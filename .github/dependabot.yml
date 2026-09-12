@@ -1,0 +1,12 @@
+# Only the GitHub Actions ecosystem is present (the tools are stdlib-only, with
+# no tracked package manifests). Dependabot keeps the SHA-pinned actions in
+# .github/workflows current; PRs still pass through the CI gates before merge.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"

@@ -25,6 +25,7 @@ MARKER_ALLOWLIST = {
     "docs/license-decision.md",
     "CONTRIBUTING.md",
     "SECURITY.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
     "tools/pre_publish_check.py",
     ".gitleaks.toml",
     # Synthetic secret-gate test vectors (fake AWS key, PEM, connection strings).
