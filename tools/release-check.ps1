@@ -43,6 +43,8 @@ Step "Gitleaks (published tree only)" {
 Step "Public-boundary check" { python tools/pre_publish_check.py }
 Step "ctxcheck tests"        { python ctxcheck/test_ctxcheck.py }
 Step "ctxdex secret-gate tests" { python ctxdex/test_ctxdex_gate.py }
+Step "local-audit census-only guard" { python local-audit/test_local_audit.py }
+Step "slop_prepass self-test" { python local-audit/slop_prepass.py --self-test }
 
 Pop-Location
 if ($fail -gt 0) { Write-Host "`n$fail gate(s) FAILED." -ForegroundColor Red; exit 1 }

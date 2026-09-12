@@ -32,7 +32,22 @@ HERE = Path(__file__).resolve().parent
 PREPASS = HERE / "slop_prepass.py"
 MAX_FILE_CHARS = 48_000
 
+# MODE: Census and report only.
+# This lane DISCOVERS and CLASSIFIES candidate defects and writes a findings
+# report OUTSIDE the audited repository. It never edits, patches, stages, commits,
+# reverts, or runs commands against the target repo. Remediation is out of scope
+# by default: applying any fix is a separate, explicit, human action — there is no
+# --fix / --apply mode here, and adding one must be a deliberate, opt-in change.
+MODE = "census"  # the only mode; asserted by test_local_audit.py
+
+CENSUS_ONLY = (
+    "MODE: Census and report only. Emit findings as text ONLY. Do NOT produce "
+    "edits, patches, diffs, rewritten files, or apply/fix commands, and do NOT "
+    "instruct anyone to modify the repository. Remediation is out of scope."
+)
+
 SYSTEM = (
+    CENSUS_ONLY + " "
     "READ-ONLY audit assistant. Findings only. Every finding must have: file and "
     "line range, a concrete failure scenario (inputs/state that produce the wrong "
     "outcome), severity (CRITICAL/HIGH/MEDIUM/LOW), why existing tests miss it, and "
@@ -175,9 +190,11 @@ def main() -> int:
         f"(non-test); cap --max-files={args.max_files}",
         f"- Generated: {now:%Y-%m-%d %H:%M:%S}",
         "",
-        "> Findings are the LOCAL model's — a decorrelated second opinion. Every one is a "
-        "HYPOTHESIS: worth checking, not a verdict. This lane is a backup to the primary "
-        "Claude-side audits, not a replacement.",
+        "> MODE: Census and report only. This lane never edited the audited repo — it "
+        "discovered, classified, and reported. Findings are the LOCAL model's — a "
+        "decorrelated second opinion. Every one is a HYPOTHESIS: worth checking, not a "
+        "verdict. Applying any fix is a separate, explicit, human action. This lane is a "
+        "backup to the primary Claude-side audits, not a replacement.",
         "",
     ]
     if skipped:

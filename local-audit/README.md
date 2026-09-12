@@ -27,10 +27,22 @@ files (`@file`), and run `/audit` or a focused variant. The model classifies
 candidates and traces cross-file paths; it does not brute-force discovery —
 that is the pre-pass's job and it is free.
 
+## MODE: Census and report only
+
+This lane **discovers, classifies, and reports** — it never edits, patches,
+stages, commits, reverts, or runs commands against the audited repo. Its output
+(a findings report) is written **outside** the target repo, under `out/`.
+Remediation is **out of scope by default**: applying any fix is a separate,
+explicit, human action. There is no `--fix` / `--apply` mode, and adding one
+must be a deliberate, opt-in change — enforced by `test_local_audit.py`.
+
 ## Ground rules
 
 - All model traffic local (`localhost:11434`). No cloud, no telemetry additions.
-- Read-only: the profile's rules forbid edits/commands/git without explicit
-  per-action approval. Treat model output as HYPOTHESIS until verified.
+- Read-only / census-only (above). The model is instructed to emit findings as
+  text only; treat every finding as HYPOTHESIS until verified.
 - Do not schedule unattended runs of this lane — a weaker model's misses go
   unnoticed without a human in the loop.
+
+Guard test: `python test_local_audit.py` (proves census-only default: mode flag,
+model instruction wording, and no repo-write / fix-apply code path).
