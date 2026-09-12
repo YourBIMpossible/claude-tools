@@ -22,6 +22,7 @@ import sys
 MARKER_ALLOWLIST = {
     "docs/public-boundary.md",
     "docs/publication-readiness.md",
+    "docs/history-exposure-assessment.md",
     "docs/license-decision.md",
     "CONTRIBUTING.md",
     "SECURITY.md",

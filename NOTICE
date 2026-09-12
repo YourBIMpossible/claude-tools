@@ -1,0 +1,22 @@
+claude-tools
+Copyright 2026 YourBIMpossible
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+All tracked source in this repository is first-party and depends only on the
+Python standard library and PowerShell. It bundles no third-party source code.
+
+Third-party components are NOT redistributed here; they are fetched or installed
+separately at setup and remain under their own licenses:
+
+  - SkillSpector (upstream project) — cloned into ./skillspector/src at setup;
+    not tracked in this repo. See skillspector/README.md and the upstream
+    project's own LICENSE.
+  - gitleaks, trivy and other CLI binaries — downloaded into ./bin at setup;
+    not tracked in this repo. See bin/README.md and each tool's own license.
+  - graphify's optional graph backend is installed from PyPI (package
+    "graphifyy") and is governed by its own license.
+
+The suppression baselines under skillspector/baselines/ contain only first-party
+scan metadata (truncated content hashes, rule IDs, file names, and review notes)
+and no third-party source text.

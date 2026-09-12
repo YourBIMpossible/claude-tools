@@ -56,6 +56,10 @@ CI (PR + manual dispatch only) runs these plus the boundary and secret scans.
 
 ## Licensing of contributions
 
-The repository's own license is **not yet decided**
-([docs/license-decision.md](docs/license-decision.md)). Until an owner sets a
-`LICENSE`, treat contribution licensing as unresolved and raise it in your PR.
+This project is licensed under the [Apache License 2.0](LICENSE). By submitting a
+contribution, you agree that it is licensed under Apache-2.0 as an intentional
+contribution under Section 5 of that license, and you affirm you have the right
+to submit it. Do not add third-party code under an incompatible license, and
+carry any required upstream copyright/`NOTICE` attribution with anything you
+adapt. See [docs/license-decision.md](docs/license-decision.md) for the
+provenance basis of the license choice.

@@ -79,7 +79,14 @@ specific fixtures (which can encode a private codebase's structure) stay local.
 - [SECURITY.md](SECURITY.md) — reporting vulnerabilities or exposed private content.
 - [docs/public-boundary.md](docs/public-boundary.md) — what may/may not enter this repo.
 - [docs/publication-readiness.md](docs/publication-readiness.md) — hardening record.
-- [docs/license-decision.md](docs/license-decision.md) — **LICENSE not yet chosen (owner decision).**
+- [docs/license-decision.md](docs/license-decision.md) — license decision record (Apache-2.0, provenance-verified).
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). All tracked source is
+first-party and stdlib-only; third-party components (SkillSpector, gitleaks,
+trivy, the `graphifyy` PyPI package) are fetched at setup under their own
+licenses and are not redistributed here — see [NOTICE](NOTICE).
 
 ## Scheduled-routine acceptance (house rule)
 
