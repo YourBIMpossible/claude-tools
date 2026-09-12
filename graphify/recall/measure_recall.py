@@ -36,12 +36,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-QUERIES = HERE / "csharp-queries.json"
-GRAPHIFY = Path(
-    r"C:\Users\Zeria\AppData\Local\Python\pythoncore-3.14-64\Scripts\graphify.exe"
-)
+# Bring your own query set (see recall/README.md for the schema). Not tracked.
+QUERIES = Path(os.environ.get("RECALL_QUERIES", HERE / "queries.json"))
+# Resolve graphify from PATH; override with $env:GRAPHIFY_EXE if not on PATH.
+GRAPHIFY = os.environ.get("GRAPHIFY_EXE", "graphify")
 
-# "NODE .Find() [src=BIMpossible.ModelQA.Core/Duplicates.cs loc=L17 community=.Find]"
+# Example graphify NODE line:
+#   "NODE MyClass.Method() [src=my.module/MyClass.cs loc=L17 community=core]"
 NODE_RE = re.compile(r"^NODE\s+(?P<label>.*?)\s+\[src=(?P<src>[^\s\]]+)")
 
 

@@ -3,14 +3,14 @@ setlocal
 rem Local audit pre-pass launcher. Scans a whole repo for "slop" candidates
 rem (silent failures + misleading counters) and opens the list in VS Code.
 rem
-rem   Double-click            -> scans F:\BIMpossible
-rem   audit-repo.cmd <path>   -> scans that repo instead
+rem   audit-repo.cmd <path>   -> scans that repo
+rem   audit-repo.cmd          -> scans the current directory
 rem
-rem This only DISCOVERS candidates. Judgment happens in Continue: open a file,
-rem paste its rows, run /audit. Read-only; nothing is written inside the target repo.
+rem This only DISCOVERS candidates. Judgment happens separately: open a file,
+rem paste its rows, run your audit. Read-only; nothing is written inside the target repo.
 
 set "REPO=%~1"
-if "%REPO%"=="" set "REPO=F:\BIMpossible"
+if "%REPO%"=="" set "REPO=%CD%"
 
 for %%I in ("%REPO%") do set "NAME=%%~nxI"
 set "OUT=%~dp0out"

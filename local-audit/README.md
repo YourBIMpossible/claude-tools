@@ -17,8 +17,8 @@ interactive use only (decision 2026-08-08).
 ## Workflow
 
 ```bash
-python F:\Claude-Tools\local-audit\slop_prepass.py <repo-root> [--since <ref>] > candidates.md
-python F:\Claude-Tools\local-audit\slop_prepass.py --self-test
+python slop_prepass.py <repo-root> [--since <ref>] > candidates.md
+python slop_prepass.py --self-test
 ```
 
 Then in VS Code (Continue sidebar, `Local Repo Audit` config selected):
