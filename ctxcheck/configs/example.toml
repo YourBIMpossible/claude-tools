@@ -1,0 +1,57 @@
+# ctxcheck config — EXAMPLE / TEMPLATE.
+# Synthetic example — contains no private repository data or production findings.
+#
+# Copy this to a file named for your target (e.g. `myproject.toml`) and edit the
+# values to match YOUR repo, then run:  py ctxcheck/ctxcheck.py run myproject
+# Real per-target configs are user-provided and are NOT tracked in this public repo.
+
+# Absolute or relative path to the repo ctxcheck should read (read-only).
+repo = "/path/to/your/repo"
+
+[files]
+# Files whose existence you claim in docs — ctxcheck FAILs if any is missing.
+require = [
+  "README.md",
+  "docs/ARCHITECTURE.md",
+  "docker/docker-compose.yml",
+  ".env.example",
+]
+
+[refs]
+# Docs whose internal path references must still resolve.
+scan = ["docs/ARCHITECTURE.md"]
+ignore = ["~/*", "*node_modules*"]
+
+[env]
+# Env-var NAMES your docs/compose declare (names only — never real values).
+names = ["DATABASE_URL", "SECRET_KEY", "SERVICE_ORIGIN"]
+declared_in = [".env.example", "docker/docker-compose.yml"]
+
+[[compose]]
+file = "docker/docker-compose.yml"
+services = ["web", "worker", "db"]
+
+# Endpoint contract: route literals the client calls must appear in the code.
+[[endpoints]]
+label = "frontend calls"
+routes = ["/api/health", "/api/items"]
+appear_in = ["frontend/**/*.ts"]
+
+[[endpoints]]
+label = "backend router prefixes"
+routes = ['prefix="/api"']
+appear_in = ["backend/**/*.py"]
+
+[links]
+docs = ["docs/*.md"]
+commit_repos = ["."]
+
+[[commands]]
+# Commands your docs tell users to run must still succeed.
+run = "py --version"
+timeout = 20
+
+[staleness]
+# "active" docs that stopped moving are the stale-context risk.
+paths = ["docs/plans/active/*.md"]
+max_age_days = 60

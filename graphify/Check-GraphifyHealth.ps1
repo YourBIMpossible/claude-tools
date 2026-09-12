@@ -22,12 +22,13 @@
 # ============================================================
 
 $ErrorActionPreference = 'Stop'
-$root      = 'F:\Claude-Tools\graphify'
+# $root defaults to this script's folder; override with $env:GRAPHIFY_ROOT.
+$root      = if ($env:GRAPHIFY_ROOT) { $env:GRAPHIFY_ROOT } else { $PSScriptRoot }
 $health    = Join-Path $root 'health.json'
 $alertsOut = Join-Path $root 'alerts.json'
 $log       = Join-Path $root 'health-check-log.txt'
 $verCache  = Join-Path $root 'pypi-version-cache.json'
-$python    = 'C:\Users\Zeria\AppData\Local\Python\pythoncore-3.14-64\python.exe'
+$python    = if ($env:PYTHON_EXE) { $env:PYTHON_EXE } else { 'python' }
 $taskName  = 'Graphify Weekly Graph Refresh'
 
 # Refresh is weekly; 8 days allows one missed-by-hours run before alerting.
@@ -147,14 +148,17 @@ $doc = [ordered]@{
 
 ConvertTo-Json $doc -Depth 6 | Set-Content -Path $alertsOut -Encoding utf8
 
-# Dashboard panel data. Rendered into the automation clone, which is the one
-# whose scheduled refresh commits and pushes it (see OWNERSHIP above). Also
-# written to the editing clone so a local preview matches.
-$js = 'window.GRAPHIFY_HEALTH = ' + (ConvertTo-Json $doc -Depth 6 -Compress) + ';'
-foreach ($dir in @('F:\AI-Dashboard\Dashboard-auto', 'F:\AI-Dashboard\Dashboard')) {
-    if (Test-Path $dir) {
-        try { Set-Content -Path (Join-Path $dir 'graphify-health.js') -Value $js -Encoding utf8 }
-        catch { Log "could not write graphify-health.js to ${dir}: $($_.Exception.Message)" }
+# Optional: render health as a JS global for a dashboard panel. Set
+# $env:GRAPHIFY_DASHBOARD_DIRS to a semicolon-separated list of folders to
+# receive graphify-health.js; leave unset to skip (the default).
+$dashDirs = if ($env:GRAPHIFY_DASHBOARD_DIRS) { $env:GRAPHIFY_DASHBOARD_DIRS -split ';' } else { @() }
+if ($dashDirs.Count -gt 0) {
+    $js = 'window.GRAPHIFY_HEALTH = ' + (ConvertTo-Json $doc -Depth 6 -Compress) + ';'
+    foreach ($dir in $dashDirs) {
+        if (Test-Path $dir) {
+            try { Set-Content -Path (Join-Path $dir 'graphify-health.js') -Value $js -Encoding utf8 }
+            catch { Log "could not write graphify-health.js to ${dir}: $($_.Exception.Message)" }
+        }
     }
 }
 

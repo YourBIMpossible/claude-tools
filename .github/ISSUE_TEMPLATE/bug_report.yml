@@ -1,0 +1,35 @@
+name: Bug report
+description: Something in a tool behaves incorrectly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste secrets, private repo paths, customer data, or internal
+        endpoint/class names.** These tools run against private code — redact
+        before posting. For exposed private content or a vulnerability, use the
+        private channel in [SECURITY.md](../blob/main/SECURITY.md) instead.
+  - type: dropdown
+    id: tool
+    attributes:
+      label: Tool
+      options: [ctxcheck, ctxdex, graphify, skillspector, local-audit, tools/ or CI, other]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact command(s). Use a synthetic/sample repo if possible.
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "OS, Python version, tool commit"

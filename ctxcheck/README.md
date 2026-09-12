@@ -19,10 +19,11 @@ Severity model: **declared** claims that don't hold FAIL (exit 1);
 **scan-discovered** issues (doc path refs, commit SHAs, staleness) WARN
 (exit 0 unless `--strict`) because scans have false positives.
 
-Configs for real repos live in `configs/` here — target repos are not
-touched. Test suite: `py test_ctxcheck.py` or `py -m pytest -q` (same 48 CLI-level
-checks over a fixture repo; pytest collects `test_ctxcheck_suite`).
+Configs are user-provided and live in `configs/` — copy `configs/example.toml`
+to `configs/<name>.toml` and edit it for your repo (target repos are never
+touched; real per-target configs are not tracked in this public repo). Test
+suite: `py test_ctxcheck.py` or `py -m pytest -q` (same 48 CLI-level checks over
+a fixture repo; pytest collects `test_ctxcheck_suite`).
 
-Scope guard: per claude-profile `docs/adr/0001`, this tool stays a
-reality-checker — no context manifests, no MCP wrapper, no retrieval-eval
-machinery.
+Scope guard: by design this tool stays a reality-checker — no context
+manifests, no MCP wrapper, no retrieval-eval machinery.

@@ -7,5 +7,6 @@ useDefault = true
 [allowlist]
 description = "Synthetic secret vectors in ctxdex's secret-gate test suite. These are deliberate fakes (AWS's public docs example key, placeholder PEM, dummy connection strings) used to verify ctxdex refuses to index credentials — not real secrets."
 paths = [
-  '''ctxdex/test_ctxdex_gate\.py''',
+  # Separator-agnostic: git mode reports "ctxdex/…"; --no-git on Windows reports "ctxdex\…".
+  '''ctxdex[/\\]test_ctxdex_gate\.py''',
 ]

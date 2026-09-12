@@ -25,6 +25,10 @@
 *.sqlite
 *.sqlite3
 
+# Scan-report artifacts (gitleaks/pre-publish output — contain finding excerpts)
+/gl-*.json
+/*-report.json
+
 # Tool run outputs
 /skillspector/reports/
 **/graphify-out/

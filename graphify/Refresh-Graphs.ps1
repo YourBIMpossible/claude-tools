@@ -1,18 +1,16 @@
 # ============================================================
 # Refresh-Graphs.ps1 — scheduled AST-only refresh of the graphify code graphs.
 #
-# Targets: BIMpossible backend + Add-Ins. Runs `graphify extract --code-only`
+# Edit the $targets array below to point at YOUR repositories.
+# Runs `graphify extract --code-only`
 # (no LLM, no API key; incremental via the manifest gate), then re-clusters +
 # regenerates GRAPH_REPORT.md, then writes a graph-meta.json sidecar
 # (wall-clock + repo HEAD + package version; graphify itself stamps
 # built_at_commit inside graph.json) and a structured health record.
 #
 # OWNERSHIP: this script owns graph.json refreshes, graph-meta.json,
-#   health.json, and health-history.jsonl.
-#   - metrics-history.jsonl stays owned by BIMpossible\Update-Graph.ps1
-#     (manual, on-demand) — this script NEVER touches the ledger.
-#   - graph-metrics.js and graphify-health.js stay owned by the Dashboard
-#     scheduled refresh (it renders health.json + alerts.json to JS).
+#   health.json, and health-history.jsonl. If you keep a separate metrics
+#   ledger or dashboard renderer, this script never touches those.
 #   - alerts.json is owned by Check-GraphifyHealth.ps1 (daily task).
 #
 # WHY A SCHEDULED TASK, NOT graphify's git hook: `graphify hook install` fires
@@ -38,12 +36,14 @@
 # ============================================================
 
 $ErrorActionPreference = 'Stop'
-$root     = 'F:\Claude-Tools\graphify'
+# $root defaults to this script's own folder; override with -Root or $env:GRAPHIFY_ROOT.
+$root     = if ($env:GRAPHIFY_ROOT) { $env:GRAPHIFY_ROOT } else { $PSScriptRoot }
 $log      = Join-Path $root 'refresh-log.txt'
 $health   = Join-Path $root 'health.json'
 $history  = Join-Path $root 'health-history.jsonl'
-$graphify = 'C:\Users\Zeria\AppData\Local\Python\pythoncore-3.14-64\Scripts\graphify.exe'
-$python   = 'C:\Users\Zeria\AppData\Local\Python\pythoncore-3.14-64\python.exe'
+# Resolve graphify/python from PATH; override with env vars if not on PATH.
+$graphify = if ($env:GRAPHIFY_EXE) { $env:GRAPHIFY_EXE } else { 'graphify' }
+$python   = if ($env:PYTHON_EXE)   { $env:PYTHON_EXE }   else { 'python' }
 
 # Node-count drift above this (percent, vs the previous recorded run) sets
 # drift_warning on the target record; Check-GraphifyHealth.ps1 turns that into
@@ -100,9 +100,13 @@ $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 $installedVer = (& $python -c "from importlib.metadata import version; print(version('graphifyy'))" 2>$null | Select-Object -First 1)
 $ErrorActionPreference = $eap
 
+# EDIT THESE — one entry per repo you want graphed.
+#   Name = label used in reports / health records
+#   Scan = folder to extract the AST graph from (graphify-out\ is written here)
+#   Repo = repo root (used to record HEAD; may equal Scan)
 $targets = @(
-    @{ Name = 'bimpossible-backend'; Scan = 'F:\BIMpossible\backend'; Repo = 'F:\BIMpossible' },
-    @{ Name = 'add-ins';             Scan = 'F:\BIMpossible-AddIns';             Repo = 'F:\BIMpossible-AddIns' }
+    @{ Name = 'my-backend';  Scan = 'C:\path\to\backend'; Repo = 'C:\path\to\repo' },
+    @{ Name = 'my-frontend'; Scan = 'C:\path\to\frontend'; Repo = 'C:\path\to\repo' }
 )
 
 $failed  = 0

@@ -1,0 +1,29 @@
+name: Tool / enhancement request
+description: Suggest a new tool or an improvement to an existing one.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep it in the house style: single-file stdlib Python or a thin
+        PowerShell wrapper, read-only against target repos, synthetic examples
+        only. See [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What question or workflow is underserved today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed tool / change
+      description: What it would do, and how it stays local-first and read-only.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Existing alternatives
+      description: Why the current tools (or Grep / Context7) don't cover it.

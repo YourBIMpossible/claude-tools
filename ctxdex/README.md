@@ -1,6 +1,6 @@
 # ctxdex
 
-Local SQLite FTS5 knowledge index. Built 2026-08-07 as the self-built replacement for the one genuinely useful mechanism in [context-mode](https://github.com/mksglu/context-mode) — see the full vetting writeup at `F:\AI-Dev\_scratch\context-mode-assessment-2026-08-07.md`.
+Local SQLite FTS5 knowledge index. A self-built, local-only replacement for the one genuinely useful mechanism in [context-mode](https://github.com/mksglu/context-mode).
 
 No hooks, no telemetry, no fake sandbox, no config rewriting. One file, stdlib only (`sqlite3`, `urllib`, `html.parser`).
 

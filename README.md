@@ -62,13 +62,24 @@ census, counter-integrity, tested-but-dead). Reports; never edits.
 1. Python 3.11+ on PATH for the `ctx*` and audit tools.
 2. `bin/`: download `trivy` and `gitleaks` per `bin/README.md`.
 3. skillspector: clone upstream into `skillspector/src/`.
-4. graphify: `pip install graphify`, then edit scan targets in `Refresh-Graphs.ps1`.
+4. graphify: `pip install graphifyy` (note the double **y** — PyPI package
+   [`graphifyy`](https://pypi.org/project/graphifyy/), which installs a `graphify`
+   CLI command; do **not** `pip install graphify`, a different package). Then edit
+   scan targets in `Refresh-Graphs.ps1`.
 
 ## What is deliberately not tracked
 
 `.gitignore` keeps this repo to tool *source only*. Generated indexes/DBs, run
 reports, health/state files, downloaded binaries, virtualenvs, and any repo-
 specific fixtures (which can encode a private codebase's structure) stay local.
+
+## Project docs
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute; the pre-push boundary gate.
+- [SECURITY.md](SECURITY.md) — reporting vulnerabilities or exposed private content.
+- [docs/public-boundary.md](docs/public-boundary.md) — what may/may not enter this repo.
+- [docs/publication-readiness.md](docs/publication-readiness.md) — hardening record.
+- [docs/license-decision.md](docs/license-decision.md) — **LICENSE not yet chosen (owner decision).**
 
 ## Scheduled-routine acceptance (house rule)
 
