@@ -1,0 +1,255 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 1
+rules: []
+fingerprints:
+- hash: sha256:b06a5dbe1c0e43a7
+  rule_id: AST4
+  file: scripts/shadcn_add.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:88a16cf67bb5666e
+  rule_id: AST4
+  file: scripts/shadcn_add.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:78fede7c9d60c260
+  rule_id: LP3
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:cf486040ff840852
+  rule_id: RP1
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:f1a4bbb79364c787
+  rule_id: RP1
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1564f4aed8ffd3d5
+  rule_id: RP1
+  file: references/shadcn-components.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:64f1447bd9ac40a0
+  rule_id: RP1
+  file: references/shadcn-components.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:ae7342390774233b
+  rule_id: RP1
+  file: references/shadcn-components.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:35e7234b4df9c968
+  rule_id: RP1
+  file: scripts/requirements.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:bf69925adaf43ae1
+  rule_id: RP1
+  file: scripts/shadcn_add.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:6f57f6d93eab4bc0
+  rule_id: RP1
+  file: scripts/shadcn_add.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:fa101624f46655d7
+  rule_id: RP1
+  file: scripts/shadcn_add.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:45ae18e2186425d6
+  rule_id: RP1
+  file: scripts/shadcn_add.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:f86d8f6f430f50e9
+  rule_id: RP1
+  file: scripts/tests/test_shadcn_add.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:b0d61747988f0dfa
+  rule_id: RP1
+  file: scripts/tests/test_shadcn_add.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:e4e713cfce148587
+  rule_id: EA3
+  file: LICENSE.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:833cb23bc81fa0d9
+  rule_id: EA3
+  file: LICENSE.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:e5c563b57556d7bf
+  rule_id: EA3
+  file: canvas-fonts/ArsenalSC-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:75367d7bfa122543
+  rule_id: EA3
+  file: canvas-fonts/BigShoulders-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:d1a912483a6e2ea9
+  rule_id: EA3
+  file: canvas-fonts/Boldonse-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:e3e32ac90551b869
+  rule_id: EA3
+  file: canvas-fonts/BricolageGrotesque-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:117262fbb094fd7d
+  rule_id: EA3
+  file: canvas-fonts/CrimsonPro-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:53c9057fb76f2657
+  rule_id: EA3
+  file: canvas-fonts/DMMono-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:4ff569c45ea2104d
+  rule_id: EA3
+  file: canvas-fonts/EricaOne-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:c0ba708a8a614651
+  rule_id: EA3
+  file: canvas-fonts/GeistMono-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:7c51548664aef559
+  rule_id: EA3
+  file: canvas-fonts/Gloock-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:8984c99c2c6d8788
+  rule_id: EA3
+  file: canvas-fonts/IBMPlexMono-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:6e591bc267b9207b
+  rule_id: EA3
+  file: canvas-fonts/InstrumentSans-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:e44293f35f88084d
+  rule_id: EA3
+  file: canvas-fonts/Italiana-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:68a0035ba76dd54d
+  rule_id: EA3
+  file: canvas-fonts/JetBrainsMono-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:5bac304851f46b6d
+  rule_id: EA3
+  file: canvas-fonts/Jura-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:3833e3c99b87962f
+  rule_id: EA3
+  file: canvas-fonts/LibreBaskerville-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:e2355ed444ea2f76
+  rule_id: EA3
+  file: canvas-fonts/Lora-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:f0c0217a1242baab
+  rule_id: EA3
+  file: canvas-fonts/NationalPark-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:af87ae8ccc61ff34
+  rule_id: EA3
+  file: canvas-fonts/NothingYouCouldDo-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:ee84e9b0d9929bb5
+  rule_id: EA3
+  file: canvas-fonts/Outfit-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:ce62a01fd30e4efb
+  rule_id: EA3
+  file: canvas-fonts/PixelifySans-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:6ee14b1310d31826
+  rule_id: EA3
+  file: canvas-fonts/PoiretOne-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:14974942ac3eb63c
+  rule_id: EA3
+  file: canvas-fonts/RedHatMono-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:0516fbe581334380
+  rule_id: EA3
+  file: canvas-fonts/Silkscreen-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:f1984b97ff36d762
+  rule_id: EA3
+  file: canvas-fonts/SmoochSans-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:05a9afad7742ea5b
+  rule_id: EA3
+  file: canvas-fonts/Tektur-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:40b39d7712bd151a
+  rule_id: EA3
+  file: canvas-fonts/WorkSans-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:0f41bf4a2ef6b121
+  rule_id: EA3
+  file: canvas-fonts/YoungSerif-OFL.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:48734e6f7d8c54db
+  rule_id: SC1
+  file: scripts/requirements.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:3120bfecb70346cf
+  rule_id: SC1
+  file: scripts/tests/requirements.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:37cc338f0b978efd
+  rule_id: SC1
+  file: scripts/tests/requirements.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:c205034eacc94076
+  rule_id: SC1
+  file: scripts/tests/requirements.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:40761651c0c65e4a
+  rule_id: SC4
+  file: scripts/requirements.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:dbff28c36b9f2ec2
+  rule_id: SC4
+  file: scripts/tests/requirements.txt
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'

@@ -1,0 +1,46 @@
+# ctxcheck config: claude-profile (SKILL claims, hook paths, ADR links)
+repo = "F:/Claude-Profile"
+
+[files]
+require = [
+  "CLAUDE.md",
+  "LONG-TASK-HARNESS.md",
+  "README.md",
+  "notes/MAINTENANCE.md",
+  "docs/adr/README.md",
+  "docs/adr/template.md",
+  "docs/adr/0001-fts5-local-first-retrieval.md",
+  "docs/adr/0002-defer-context-budget-automation.md",
+  "hooks/ctxdex_autoindex.py",
+  "hooks/tests/test_ctxdex_hook.py",
+  "skills/ctxdex/SKILL.md",
+]
+
+[refs]
+scan = ["skills/ctxdex/SKILL.md", "notes/MAINTENANCE.md", "docs/adr/*.md"]
+# the hook's external dependency + the paths SKILL.md claims
+require = [
+  "hooks/ctxdex_autoindex.py",
+  "F:/Claude-Tools/ctxdex/ctxdex.py",
+  "F:/Claude-Tools/ctxdex/test_ctxdex_gate.py",
+]
+ignore = ["bash://*", "~/*", "*tool-results*", "*.claude/projects*"]
+
+[links]
+docs = ["docs/adr/*.md", "skills/ctxdex/SKILL.md", "notes/MAINTENANCE.md"]
+adr_dir = "docs/adr"
+# SKILL.md pins ctxdex-repo commits (402c0e6, dd0173b) - resolve against both repos
+commit_repos = [".", "F:/Claude-Tools/ctxdex"]
+
+[[commands]]
+# the exact invocation SKILL.md documents must still run
+run = "py F:/Claude-Tools/ctxdex/ctxdex.py --help"
+timeout = 30
+
+[[commands]]
+run = "py --version"
+timeout = 15
+
+[staleness]
+paths = ["notes/*.md"]
+max_age_days = 90

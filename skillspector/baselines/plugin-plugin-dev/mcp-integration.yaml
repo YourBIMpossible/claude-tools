@@ -1,0 +1,25 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 1
+rules: []
+fingerprints:
+- hash: sha256:84a9d8bf212a862d
+  rule_id: E1
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:50fcb91c85914e6f
+  rule_id: E1
+  file: examples/http-server.json
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:9f9b0d7e99c63899
+  rule_id: E1
+  file: examples/http-server.json
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:afb4cb1a66b68c11
+  rule_id: EA1
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'

@@ -1,0 +1,10 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 1
+rules: []
+fingerprints:
+- hash: sha256:0ab52994cd6a1cc9
+  rule_id: P6
+  file: scripts/inject-brand-context.cjs
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'

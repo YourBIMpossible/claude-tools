@@ -1,0 +1,20 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 1
+rules: []
+fingerprints:
+- hash: sha256:73f991e5d4696fdf
+  rule_id: AS3
+  file: references/claude-code-tools.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:52b6dee889659668
+  rule_id: AS3
+  file: references/codex-tools.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:3b720ef528ce3d73
+  rule_id: AS3
+  file: references/gemini-tools.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'

@@ -1,0 +1,30 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 1
+rules: []
+fingerprints:
+- hash: sha256:ace22d1fab635137
+  rule_id: AST4
+  file: scripts/slide-token-validator.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:0de16ec428a46dfb
+  rule_id: LP3
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:9cb1238a810ca84b
+  rule_id: RP1
+  file: references/tailwind-integration.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:427d04ccd5ad0960
+  rule_id: RP1
+  file: references/tailwind-integration.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:dfbadf36f4a7fd29
+  rule_id: RP1
+  file: references/tailwind-integration.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'

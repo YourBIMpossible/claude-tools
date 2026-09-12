@@ -1,0 +1,104 @@
+# ctxcheck config: BIMpossible (endpoint contracts, compose services, APS config refs)
+# Facts sourced from live recon 2026-08-07. Read-only against the repo.
+repo = "F:/BIMpossible"
+
+[files]
+require = [
+  "README.md",
+  "CLAUDE.md",
+  "docs/ARCHITECTURE.md",
+  "docs/PROJECT_CONSTITUTION.md",
+  "docs/CI-GATES.md",
+  "docs/AGENT_WORKFLOW.md",
+  "docker/docker-compose.yml",
+  "frontend/package.json",
+  "frontend/tsconfig.json",
+  "backend/requirements.txt",
+  "backend/main.py",
+  "backend/alembic.ini",
+  "backend/Dockerfile",
+  "frontend/Dockerfile",
+  ".env.example",
+  "docker/frontend.env.example",
+  "decision-log/README.md",
+  "docs/decision-log/INDEX.md",
+  "Verify-Local-CI.ps1",
+  "Push-And-Verify.ps1",
+]
+
+[refs]
+scan = ["docs/ARCHITECTURE.md", "docs/CI-GATES.md"]
+ignore = ["~/*", "*node_modules*", "*.claude/worktrees*"]
+
+[env]
+# APS + core contract vars; REDIS_URL is deliberately compose-injected only,
+# so the compose file counts as a declaration source.
+names = [
+  "APS_CLIENT_ID",
+  "APS_CLIENT_SECRET",
+  "APS_CALLBACK_URL",
+  "DATABASE_URL",
+  "SECRET_KEY",
+  "REVIT_RELAY_URL",
+  "RELAY_SECRET",
+  "BIMPOSSIBLE_REVIT_LINK_ENABLED",
+  "REDIS_URL",
+  "AUTH_SECRET",
+  "BACKEND_ORIGIN",
+]
+declared_in = [
+  ".env.example",
+  "docker/frontend.env.example",
+  "docker/docker-compose.yml",
+]
+
+[[compose]]
+file = "docker/docker-compose.yml"
+services = ["frontend", "backend", "backend-migrate", "db", "redis"]
+
+# Frontend side of the endpoint contract: full route literals the UI calls.
+[[endpoints]]
+label = "frontend calls"
+routes = [
+  "/aps/projects",
+  "/auth/status",
+  "/auth/login",
+  "/data/elements",
+  "/data/categories",
+  "/account/preferences",
+  "/search/models",
+  "/data/qa/model-health",
+]
+appear_in = ["frontend/app/**/*.ts", "frontend/app/**/*.tsx"]
+
+# Backend side: each router must still declare its APIRouter prefix.
+[[endpoints]]
+label = "backend APIRouter prefixes"
+routes = [
+  'prefix="/aps"',
+  'prefix="/account"',
+  'prefix="/data"',
+  'prefix="/data/qa"',
+  'prefix="/search"',
+  'prefix="/revit"',
+]
+appear_in = ["backend/**/*.py"]
+
+[links]
+# decision-log entries cite commit SHAs; no ADR scheme exists in this repo,
+# so adr_dir is omitted on purpose.
+docs = ["decision-log/*.md", "docs/CI-GATES.md"]
+commit_repos = ["."]
+
+[[commands]]
+run = "node --version"
+timeout = 20
+
+[[commands]]
+run = "py --version"
+timeout = 20
+
+[staleness]
+# "active" plan/spec docs that stopped moving are exactly the stale-context risk
+paths = ["docs/plans/active/*.md", "docs/specs/active/*.md", "docs/verification/active/*.md"]
+max_age_days = 60

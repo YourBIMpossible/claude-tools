@@ -1,0 +1,85 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 1
+rules: []
+fingerprints:
+- hash: sha256:4c3cbd634ebdc2f7
+  rule_id: AS1
+  file: references/marketplace-considerations.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:069c302a6be60954
+  rule_id: AS1
+  file: references/marketplace-considerations.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:bc1607aab3183a72
+  rule_id: AS1
+  file: references/marketplace-considerations.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:d3cd948fd906572a
+  rule_id: AS1
+  file: references/marketplace-considerations.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:71ec297a3cd56260
+  rule_id: AS1
+  file: references/testing-strategies.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:71503b566dd3e37c
+  rule_id: AS1
+  file: references/testing-strategies.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:eeea29b8689278a8
+  rule_id: AS1
+  file: references/testing-strategies.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:aba8f64fec8dda98
+  rule_id: AS1
+  file: references/testing-strategies.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:08eda1dca062611e
+  rule_id: AS1
+  file: references/testing-strategies.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:95a3ed13f92ba124
+  rule_id: AS1
+  file: references/testing-strategies.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:94eaff5a4b56621d
+  rule_id: P2
+  file: references/documentation-patterns.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:949f2c95b9a02dc6
+  rule_id: P2
+  file: references/documentation-patterns.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:085b35c29a4d9bb3
+  rule_id: P2
+  file: references/documentation-patterns.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1f9301ce134a480e
+  rule_id: P2
+  file: references/marketplace-considerations.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:a53bdbdc9dc12efc
+  rule_id: RA2
+  file: README.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:28eadfb0fc819d8a
+  rule_id: RA2
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'

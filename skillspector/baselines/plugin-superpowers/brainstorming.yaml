@@ -1,0 +1,60 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 1
+rules: []
+fingerprints:
+- hash: sha256:9e19e9efe8f52a9c
+  rule_id: LP3
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:9ab2b6f4384a55c8
+  rule_id: PE3
+  file: scripts/server.cjs
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:02539f75db631685
+  rule_id: PE2
+  file: scripts/start-server.sh
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:2bb4c502bce9f091
+  rule_id: P2
+  file: scripts/server.cjs
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:49aee32f8f895fb8
+  rule_id: RA2
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:a7d43359c0690e21
+  rule_id: RA2
+  file: scripts/start-server.sh
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:ddb634cff233ee11
+  rule_id: RA2
+  file: scripts/start-server.sh
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:ddb634cff233ee11
+  rule_id: RA2
+  file: scripts/start-server.sh
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1e7a33f1fa50c0ed
+  rule_id: RA2
+  file: scripts/start-server.sh
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:cd7f82331362329b
+  rule_id: RA2
+  file: scripts/start-server.sh
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1597e5a4e6cdcd51
+  rule_id: TM1
+  file: scripts/stop-server.sh
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'

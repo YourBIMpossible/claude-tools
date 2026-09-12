@@ -1,0 +1,65 @@
+# Claude-Tools consolidated repo — track tool SOURCE only.
+# Everything below is generated, vendored, private, or a separate repo.
+# NOTE: git .gitignore does not support inline comments; keep comments on their own line.
+
+# Private data / separate repos
+# state = claude-next-state (private /next data + own sync repo)
+/state/
+# reports = private audit outputs (contain copies of private project source)
+/reports/
+# ctxdex/data = FTS indexes built from private repos (regenerable)
+/ctxdex/data/
+
+# Vendored third-party binaries (download at setup — see bin/README.md)
+/bin/*.exe
+
+# Python / Node environments and caches
+**/venv/
+**/.venv/
+**/__pycache__/
+*.pyc
+**/node_modules/
+
+# Generated indexes / databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Tool run outputs
+/skillspector/reports/
+**/graphify-out/
+**/_backups/
+
+# skillspector/src = the upstream skillspector project (its own repo, own LICENSE).
+# Vendored, not our source. Clone it into ./src at setup — see skillspector/README.md.
+/skillspector/src/
+
+# graphify/backups = exported AST graphs + run logs of PRIVATE repos (backend/Add-Ins).
+# Structural source leak; regenerable. Never ship.
+/graphify/backups/
+
+# graphify recall fixtures enumerate the private Add-Ins command inventory (ground-truth
+# source paths). The method (measure_recall.py, rerank_bm25.py) and writeups ship; the
+# private-repo-specific query/baseline data does not.
+/graphify/recall/csharp-queries.json
+/graphify/recall/*budget*.json
+/graphify/recall/rerank-experiment-v1.json
+
+# graphify runtime state / logs (regenerated each run)
+/graphify/health.json
+/graphify/health-history.jsonl
+/graphify/health-check-log.txt
+/graphify/refresh-log.txt
+/graphify/alerts.json
+/graphify/pypi-version-cache.json
+*.bak-cutover-*
+
+# Secrets / local env
+.env
+**/.env
+*.local
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log

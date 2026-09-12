@@ -1,0 +1,280 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 1
+rules: []
+fingerprints:
+- hash: sha256:8c1bcb6c2a01fecc
+  rule_id: LP3
+  file: SKILL.md
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:26c583910653baf6
+  rule_id: RP1
+  file: data/stacks/astro.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:8c8735e1e1f3a816
+  rule_id: RP1
+  file: data/stacks/astro.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:3489a873426aee9d
+  rule_id: RP1
+  file: data/stacks/astro.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:3489a873426aee9d
+  rule_id: RP1
+  file: data/stacks/astro.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:e625631b403c3335
+  rule_id: RP1
+  file: data/stacks/astro.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:87335fa8cbb81cea
+  rule_id: RP1
+  file: data/stacks/nuxt-ui.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:87335fa8cbb81cea
+  rule_id: RP1
+  file: data/stacks/nuxt-ui.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:2080dc7da6e07eb4
+  rule_id: RP1
+  file: data/stacks/shadcn.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:2080dc7da6e07eb4
+  rule_id: RP1
+  file: data/stacks/shadcn.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:189fc8bc7d575310
+  rule_id: RP1
+  file: data/stacks/shadcn.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:189fc8bc7d575310
+  rule_id: RP1
+  file: data/stacks/shadcn.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:189fc8bc7d575310
+  rule_id: RP1
+  file: data/stacks/shadcn.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1c65fc8b6f3057b6
+  rule_id: RP1
+  file: data/stacks/shadcn.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1c65fc8b6f3057b6
+  rule_id: RP1
+  file: data/stacks/shadcn.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:dbea8777a2b0ab75
+  rule_id: RP1
+  file: data/stacks/vue.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:60a2a71ecc2a4138
+  rule_id: AR2
+  file: data/stacks/threejs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:a030c219a57f6307
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:8b45f6bd00bf8220
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:0eb8af5b3b9c83c9
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:fa3ffd02875fffcc
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:ba7a7a07595cae7c
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:865412868eb770d3
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:90a9df3589bfcfa2
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:07573673b781dff5
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:7e95f303b982d0fa
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:b78c4bd4a9c0e175
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:0355f136aa765324
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:4d982ad74ac9a361
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1808bc2001f806a6
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:8495e56911cf5ee4
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:45116239549594d2
+  rule_id: E1
+  file: data/stacks/flutter.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:c925518f51db8949
+  rule_id: EA2
+  file: data/app-interface.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:b5916d343ac65105
+  rule_id: EA2
+  file: data/stacks/avalonia.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:274593f37e2dfd36
+  rule_id: EA2
+  file: data/stacks/nuxt-ui.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:c1aded8f2aa2f385
+  rule_id: EA2
+  file: data/stacks/react-native.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:9d778bc0676d0343
+  rule_id: EA2
+  file: data/ux-guidelines.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:51ec85096474bb1a
+  rule_id: EA2
+  file: data/ux-guidelines.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:eba7eb49a80f4660
+  rule_id: EA2
+  file: data/ux-guidelines.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:2216a8d0982ef171
+  rule_id: MP3
+  file: data/stacks/javafx.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1bdbb8288e060d9b
+  rule_id: OH1
+  file: data/react-performance.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:26b4c7e6d6a81d88
+  rule_id: OH1
+  file: data/stacks/nextjs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:2d2adbe0e7f484c4
+  rule_id: PE3
+  file: data/products.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1919c46c364bcb2a
+  rule_id: PE3
+  file: data/stacks/nextjs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1919c46c364bcb2a
+  rule_id: PE3
+  file: data/stacks/nextjs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1919c46c364bcb2a
+  rule_id: PE3
+  file: data/stacks/nextjs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1919c46c364bcb2a
+  rule_id: PE3
+  file: data/stacks/nextjs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:1919c46c364bcb2a
+  rule_id: PE3
+  file: data/stacks/nextjs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:6d2c06bfcf90efbb
+  rule_id: P2
+  file: data/stacks/threejs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:8780b118fcccbbd8
+  rule_id: P2
+  file: data/stacks/threejs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:f7a09184954d8a22
+  rule_id: P1
+  file: data/ux-guidelines.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:4c5f696655cf6784
+  rule_id: P6
+  file: scripts/design_system.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:ac40c56cbde83403
+  rule_id: P6
+  file: scripts/design_system.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:46d59f58be8894c8
+  rule_id: P6
+  file: scripts/design_system.py
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
+- hash: sha256:3816acbbce887bab
+  rule_id: TM3
+  file: data/stacks/nextjs.csv
+  reason: 'Accepted 2026-07-25: reviewed in session, verified false positive or known-benign
+    behaviour'
