@@ -120,6 +120,17 @@ Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
   is itself the last commit, so the recorded SHA is captured one commit ahead of
   the doc line that names it — inherent and expected.)
 
+### Post-merge recovery bundle (current authoritative)
+- After PR #1 merged to `main` (merge `deeb728`).
+- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-postmerge-20260912T181302Z.bundle`
+- Created (UTC): `2026-09-12T18:13:02Z`
+- `git bundle verify`: "The bundle records a complete history."
+- Contents: `main` @ `deeb728…` (merged), `hardening/public-boundary` @ `7646f2d…`,
+  `governance/exposure-and-license` @ `c719020…`.
+- SHA-256: `a1249710d9892bfe03aa01ff5a86a57cb04463a98b31239bcdac8f6e24303f5c`
+- This captures the merged public history; the pre-merge bundles remain valid for
+  the pre-merge tips.
+
 ## Phase 8 — final push, remote verification & disposition (done)
 
 ### 8.1 What was pushed
