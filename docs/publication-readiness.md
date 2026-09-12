@@ -89,5 +89,30 @@ corrective commit does not un-expose it. History rewrite is an **owner decision*
   key, placeholder PEM, dummy connection strings). Allowlisted in `.gitleaks.toml`
   and `pre_publish_check.py`; the suite asserts ctxdex *refuses* to index each.
 
-### Clean-clone result
-- (Phase 7)
+### Phase 7 — clean-clone & recovery validation (done)
+Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
+
+- Source: fresh `git clone` of branch `hardening/public-boundary` into a temp dir
+  (not under `F:\Claude-Tools`). Cloned HEAD `0ef9898…`, **82 tracked files**.
+- Confirmed git-ignored/untracked content is absent in a fresh clone:
+  `skillspector/src/`, `reports/`, and `bin/*.exe` are not present (bin has only
+  its README). No pre-built private artifact is required.
+- Ran published README setup path (Python 3.11+) and all gates in the clone:
+  - ctxcheck tests **48/48**, ctxdex secret-gate **43/43**,
+    slop_prepass self-test **11/11**, census-only guard **held**.
+  - Public-boundary check **PASS**; gitleaks over the published tree **no leaks**.
+  - Smoke: `ctxcheck run --config configs/example.toml` executes end-to-end and
+    correctly reports its generic declared endpoints as unmet against an arbitrary
+    repo (expected — `example.toml` is a template to edit, not a passing config);
+    `ctxdex stats` initializes a fresh local DB (0 chunks). Both prove the tools
+    run from a clean clone.
+  - `tools/release-check.ps1` in the clone: **All release gates passed.**
+
+### Recovery bundle
+- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-20260912T165910Z.bundle`
+- Created (UTC): `2026-09-12T16:59:10Z`
+- `git bundle verify`: "The bundle records a complete history."
+- Contents: `main` @ `351a644…`, `hardening/public-boundary` @ `0ef9898…`.
+- SHA-256: `18ea761cdf7a1a3bf333fb73253105bf29cc51492eae6acea592747e2f2edca6`
+- Round-trip: cloned from the bundle → HEAD `0ef9898…`, 82 files, no private
+  configs present. Recovery path confirmed.
