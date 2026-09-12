@@ -22,6 +22,9 @@ import sys
 MARKER_ALLOWLIST = {
     "docs/public-boundary.md",
     "docs/publication-readiness.md",
+    "docs/license-decision.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
     "tools/pre_publish_check.py",
     ".gitleaks.toml",
     # Synthetic secret-gate test vectors (fake AWS key, PEM, connection strings).
