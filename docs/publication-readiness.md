@@ -120,6 +120,17 @@ Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
   is itself the last commit, so the recorded SHA is captured one commit ahead of
   the doc line that names it — inherent and expected.)
 
+### Post-merge recovery bundle (current authoritative)
+- After PR #1 merged to `main` (merge `deeb728`).
+- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-postmerge-20260912T181302Z.bundle`
+- Created (UTC): `2026-09-12T18:13:02Z`
+- `git bundle verify`: "The bundle records a complete history."
+- Contents: `main` @ `deeb728…` (merged), `hardening/public-boundary` @ `7646f2d…`,
+  `governance/exposure-and-license` @ `c719020…`.
+- SHA-256: `a1249710d9892bfe03aa01ff5a86a57cb04463a98b31239bcdac8f6e24303f5c`
+- This captures the merged public history; the pre-merge bundles remain valid for
+  the pre-merge tips.
+
 ## Phase 8 — final push, remote verification & disposition (done)
 
 ### 8.1 What was pushed
@@ -168,10 +179,16 @@ not rewrite history or invent a license without direction):
    Owner decision required: (a) leave as-is, (b) rewrite history / re-create the
    repo from the hardened tip, and/or (c) rotate any identifiers that were
    exposed by name. See [public-boundary.md](public-boundary.md) for the file list.
-2. **License.** No LICENSE and no prior stated intent → not invented; repo is
-   therefore all-rights-reserved by default. Choose per
-   [license-decision.md](license-decision.md).
+2. **License.** ~~Not chosen at Phase 8.~~ **RESOLVED 2026-09-12:** after
+   provenance verification (all tracked source first-party and stdlib-only; no
+   third-party code redistributed), the repo is licensed **Apache-2.0** — `LICENSE`
+   + `NOTICE` added on the `governance/exposure-and-license` branch. See
+   [license-decision.md](license-decision.md). No longer an open item.
 
-Everything within the automated scope is green; the repository is safe to keep
-public as-is pending those two owner calls. Merge of PR #1 is likewise the
-owner's decision.
+**Update (post-Phase-8):** PR #1 was merged to `main` (merge `deeb728`). The
+license item above is resolved. The only remaining owner decision is the
+Git-history exposure (item 1) — see
+[history-exposure-assessment.md](history-exposure-assessment.md), which classifies
+it as architecture/privacy disclosure (no secret values, no client data; rotation
+not required) and lays out options A (accept) / B (rewrite history + cache
+removal). Everything within the automated scope is green.

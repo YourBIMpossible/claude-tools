@@ -1,41 +1,40 @@
-# LICENSE — DECISION REQUIRED (owner)
+# License decision — RESOLVED: Apache-2.0
 
-**Status: unlicensed. This repository currently ships no `LICENSE` file and no
-license header in any source file.**
+**Status: LICENSED. `LICENSE` (Apache License 2.0) added at the repo root on
+2026-09-12, with a `NOTICE` file.** This supersedes the prior
+"decision required / all-rights-reserved" state.
 
-Under default copyright law, "no license" means **all rights reserved**: the
-public can view and fork on GitHub (per the GitHub Terms of Service), but no one
-is granted permission to use, copy, modify, or redistribute the code. That is
-almost certainly *not* the intent for a public toolbelt, but the intended license
-was never stated, so this hardening pass **did not invent one**.
+## Decision
 
-## What needs an owner decision
+- **License chosen:** Apache License 2.0.
+- **Why:** permissive license suited to public developer tooling, with an
+  express patent grant and `NOTICE`-file support for attribution.
+- **Copyright line:** `Copyright 2026 YourBIMpossible` (see `NOTICE` and the
+  `LICENSE` appendix).
 
-Pick one and add the corresponding `LICENSE` file at the repo root (and, if you
-want, an SPDX header line in each source file):
+## Provenance verification (basis for the choice)
 
-| Option | Effect |
+Verified against the merged `main` tree on 2026-09-12 before adding the license:
+
+| Check | Result |
 |---|---|
-| **MIT** | Simplest permissive; keep copyright + license notice. Common for small tool repos. |
-| **Apache-2.0** | Permissive + explicit patent grant + `NOTICE` support. |
-| **BSD-3-Clause** | Permissive; adds a no-endorsement clause. |
-| **GPL-3.0 / MPL-2.0** | Copyleft (share-alike). Only if you want derivatives kept open. |
-| **Keep unlicensed** | Deliberate all-rights-reserved. State it explicitly so it is a choice, not an oversight. |
+| All tracked source first-party? | Yes — no copied/adapted-from markers, no third-party copyright/SPDX/license notices in any tracked file. |
+| Python dependencies | **stdlib only** (argparse, json, sqlite3, subprocess, pathlib, re, urllib, tomllib, …). No `requirements.txt` / `setup.py` / `pyproject.toml` / `Pipfile`. |
+| `skillspector/src` tracked? | **No.** Only first-party wrapper scripts (`Run-…`, `Update-…`, `SkillTargets.ps1`) and README are tracked; the upstream project is cloned at setup under its own license. |
+| `skillspector/baselines/*` | First-party SkillSpector scan metadata only — `version`, `rules: []`, and `fingerprints` (truncated content hashes + rule IDs + file names + review notes). **No third-party source text.** |
+| Third-party binaries (`bin/*.exe`) | Not tracked; downloaded at setup under their own licenses (see `bin/README.md`). |
+| `graphifyy` (PyPI) | Installed at setup under its own license; not redistributed. |
 
-## Third-party components are separately licensed (not affected by this choice)
+**Conclusion:** all tracked material is licensable by the repository owner and no
+incompatible third-party code is distributed → Apache-2.0 is applicable and was
+added.
 
-- **skillspector** (`skillspector/src/`) — NVIDIA's project, **not vendored here**;
-  cloned at setup under its own upstream license. This repo's license does not
-  cover it.
-- **graphifyy** — installed from PyPI at setup; its own license applies.
+## Third-party components (separately licensed — unchanged by this choice)
+
+- **SkillSpector** — upstream project, cloned into `skillspector/src/` at setup;
+  not vendored here. Governed by its own upstream license.
+- **graphifyy** — PyPI package installed at setup; its own license applies.
 - **gitleaks / trivy** (`bin/`) — downloaded at setup; their own licenses apply.
 
-Only the first-party tool source in this repo (ctxcheck, ctxdex, the graphify
-ops scripts, local-audit, the skillspector *wrapper* scripts, `tools/`) is
-covered by whatever license the owner chooses.
-
-## How to resolve
-
-1. Decide the license (or decide to stay unlicensed on purpose).
-2. Add `LICENSE` at the repo root; optionally add SPDX headers.
-3. Delete this file, or replace it with a one-line pointer to the chosen license.
+This repository's Apache-2.0 grant covers only the first-party tool source and
+documentation tracked here. See [NOTICE](../NOTICE).
