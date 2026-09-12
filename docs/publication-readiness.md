@@ -108,11 +108,68 @@ Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
     run from a clean clone.
   - `tools/release-check.ps1` in the clone: **All release gates passed.**
 
-### Recovery bundle
-- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-20260912T165910Z.bundle`
-- Created (UTC): `2026-09-12T16:59:10Z`
+### Recovery bundle (authoritative — pushed tip)
+- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-final-20260912T170206Z.bundle`
+- Created (UTC): `2026-09-12T17:02:06Z`
 - `git bundle verify`: "The bundle records a complete history."
-- Contents: `main` @ `351a644…`, `hardening/public-boundary` @ `0ef9898…`.
-- SHA-256: `18ea761cdf7a1a3bf333fb73253105bf29cc51492eae6acea592747e2f2edca6`
-- Round-trip: cloned from the bundle → HEAD `0ef9898…`, 82 files, no private
-  configs present. Recovery path confirmed.
+- Contents: `main` @ `351a644…`, `hardening/public-boundary` @ `3dc9612…` (the
+  pushed PR tip).
+- SHA-256: `cabe1db597170788ad1123153c78aac9bff2efede677f462df9e759b28768cc6`
+- Supersedes the earlier `…T165910Z` bundle (captured at `0ef9898`, before the
+  Phase 7 provenance commit). Both remain on disk; this one is authoritative.
+
+## Phase 8 — final push, remote verification & disposition (done)
+
+### 8.1 What was pushed
+- Branch `hardening/public-boundary`, tip `3dc9612ab21a6a9cda136746ab931c254af13509`.
+- Normal commits only; **no force-push, no history rewrite, no squash/rebase**.
+- Commit graph: `3dc9612` (Ph7) ← `0ef9898` (Ph6) ← `d89e70c` (Ph5) ←
+  `893d633` (Ph4) ← `0beabe1` (Ph2/3) ← `351a644` (baseline).
+- `main` untouched: local and remote `main` both remain at `351a644`.
+- PR #1 opened for owner review: https://github.com/YourBIMpossible/claude-tools/pull/1
+  (**not merged** — merge is the owner's call).
+
+### 8.2 Remote verification (post-push)
+- Remote branch tip == local: `3dc9612…` ✓
+- Remote tracked file count: **82** ✓
+- Remote-tree private-file scan: no `bimpossible.toml`, no `reports/`, `state/`,
+  `*.exe`, `*.db`, `.env*`, or AI-Dev/BASELINE artifacts. The only fuzzy hit was
+  `graphify/recall/rerank_bm25.py` — a **false positive** (generic BM25 rerank
+  *method*; unrelated to the removed private `RERANK-EXPERIMENT.md`). Tree clean. ✓
+
+### 8.3 CI
+- GitHub Actions `CI` on the PR: **success** (run `34706988401`, 14s).
+- Read-only least-privilege (`contents: read`), SHA-pinned actions, no secrets,
+  triggers limited to `pull_request` + `workflow_dispatch`.
+
+### 8.4 Gate results at `3dc9612`
+| Gate | Result |
+|---|---|
+| gitleaks (published tree, 8.18.4) | no leaks |
+| `pre_publish_check.py` boundary | PASS |
+| ctxcheck tests | 48/48 |
+| ctxdex secret-gate | 43/43 |
+| census-only guard (`test_local_audit.py`) | held (10/10) |
+| slop_prepass self-test | 11/11 |
+| `tools/release-check.ps1` (all of the above) | all gates passed |
+
+### 8.5 Final disposition — **READY WITH OWNER DECISIONS**
+
+Two items require the owner and are intentionally left unresolved (per spec: do
+not rewrite history or invent a license without direction):
+
+1. **Git-history exposure of removed private files.** The corrective commits
+   remove `ctxcheck/configs/bimpossible.toml` (private endpoint/route/env-name
+   inventory) and the other Phase-2 files from the **current** tree, but that
+   content still exists in Git history at `351a644` and in any fork/cache/CI
+   mirror of that commit. A clean current tree does **not** un-expose history.
+   Owner decision required: (a) leave as-is, (b) rewrite history / re-create the
+   repo from the hardened tip, and/or (c) rotate any identifiers that were
+   exposed by name. See [public-boundary.md](public-boundary.md) for the file list.
+2. **License.** No LICENSE and no prior stated intent → not invented; repo is
+   therefore all-rights-reserved by default. Choose per
+   [license-decision.md](license-decision.md).
+
+Everything within the automated scope is green; the repository is safe to keep
+public as-is pending those two owner calls. Merge of PR #1 is likewise the
+owner's decision.
