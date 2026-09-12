@@ -108,15 +108,17 @@ Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
     run from a clean clone.
   - `tools/release-check.ps1` in the clone: **All release gates passed.**
 
-### Recovery bundle (authoritative — pushed tip)
-- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-final-20260912T170206Z.bundle`
-- Created (UTC): `2026-09-12T17:02:06Z`
+### Recovery bundle (authoritative — final pushed tip)
+- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-final-20260912T170512Z.bundle`
+- Created (UTC): `2026-09-12T17:05:12Z`
 - `git bundle verify`: "The bundle records a complete history."
-- Contents: `main` @ `351a644…`, `hardening/public-boundary` @ `3dc9612…` (the
-  pushed PR tip).
-- SHA-256: `cabe1db597170788ad1123153c78aac9bff2efede677f462df9e759b28768cc6`
-- Supersedes the earlier `…T165910Z` bundle (captured at `0ef9898`, before the
-  Phase 7 provenance commit). Both remain on disk; this one is authoritative.
+- Contents: `main` @ `351a644…`, `hardening/public-boundary` @ `a661323…` (the
+  final pushed tip, including this Phase 8 report commit).
+- SHA-256: `feef196d9afde4a5b92a0fbe51c0a02fd9d007e9c1aefee19462beb7ebb4d659`
+- Supersedes the `…T170206Z` (tip `3dc9612`) and `…T165910Z` (tip `0ef9898`)
+  bundles; all remain on disk, this one is authoritative. (Recording this hash
+  is itself the last commit, so the recorded SHA is captured one commit ahead of
+  the doc line that names it — inherent and expected.)
 
 ## Phase 8 — final push, remote verification & disposition (done)
 
