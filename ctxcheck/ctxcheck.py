@@ -86,6 +86,7 @@ def resolve_ref(token: str, repo: Path, doc_dir: Path) -> bool:
 _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _MD_LINK_RE = re.compile(r"\]\(([^)\s#]+)")
 _CODE_TOKEN_RE = re.compile(r"`([^`\n]+)`")
+_REV_RANGE_RE = re.compile(r"^[A-Za-z0-9_./~^-]+[.]{2,3}[A-Za-z0-9_./~^-]*$")
 
 
 def looks_like_path(tok: str) -> bool:
@@ -100,6 +101,9 @@ def looks_like_path(tok: str) -> bool:
         return False
     # command-flag fragments and bare separators
     if t.startswith("-") or t in ("/", "\\"):
+        return False
+    # git revision ranges (`origin/main..HEAD`, `abc1234...feature/x`) are refs, not paths
+    if _REV_RANGE_RE.match(t):
         return False
     last = norm(t).rstrip("/").rsplit("/", 1)[-1]
     # require an extension in the last segment, or an explicit trailing slash

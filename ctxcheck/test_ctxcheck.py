@@ -51,7 +51,8 @@ def build_fixture(root: Path) -> Path:
         "# Fixture\nSee [the script](scripts/build.py) and `docs/arch.md`.\n"
         "Broken: [gone](scripts/gone.py) and `missing/dir/file.txt`.\n"
         "Ignored: `bash://20260101-000000` style URIs.\n"
-        "Line-ref works: `scripts/build.py:12`.\n",
+        "Line-ref works: `scripts/build.py:12`.\n"
+        "Range, not a path: `origin/main..HEAD` and `abc1234...feature/x`.\n",
         encoding="utf-8")
     (repo / "scripts").mkdir()
     (repo / "scripts" / "build.py").write_text("print('build')\n", encoding="utf-8")
@@ -177,6 +178,8 @@ max_age_days = 90
         check(not any("bash://" in m and "missing" in m for m in msgs),
               "refs: ignore pattern suppresses bash:// URIs")
         check(not any("build.py:12" in m for m in msgs), "refs: path:line suffix resolves")
+        check(not any("origin/main..HEAD" in m or "abc1234...feature/x" in m for m in msgs),
+              "refs: git revision ranges are not treated as paths")
         check(any(m.startswith("API_KEY_ID declared") for m in msgs), "env: declared name passes")
         check(any("service 'backend' defined" in m for m in msgs), "compose: backend found")
         check(not any("'data'" in m for m in msgs), "compose: volumes not parsed as services")
