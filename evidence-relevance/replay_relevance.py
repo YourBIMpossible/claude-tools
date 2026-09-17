@@ -46,13 +46,13 @@ def _import_compiler(src: Path):
     """Import evidence_compiler from --src and prove it was not shadowed by site-packages."""
     sys.path.insert(0, str(src))
     import evidence_compiler
-    from evidence_compiler import compiler, scoping
+    from evidence_compiler import compiler, ranking, scoping
     from evidence_compiler.collectors import ripgrep
 
     loaded = Path(evidence_compiler.__file__).resolve()
     if src.resolve() not in loaded.parents:
         raise SystemExit(f"import guard: evidence_compiler loaded from {loaded}, not under {src}")
-    return compiler, scoping, ripgrep, loaded
+    return compiler, ranking, scoping, ripgrep, loaded
 
 
 def _path_of(ref: str) -> str:
@@ -89,15 +89,21 @@ def _compile(compiler, scoping, repo: str, symbols: list[str]):
         scoping.build_task = real
 
 
-def _views(result) -> dict:
+def _views(result, ranking) -> dict:
     ev = result.packet.evidence
     rg_items = [e for e in ev if e.provenance.collector == "ripgrep" and e.provenance.extra.get("evidence_source") != STEM_SOURCE]
     stem_items = [e for e in ev if e.provenance.extra.get("evidence_source") == STEM_SOURCE]
-    # ranker order: evidence is canonical-sorted, selection is score-desc and stable on that order
     selected = [e for e in ev if e.compiler_assessment.selected]
-    order = {e.id: i for i, e in enumerate(ev)}
-    selected.sort(key=lambda e: (-e.compiler_assessment.final_score, order[e.id]))
+    if hasattr(ranking, "selection_key"):  # tie-break branch: mirror its real fill order
+        symbols = [s.lower() for s in result.packet.task.extracted_symbols if s]
+        selected.sort(key=lambda e: ranking.selection_key(e, symbols))
+    else:  # evidence is canonical-sorted, selection is score-desc and stable on that order
+        order = {e.id: i for i, e in enumerate(ev)}
+        selected.sort(key=lambda e: (-e.compiler_assessment.final_score, order[e.id]))
     return {
+        "stem_brief_rank": {_path_of(r): i + 1 for i, e in reversed(list(enumerate(selected)))
+                            if e.provenance.extra.get("evidence_source") == STEM_SOURCE
+                            for r in e.source_claim.references},
         "raw_sequence": [(e.provenance.extra.get("symbol"), _path_of(r)) for e in rg_items for r in e.source_claim.references],
         "raw_by_symbol": {s: sum(1 for e in rg_items if e.provenance.extra.get("symbol") == s) for s in {e.provenance.extra.get("symbol") for e in rg_items}},
         "stem_paths": {_path_of(r) for e in stem_items for r in e.source_claim.references},
@@ -138,7 +144,7 @@ def main() -> int:
         targets.setdefault(pid, set()).add(path.replace("\\", "/").lower())
     args.packet += [pid for pid in targets if pid not in args.packet]
 
-    compiler, scoping, ripgrep, loaded = _import_compiler(args.src)
+    compiler, ranking, scoping, ripgrep, loaded = _import_compiler(args.src)
     packets, _ = mr.load_packets()
     pool = [p for p in packets if p.traffic == "candidate" and Path(p.repo_root).is_dir()
             and (not args.packet or any(p.packet_id.startswith(x) for x in args.packet))]
@@ -158,7 +164,7 @@ def main() -> int:
         if not symbols:
             continue
 
-        runs = [_views(_compile(compiler, scoping, p.repo_root, symbols)) for _ in range(args.repeats)]
+        runs = [_views(_compile(compiler, scoping, p.repo_root, symbols), ranking) for _ in range(args.repeats)]
         uncapped = {s: _uncapped(ripgrep, p.repo_root, s, uncapped_cache) for s in symbols}
         v = runs[0]
         cap_hit = {s for s, n in v["raw_by_symbol"].items() if n >= ripgrep._MAX_MATCHES_PER_SYMBOL}
@@ -180,6 +186,8 @@ def main() -> int:
                 "in_final_candidates": [f in r["candidate_paths"] for r in runs],
                 "in_brief": [x is not None for x in ranks],
                 "brief_rank": ranks,
+                "stem_item_brief_rank": [r["stem_brief_rank"].get(f) for r in runs],
+                "symbols": symbols,
                 "cap_exclusion": _cap_exclusion(f, symbols, v, uncapped, ripgrep, cap_hit),
                 "in_uncapped_content": any(f in (uncapped.get(s) or set()) for s in symbols),
             })
