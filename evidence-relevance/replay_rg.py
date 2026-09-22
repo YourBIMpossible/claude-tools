@@ -58,10 +58,14 @@ def main() -> int:
 
     packets, _ = mr.load_packets()
     rows = []
+    issues: Counter = Counter()
     for p in packets:
         if p.traffic != "candidate" or not Path(p.repo_root).is_dir():
             continue
-        raw = json.loads(next(Path(p.store_root, ".evidence-compiler", "packets").glob(f"*{p.packet_id}*.json")).read_text(encoding="utf-8"))
+        raw = mr.load_packet_json(p.store_root, f"*{p.packet_id}*.json")
+        if raw is None:
+            issues["missing_packet_json"] += 1
+            continue
         symbols = raw.get("task", {}).get("extracted_symbols") or []
         if not symbols:
             continue
@@ -109,6 +113,8 @@ def main() -> int:
         "symbols_matched_new": sum(r["new_matched"] for r in rows),
         "file_sets_equal_old_vs_old": sum(r["old_vs_old_same_files"] for r in rows),
         "file_sets_equal_old_vs_new": sum(r["old_vs_new_same_files"] for r in rows),
+        "issues": dict(issues),
+        "complete": not issues,
     }
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

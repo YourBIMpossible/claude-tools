@@ -112,6 +112,14 @@ def traffic_classes(store_root: str) -> dict[str, tuple[str, str]]:
     return out
 
 
+def load_packet_json(store_root: str, glob_pattern: str) -> dict | None:
+    """Read a packet's raw JSON by glob under store_root; None (never raises) when absent."""
+    matches = list(Path(store_root, ".evidence-compiler", "packets").glob(glob_pattern))
+    if not matches:
+        return None
+    return json.loads(matches[0].read_text(encoding="utf-8"))
+
+
 def load_packets() -> tuple[list[Packet], Counter]:
     issues: Counter = Counter()
     packets: list[Packet] = []
@@ -199,6 +207,7 @@ def build_turns(packets: list[Packet]) -> tuple[dict[str, Turn], Counter]:
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
+                    issues["unreadable_transcript_line"] += 1
                     continue
                 ts = _ts(entry) or last
                 last = ts

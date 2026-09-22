@@ -152,6 +152,7 @@ def main() -> int:
 
     uncapped_cache: dict = {}
     rows, packet_rows = [], []
+    issues: Counter = Counter()
     for p in pool:
         turn = turns.get(p.packet_id)
         native = set(turn.opened) if turn else set()
@@ -159,7 +160,10 @@ def main() -> int:
         opened = sorted(native | named)
         if not opened:
             continue
-        raw = json.loads(next(Path(p.store_root, ".evidence-compiler", "packets").glob(f"*{p.packet_id}.json")).read_text(encoding="utf-8"))
+        raw = mr.load_packet_json(p.store_root, f"*{p.packet_id}.json")
+        if raw is None:
+            issues["missing_packet_json"] += 1
+            continue
         symbols = raw.get("task", {}).get("extracted_symbols") or []
         if not symbols:
             continue
@@ -208,6 +212,8 @@ def main() -> int:
         "packets_repeat_same_raw_path_set": sum(r["repeat_same_raw_path_set"] for r in packet_rows),
         "packets_repeat_same_brief": sum(r["repeat_same_brief"] for r in packet_rows),
         "files_brief_membership_unstable": sum(1 for r in rows if len(set(r["in_brief"])) > 1),
+        "issues": dict(issues),
+        "complete": not issues,
     }
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / f"replay_relevance_{args.label}.json").write_text(

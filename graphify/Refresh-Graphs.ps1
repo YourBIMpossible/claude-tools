@@ -176,7 +176,15 @@ foreach ($t in $targets) {
             }
             $rec.ok = $true
         } else {
-            "WARN $($t.Name): could not read stats from graph.json" | Add-Content -Path $log -Encoding utf8
+            # Extract/cluster succeeded but graph.json stats are unreadable:
+            # a real mid-run failure. Mirror the extract-fail branch — record a
+            # distinct exit_code, count it, and skip the meta stamp + OK summary.
+            $failed++
+            $rec.exit_code = -2
+            "FAIL $($t.Name): could not read stats from graph.json" | Add-Content -Path $log -Encoding utf8
+            $rec.ended_at = NowIso
+            $records += [pscustomobject]$rec
+            continue
         }
 
         # Sidecar stamp (graph.json carries no wall-clock timestamp upstream).
