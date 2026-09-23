@@ -4,7 +4,8 @@
 |---|---|
 | Base (`origin/main`) | `e2d9cb2` |
 | Branch | `security/publication-hygiene-closeout` |
-| PR / merge | recorded in the post-merge section below |
+| PR | YourBIMpossible/claude-tools#7 (branch head `3f6f572`) |
+| Merge (squash) | `6582fda` |
 
 ## 1. Current-tree inventory and dispositions
 
@@ -117,4 +118,14 @@ deletion or GitHub Support contact was made.
 
 ## 6. GitHub CI, merge and post-merge verification
 
-A follow-up commit records these once the merge lands.
+| Check | Result |
+|---|---|
+| GitHub CI, PR #7 (run 35933895030, job `boundary + secret + tests`) | success. All 11 gate steps passed, including `Public-boundary checker tests` and `evidence-relevance tests` |
+| Merge | squash `6582fda`, normal merge (no admin, no bypass) |
+| Reachable from `origin/main` after fetch | yes |
+| Enhanced checker on `origin/main` | PASS (99 tracked files, 0 findings, 3 exceptions all in use), exit 0 |
+| Checker tests on `origin/main` | 54/54 |
+| This report and the retention record present on `origin/main` | yes |
+| Task worktree and branches | removed after merge |
+
+**0 unresolved current-tree publication-boundary findings; historical disposition completed.**
