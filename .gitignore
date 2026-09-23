@@ -38,11 +38,11 @@
 # Vendored, not our source. Clone it into ./src at setup — see skillspector/README.md.
 /skillspector/src/
 
-# graphify/backups = exported AST graphs + run logs of PRIVATE repos (backend/Add-Ins).
+# graphify/backups = exported AST graphs + run logs of PRIVATE repos (backend/plugin).
 # Structural source leak; regenerable. Never ship.
 /graphify/backups/
 
-# graphify recall fixtures enumerate the private Add-Ins command inventory (ground-truth
+# graphify recall fixtures enumerate the private plugin command inventory (ground-truth
 # source paths). The method (measure_recall.py, rerank_bm25.py) and writeups ship; the
 # private-repo-specific query/baseline data does not.
 /graphify/recall/csharp-queries.json

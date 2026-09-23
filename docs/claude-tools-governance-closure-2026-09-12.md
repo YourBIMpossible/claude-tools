@@ -14,7 +14,9 @@
 - Historical baseline exposure accepted as architecture/privacy disclosure only.
 - No actual credential, private-key, token, customer-data, or client-data exposure found.
 - No credential rotation, history rewrite, force-push, or cache-removal action required.
-- Exact-path marker allowlist accepted.
+- Exact-path marker allowlist accepted. (Superseded 2026-09-23: whole-file
+  allowlist removed in favor of line-scoped exceptions; see
+  `audits/2026-09-23__publication-hygiene-closeout.md`.)
 - Predecessor repositories remain deleted.
 - Existing recovery bundle retained.
 

@@ -47,8 +47,8 @@ $ErrorActionPreference = 'Stop'
 # Resolve the script's own directory in the body, NOT in a param default.
 # Verified 2026-07-25: under `powershell.exe -File`, $PSScriptRoot evaluated
 # empty inside this script's param defaults, so $ReportDir became "\reports"
-# and a scheduled run silently wrote its output to C:\reports (the root of
-# whatever drive the task's working directory happened to be on).
+# and a scheduled run silently wrote its output to a reports folder at the root of
+# whatever drive the task's working directory happened to be on.
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
 if (-not $scriptRoot) { $scriptRoot = $PSScriptRoot }
 if (-not $ReportDir)  { $ReportDir  = Join-Path $scriptRoot 'reports' }

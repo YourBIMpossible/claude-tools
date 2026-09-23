@@ -2,7 +2,7 @@
 """Unit tests for measure_relevance.py's transcript join and packet-JSON lookup.
 
 No framework, plain checks (ctxdex-suite style, matching ctxcheck/test_ctxcheck.py).
-Runs against throwaway tempfile fixtures only — never the real ~/.claude/projects
+Runs against throwaway tempfile fixtures only — never the real Claude Code projects directory
 or a real .evidence-compiler store.
 """
 
@@ -34,7 +34,7 @@ def check(cond: bool, name: str) -> None:
 
 def test_build_turns_counts_malformed_line_and_keeps_valid_data(tmp_path: Path) -> None:
     session_id = "test-session-0001"
-    repo_root = "F:/fixture-repo"
+    repo_root = "/srv/fixture-repo"
     store_root = repo_root
     packet_id = "ep_test0000000001"
 

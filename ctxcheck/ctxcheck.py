@@ -21,7 +21,7 @@ because scans have false positives. staleness is always WARN (flag for review,
 not a defect). Exit 0 = no FAIL, exit 1 = FAILs (or WARNs under --strict),
 exit 2 = usage/config error.
 
-Deliberately out of scope (see claude-profile docs/adr/0001): context manifests,
+Deliberately out of scope (see the maintainer's private ADR 0001): context manifests,
 MCP wrappers, retrieval-eval machinery. ctxcheck reads and reports; it never
 indexes, rewrites, or serves anything.
 """

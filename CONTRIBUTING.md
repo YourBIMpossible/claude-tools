@@ -21,8 +21,8 @@ python tools/pre_publish_check.py                # forbidden-file + private-mark
 Never attach to a commit, issue, or PR: secrets, tokens, keys, `.env` files;
 customer/client/financial data; private source trees or architecture metadata
 (routes, service topology, internal class/command names, secret env-var names);
-generated reports, indexes, or databases; local-machine paths (`F:\…`,
-`C:\Users\…`), private hostnames/IPs, or personal emails. See
+generated reports, indexes, or databases; local-machine paths (drive-letter,
+UNC, or user-home), private hostnames/IPs, or personal emails. See
 [docs/public-boundary.md](docs/public-boundary.md) for the full allowed/forbidden
 policy and the examples/fixtures rules.
 
@@ -50,6 +50,8 @@ does not remove it from Git history or third-party caches.
 ```bash
 python ctxcheck/test_ctxcheck.py
 python ctxdex/test_ctxdex_gate.py
+python tools/test_pre_publish_check.py
+python evidence-relevance/test_measure_relevance.py
 python graphify/test_refresh_graphs.py   # needs pwsh (PowerShell 7)
 ```
 

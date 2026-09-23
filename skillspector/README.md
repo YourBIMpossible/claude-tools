@@ -64,7 +64,7 @@ kept all 119 findings. The flags do not compose, and nothing warns you.
 
 **4. A non-recursive scan of a parent directory does not scan the skills
 inside it.** It analyses the directory as one skill. A malicious skill planted
-in `~/.claude/skills` was not detected and the run reported CLEAN. This is why
+in the personal Claude Code skills directory was not detected and the run reported CLEAN. This is why
 `SkillTargets.ps1` enumerates skills and scans each one individually.
 
 **5. The exit code is severity-thresholded, not finding-based.** A skill with
@@ -101,7 +101,7 @@ Two bugs found while wiring this up, in case they resurface:
 
 - Under `powershell.exe -File`, `$PSScriptRoot` evaluated **empty** inside this
   script's param defaults, so `$ReportDir` became `\reports` and the first
-  scheduled run wrote its output to `C:\reports`. Both scripts now resolve
+  scheduled run wrote its output to a `reports` folder at the drive root. Both scripts now resolve
   their own directory in the body via `$MyInvocation.MyCommand.Definition`.
   If you add a script here, do the same -- do not use `$PSScriptRoot` in a
   param default.

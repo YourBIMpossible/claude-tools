@@ -12,6 +12,10 @@ GitHub cache-removal request is performed here; those remain owner decisions.
 
 ## Owner-decision block (read first)
 
+> **Decided 2026-09-23: Option A — retain history, no rewrite.** A full-ref
+> mirror scan found no credential, private key, or personal/customer data. See
+> [2026-09-23__history-retention-decision.md](2026-09-23__history-retention-decision.md).
+
 Based on the evidence below (no real secret values, no customer/client data —
 only architecture/privacy metadata):
 
@@ -81,7 +85,7 @@ repo that currently has **0 forks** and a ~9.5-hour public exposure window.
     API-router prefixes, docker service topology, and secret env-var NAMES. No
     secret values. Structural disclosure only; rewrite is an owner judgment call.
 
-- artifact_path: ctxcheck/configs/claude-profile.toml
+- artifact_path: ctxcheck/configs/<private-profile>.toml
   public_commit_range: 351a644 .. (removed in PR #1)
   exposure_category:
     - private source file/class/module inventory
@@ -248,7 +252,7 @@ repo that currently has **0 forks** and a ~9.5-hour public exposure window.
   current_tip_removed_or_anonymized: yes
   rotation_or_revocation_required: no
   history_rewrite_recommended: owner_decision_required
-  rationale: Pointer to a private AI-Dev path; dropped, public attribution kept.
+  rationale: Pointer to a legacy private-workspace path; dropped, public attribution kept.
 
 - artifact_path: ctxcheck/README.md
   public_commit_range: 351a644 .. (anonymized in PR #1)

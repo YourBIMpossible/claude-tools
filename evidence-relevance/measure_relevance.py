@@ -37,7 +37,11 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
-STORE_GLOBS = ("F:/*/.evidence-compiler", "F:/*/.claude/worktrees/*/.evidence-compiler")
+# Evidence stores live beside this checkout (sibling repos and their worktrees);
+# EVIDENCE_STORE_ROOT overrides the parent directory that is searched.
+STORE_ROOT = Path(os.environ.get("EVIDENCE_STORE_ROOT") or Path(__file__).resolve().parents[2])
+STORE_GLOBS = (str(STORE_ROOT / "*" / ".evidence-compiler"),
+               str(STORE_ROOT / "*" / ".claude/worktrees/*/.evidence-compiler"))
 OPEN_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "NotebookEdit"}
 SHELL_TOOLS = {"Bash", "PowerShell"}
 BASELINE_SHIFTS = (1, 2, 3, 5, 8)
