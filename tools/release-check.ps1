@@ -45,6 +45,7 @@ Step "ctxcheck tests"        { python ctxcheck/test_ctxcheck.py }
 Step "ctxdex secret-gate tests" { python ctxdex/test_ctxdex_gate.py }
 Step "local-audit census-only guard" { python local-audit/test_local_audit.py }
 Step "slop_prepass self-test" { python local-audit/slop_prepass.py --self-test }
+Step "graphify refresh failure-accounting tests" { python graphify/test_refresh_graphs.py }
 
 Pop-Location
 if ($fail -gt 0) { Write-Host "`n$fail gate(s) FAILED." -ForegroundColor Red; exit 1 }

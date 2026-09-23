@@ -50,6 +50,7 @@ does not remove it from Git history or third-party caches.
 ```bash
 python ctxcheck/test_ctxcheck.py
 python ctxdex/test_ctxdex_gate.py
+python graphify/test_refresh_graphs.py   # needs pwsh (PowerShell 7)
 ```
 
 CI (PR + manual dispatch only) runs these plus the boundary and secret scans.

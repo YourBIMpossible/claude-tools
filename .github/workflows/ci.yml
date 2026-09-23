@@ -47,6 +47,10 @@ jobs:
       - name: slop_prepass self-test
         run: python local-audit/slop_prepass.py --self-test
 
+      - name: graphify refresh failure-accounting tests
+        # Drives graphify/Refresh-Graphs.ps1 under pwsh (preinstalled on ubuntu-latest).
+        run: python graphify/test_refresh_graphs.py
+
       - name: Install gitleaks (pinned, checksum-verified)
         run: |
           set -euo pipefail
