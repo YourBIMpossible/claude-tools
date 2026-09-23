@@ -39,7 +39,7 @@ exits 1 on any finding, stale exception or invalid config. There is no warn mode
 | Rule | Detects |
 |---|---|
 | `windows-drive-path` | Any drive letter, `\` or `/`, not part of a URL scheme or word |
-| `unc-path` | `\\host\share…` |
+| `unc-path` | Double-backslash host/share network paths |
 | `user-home-path` | `/home/<user>/`, `/Users/<user>/` |
 | `claude-user-home` | `~`, `$HOME`, `%USERPROFILE%`, `$env:USERPROFILE` + `.claude`, either separator |
 | `claude-worktree-path` | `.claude` + `worktrees`, either separator |
@@ -70,8 +70,8 @@ synthetic content only.
 | Forward-slash drive path | exit 1, 1 finding, literal redacted |
 | Multiple violations in one file | all 4 reported; distinct line numbers |
 | UNC path | exit 1, literal redacted |
-| `~/.claude`, `%USERPROFILE%\.claude` | exit 1 each |
-| `.claude/worktrees`, `.claude\worktrees` | exit 1 each |
+| Claude user-home, tilde and USERPROFILE forms | exit 1 each |
+| Claude worktree path, forward and backslash | exit 1 each |
 | `/home/<user>/` | exit 1, redacted |
 | Generated worktree name | exit 1 |
 | Private identifier (exact, and case/separator variant inside a path) | exit 1, name never printed |
@@ -107,7 +107,7 @@ deletion or GitHub Support contact was made.
 
 | Gate | Result |
 |---|---|
-| `tools/pre_publish_check.py` | PASS (97 files, 13 content rules, 19 identifiers, 3 exceptions) |
+| `tools/pre_publish_check.py` | PASS (98 files, 13 content rules, 19 identifiers, 3 exceptions) |
 | `tools/test_pre_publish_check.py` | 54/54 |
 | ctxcheck / ctxdex / local-audit guard / slop_prepass | 49/49, 43/43, held, 11/11 |
 | graphify refresh tests / evidence-relevance tests | 22/22, 7/7 |
