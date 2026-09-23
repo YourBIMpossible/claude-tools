@@ -1,6 +1,6 @@
 # Anti-slop code audit — Claude-Tools
 
-- **Scope:** FULL scan (no prior report). Repo `F:\Claude-Tools` (consolidated toolkit: ctxcheck, ctxdex, local-audit, graphify, skillspector, tools).
+- **Scope:** FULL scan (no prior report). Repo `claude-tools` (consolidated toolkit: ctxcheck, ctxdex, local-audit, graphify, skillspector, tools).
 - **Date:** 2026-09-13
 - **Mode:** READ-ONLY. No target file was edited; the only write is this report.
 - **Checks run:** (1) silent-catch census, (2) counter-integrity, (3) tested-but-dead.
