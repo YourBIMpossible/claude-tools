@@ -35,6 +35,9 @@ jobs:
       - name: Public-boundary check
         run: python tools/pre_publish_check.py
 
+      - name: Public-boundary checker tests
+        run: python tools/test_pre_publish_check.py
+
       - name: Safe-by-default (census-only) guard
         run: python local-audit/test_local_audit.py
 
@@ -50,6 +53,9 @@ jobs:
       - name: graphify refresh failure-accounting tests
         # Drives graphify/Refresh-Graphs.ps1 under pwsh (preinstalled on ubuntu-latest).
         run: python graphify/test_refresh_graphs.py
+
+      - name: evidence-relevance tests
+        run: python evidence-relevance/test_measure_relevance.py
 
       - name: Install gitleaks (pinned, checksum-verified)
         run: |

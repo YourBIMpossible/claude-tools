@@ -1,0 +1,20 @@
+[
+  {
+    "path": "ctxdex/test_ctxdex_gate.py",
+    "rule": "email-address",
+    "line_sha256": "ddf148d0b0fee37d7aefe54ca8b3b4845ef88a07ec6b60a64bfd0e0cac3aa214",
+    "reason": "Synthetic credential-bearing connection string (user:pass@host) that the ctxdex secret gate must refuse; not a real address. Also scoped in .gitleaks.toml."
+  },
+  {
+    "path": "evidence-relevance/measure_relevance.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "c8b0fa5c46c5a755d2fe2bff71a87753ceb2f5e8893e9e28335041342f924e98",
+    "reason": "Functional glob: evidence stores inside Claude Code worktrees of sibling checkouts, relative to the configurable STORE_ROOT; no machine-specific prefix."
+  },
+  {
+    "path": "evidence-relevance/measure_relevance.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "c311dd613b8dff66ddfc132b1b9c46d3cd7bc7ffe0db89aca94b307d7a7b92c3",
+    "reason": "Functional regex that strips a repo-relative Claude Code worktree prefix when joining transcript paths; no machine-specific prefix."
+  }
+]

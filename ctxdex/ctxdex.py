@@ -39,7 +39,7 @@ SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "bin", "obj
 # --allow-sensitive escape hatch until a real need appears.
 #
 # ALIGNMENT NOTE: the content patterns are a deliberate duplicate of
-# _OUTPUT_PATTERNS in claude-profile/hooks/ctxdex_autoindex.py (auto-capture's
+# _OUTPUT_PATTERNS in the profile repo's hooks/ctxdex_autoindex.py (auto-capture's
 # gate). The two policies must stay aligned — change one, change both, and keep
 # their test vectors matching. Duplicated on purpose: this standalone repo must
 # not depend on the hook at runtime.

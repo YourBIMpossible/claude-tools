@@ -5,7 +5,7 @@
 #
 # Gates:
 #   1. Gitleaks secret scan (bin/gitleaks.exe — fetch per bin/README.md)
-#   2. Public-boundary check (tools/pre_publish_check.py)
+#   2. Public-boundary check (tools/pre_publish_check.py) + its tests
 #   3. Unit tests (ctxcheck, ctxdex gate)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -30,7 +30,7 @@ Step "Gitleaks (published tree only)" {
     $dst = Join-Path $tmp 'tree'
     New-Item -ItemType Directory -Path $dst -Force | Out-Null
     try {
-        # zip + native Expand-Archive: avoids GNU tar treating "C:\..." as a remote host.
+        # zip + native Expand-Archive: avoids GNU tar treating a drive-letter path's colon as a remote host.
         $zip = Join-Path $tmp 'tree.zip'
         git archive --format=zip -o $zip HEAD
         Expand-Archive -Path $zip -DestinationPath $dst -Force
@@ -41,11 +41,13 @@ Step "Gitleaks (published tree only)" {
     } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 }
 Step "Public-boundary check" { python tools/pre_publish_check.py }
+Step "Public-boundary checker tests" { python tools/test_pre_publish_check.py }
 Step "ctxcheck tests"        { python ctxcheck/test_ctxcheck.py }
 Step "ctxdex secret-gate tests" { python ctxdex/test_ctxdex_gate.py }
 Step "local-audit census-only guard" { python local-audit/test_local_audit.py }
 Step "slop_prepass self-test" { python local-audit/slop_prepass.py --self-test }
 Step "graphify refresh failure-accounting tests" { python graphify/test_refresh_graphs.py }
+Step "evidence-relevance tests" { python evidence-relevance/test_measure_relevance.py }
 
 Pop-Location
 if ($fail -gt 0) { Write-Host "`n$fail gate(s) FAILED." -ForegroundColor Red; exit 1 }

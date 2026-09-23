@@ -6,7 +6,7 @@ No hooks, no telemetry, no fake sandbox, no config rewriting. One file, stdlib o
 
 ## Usage
 
-See [`../../claude-profile/skills/ctxdex/SKILL.md`](../../claude-profile/skills/ctxdex/SKILL.md) for the working rules Claude follows. Direct CLI:
+The working rules Claude follows live in a separate, non-public skill definition (`SKILL.md`). Direct CLI:
 
 ```bash
 python ctxdex.py index <path-or-url> --source LABEL
@@ -29,4 +29,4 @@ Each project gets its own DB under `data/<project>.db`, named for the invoking c
 
 Per the assessment: sandboxed execution, PreCompact/SessionStart session snapshots, and Bash/Read nudges were all judged duplicative of existing tools (Bash+scratchpad, LONG-TASK-HARNESS anchor docs, the context-budget skill) and were skipped.
 
-One related mechanism was added later (2026-08-07): a PostToolUse hook (`../../claude-profile/hooks/ctxdex_autoindex.py`) that auto-indexes large (≥100 KiB) Bash output under `source=bash-output`. This differs from a "nudge" — it's a silent side effect (empty stdout, exit 0 always, fails open on any error) with no prompt-injection or conversational noise, gated by a secret-safety filter on both command and output, and a 14-day retention window scoped independently of manually-indexed content. See the SKILL.md "Auto-capture" section for the full contract.
+One related mechanism was added later (2026-08-07): a PostToolUse hook (`ctxdex_autoindex.py`, kept in the non-public profile repo) that auto-indexes large (≥100 KiB) Bash output under `source=bash-output`. This differs from a "nudge" — it's a silent side effect (empty stdout, exit 0 always, fails open on any error) with no prompt-injection or conversational noise, gated by a secret-safety filter on both command and output, and a 14-day retention window scoped independently of manually-indexed content. See the SKILL.md "Auto-capture" section for the full contract.

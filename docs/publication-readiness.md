@@ -30,7 +30,7 @@ Living record of the post-publication hardening pass. Non-sensitive by design.
 Full policy: [public-boundary.md](public-boundary.md). Summary: this repo tracks
 reusable **tool source only**. No BIMpossible private source, private architecture
 metadata, local-machine data, private audit output, credentials, customer/financial
-data, databases, indexes, generated logs, third-party binaries, or legacy AI-Dev
+data, databases, indexes, generated logs, third-party binaries, or legacy private-workspace
 content. Evidence is always the committed Git tree, never `.gitignore` alone.
 
 ## Validation commands
@@ -87,13 +87,14 @@ corrective commit does not un-expose it. History rewrite is an **owner decision*
 ### Reviewed exceptions
 - `ctxdex/test_ctxdex_gate.py` — synthetic secret vectors (AWS public-docs example
   key, placeholder PEM, dummy connection strings). Allowlisted in `.gitleaks.toml`
-  and `pre_publish_check.py`; the suite asserts ctxdex *refuses* to index each.
+  and (since 2026-09-23) as a single line-scoped `email-address` exception in
+  `tools/public-boundary-exceptions.json`; the suite asserts ctxdex *refuses* to index each.
 
 ### Phase 7 — clean-clone & recovery validation (done)
-Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
+Validated **outside** the working checkout, on the pre-push hardening tip.
 
 - Source: fresh `git clone` of branch `hardening/public-boundary` into a temp dir
-  (not under `F:\Claude-Tools`). Cloned HEAD `0ef9898…`, **82 tracked files**.
+  (not under the working checkout). Cloned HEAD `0ef9898…`, **82 tracked files**.
 - Confirmed git-ignored/untracked content is absent in a fresh clone:
   `skillspector/src/`, `reports/`, and `bin/*.exe` are not present (bin has only
   its README). No pre-built private artifact is required.
@@ -109,7 +110,7 @@ Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
   - `tools/release-check.ps1` in the clone: **All release gates passed.**
 
 ### Recovery bundle (authoritative — final pushed tip)
-- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-final-20260912T170512Z.bundle`
+- Path (outside the repo): `<recovery-dir>/claude-tools-final-20260912T170512Z.bundle`
 - Created (UTC): `2026-09-12T17:05:12Z`
 - `git bundle verify`: "The bundle records a complete history."
 - Contents: `main` @ `351a644…`, `hardening/public-boundary` @ `a661323…` (the
@@ -122,7 +123,7 @@ Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
 
 ### Post-merge recovery bundle (current authoritative)
 - After PR #1 merged to `main` (merge `deeb728`).
-- Path (outside the repo): `F:\Claude-Tools-recovery\claude-tools-postmerge-20260912T181302Z.bundle`
+- Path (outside the repo): `<recovery-dir>/claude-tools-postmerge-20260912T181302Z.bundle`
 - Created (UTC): `2026-09-12T18:13:02Z`
 - `git bundle verify`: "The bundle records a complete history."
 - Contents: `main` @ `deeb728…` (merged), `hardening/public-boundary` @ `7646f2d…`,
@@ -146,7 +147,7 @@ Validated **outside** `F:\Claude-Tools`, on the pre-push hardening tip.
 - Remote branch tip == local: `3dc9612…` ✓
 - Remote tracked file count: **82** ✓
 - Remote-tree private-file scan: no `bimpossible.toml`, no `reports/`, `state/`,
-  `*.exe`, `*.db`, `.env*`, or AI-Dev/BASELINE artifacts. The only fuzzy hit was
+  `*.exe`, `*.db`, `.env*`, or legacy-workspace/BASELINE artifacts. The only fuzzy hit was
   `graphify/recall/rerank_bm25.py` — a **false positive** (generic BM25 rerank
   *method*; unrelated to the removed private `RERANK-EXPERIMENT.md`). Tree clean. ✓
 

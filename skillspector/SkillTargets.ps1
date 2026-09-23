@@ -31,7 +31,7 @@ function Get-SkillTargets {
 
     $targets = @()
 
-    # Personal skills: ~/.claude/skills/<skill>/SKILL.md
+    # Personal skills: <USERPROFILE>/.claude/skills/<skill>/SKILL.md
     if (Test-Path $SkillsRoot) {
         Get-ChildItem $SkillsRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
             if (Test-Path (Join-Path $_.FullName 'SKILL.md')) {
@@ -44,7 +44,7 @@ function Get-SkillTargets {
         }
     }
 
-    # Plugin skills: ~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md
+    # Plugin skills: <USERPROFILE>/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md
     # The <version> segment changes on every plugin update, so it is discovered
     # rather than hardcoded, and the baseline is keyed on <plugin>/<skill> so a
     # version bump does not orphan it.

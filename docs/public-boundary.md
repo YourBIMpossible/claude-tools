@@ -22,12 +22,12 @@ never `.gitignore` alone.
   secret env-var name sets, or operational targets.
 - Private/historical audit or report output; benchmark data derived from private
   source.
-- Local-machine paths (`F:\…`, `C:\Users\…`), personal home dirs, private
+- Local-machine paths (absolute drive-letter or UNC paths, user-home paths), personal home dirs, private
   hostnames, private IPs, private git URLs, personal emails.
 - Credentials, tokens, keys, `.env` / `.env.*`, database dumps, SQLite/Postgres
   DBs, FTS indexes, logs, caches, virtualenvs.
 - Third-party executables / DLLs / vendored binaries.
-- Any `F:\AI-Dev` / legacy content.
+- Any legacy private-workspace content.
 
 ## Examples & fixtures policy
 
@@ -50,6 +50,18 @@ clone builds its own; nothing here depends on a pre-built private artifact.
 1. Before any push, scan the **committed tree**:
    - `bin/gitleaks.exe detect --source . --no-banner`
    - `python tools/pre_publish_check.py`
+
+   The boundary check scans every tracked file (no whole-file allowlist), reports
+   every match redacted as file:line + rule, and exits nonzero on any finding.
+   Rules: `windows-drive-path` (any letter, either separator), `unc-path`,
+   `user-home-path`, `claude-user-home`, `claude-worktree-path`,
+   `worktree-autoname`, `internal-state-path`, `private-namespace`,
+   `private-source-path`, `email-address`, `private-ip`, `private-git-remote`, and
+   `private-identifier` (SHA-256 list in `tools/private-identifiers.sha256`; add a
+   name with `--hash-identifier`). Exceptions live in
+   `tools/public-boundary-exceptions.json`, each bound to one path, one rule and
+   the hash of one line, with a reason; an unused exception fails the check.
+   `tools/test_pre_publish_check.py` covers every rule and the exception semantics.
 2. Never attach secrets, `.env` files, customer/client data, private source
    trees, generated reports, or database dumps to commits, issues, or PRs.
 3. If you find a questionable file, do **not** silently delete it: open an issue
@@ -66,7 +78,7 @@ Baseline `351a644`. Dispositions applied:
 | Item | Classification | Action |
 |---|---|---|
 | `ctxcheck/configs/bimpossible.toml` | Remove — private endpoint/route/env inventory | Deleted; replaced by `configs/example.toml` |
-| `ctxcheck/configs/claude-profile.toml` | Remove — private repo inventory + local paths | Deleted |
+| `ctxcheck/configs/<private-profile>.toml` | Remove — private repo inventory + local paths | Deleted |
 | `ctxcheck/configs/memory.toml` | Remove — local machine path, private target | Deleted |
 | `ctxcheck/audits/*` (2) | Remove — generated operational output, local paths | Deleted |
 | `ctxdex/audits/*` (1) | Remove — generated operational output | Deleted |
@@ -78,7 +90,7 @@ Baseline `351a644`. Dispositions applied:
 | `local-audit/audit-repo.cmd` | Anonymize — default scanned a private repo | Default now current dir |
 | `local-audit/full-audit.cmd` | Anonymize — same | Default now current dir |
 | `local-audit/README.md` | Anonymize — absolute self-paths | Relative paths |
-| `ctxdex/README.md` | Anonymize — pointer to private AI-Dev path | Dropped path; kept public attribution link |
+| `ctxdex/README.md` | Anonymize — pointer to a legacy private-workspace path | Dropped path; kept public attribution link |
 | `ctxcheck/README.md` | Anonymize — private ADR reference | Genericized |
 | `ctxdex/test_ctxdex_gate.py` | Keep — synthetic secret vectors (Gitleaks-allowlisted) | Kept; see Phase 3 |
 | skillspector baselines, other source | Safe | Kept |

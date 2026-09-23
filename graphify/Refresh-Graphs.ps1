@@ -23,7 +23,7 @@
 #
 # `extract --code-only` (NOT `update`): `graphify update` has no --code-only
 # concept — proven 2026-08-07, it re-extracted the skipped docs and grew the
-# just-built Add-Ins graph 6,585 -> 8,610 nodes (1,987 .md nodes). Plain
+# just-built plugin graph 6,585 -> 8,610 nodes (1,987 .md nodes). Plain
 # extract honors --code-only AND is incremental (the manifest gate skips
 # unchanged files; --force is what disables that). Trade-off: we lose update's
 # refuses-to-shrink guard — the health record's drift warning covers that.
@@ -105,8 +105,8 @@ $ErrorActionPreference = $eap
 #   Scan = folder to extract the AST graph from (graphify-out\ is written here)
 #   Repo = repo root (used to record HEAD; may equal Scan)
 $targets = @(
-    @{ Name = 'my-backend';  Scan = 'C:\path\to\backend'; Repo = 'C:\path\to\repo' },
-    @{ Name = 'my-frontend'; Scan = 'C:\path\to\frontend'; Repo = 'C:\path\to\repo' }
+    @{ Name = 'my-backend';  Scan = '<path-to-backend>'; Repo = '<path-to-repo>' },
+    @{ Name = 'my-frontend'; Scan = '<path-to-frontend>'; Repo = '<path-to-repo>' }
 )
 
 $failed  = 0

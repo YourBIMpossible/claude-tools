@@ -9,7 +9,7 @@
 - [ ] Ran `pwsh tools/release-check.ps1` (or the individual gates) and it passed.
 - [ ] No secrets, `.env`, credentials, or keys added.
 - [ ] No private source, routes/endpoints, service topology, secret env-var
-      names, local-machine paths (`F:\…`, `C:\Users\…`), private hosts/IPs, or
+      names, local-machine paths (drive-letter, UNC, user-home), private hosts/IPs, or
       personal emails added (see `docs/public-boundary.md`).
 - [ ] Any new tool/example/fixture uses **synthetic** data only and is labelled.
 - [ ] Audit/analysis code stays **census/report-only** (no default remediation).
