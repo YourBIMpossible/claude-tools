@@ -6,12 +6,13 @@ Only the external `graphify` executable is faked (GRAPHIFY_EXE). The stats read
 is real: PYTHON_EXE is this interpreter, and the stats-failed target carries a
 malformed graph.json, so the script's own embedded json.loads is what fails.
 
-The script's hardcoded $targets block is swapped for synthetic targets in a
-temp copy; every other line runs verbatim. Run: python test_refresh_graphs.py
+Synthetic targets arrive via a temp graphify.local.json (GRAPHIFY_CONFIG); the
+shipped script runs verbatim. Config-failure cases assert the fail-closed path
+(graphify is never invoked); relative-path cases run from a working directory
+outside the config folder, as a scheduled task does. Run: python test_refresh_graphs.py
 """
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +20,6 @@ import tempfile
 from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("Refresh-Graphs.ps1")
-TARGETS_BLOCK = re.compile(r"^\$targets = @\(\r?\n.*?^\)\r?$", re.M | re.S)
 
 # Fake graphify: `extract` exits 3 inside a scan dir named extract-fail, every
 # other call succeeds without touching graph.json.
@@ -45,12 +45,111 @@ def make_target(root, name, graph_text):
     return scan
 
 
-def ps_quote(path):
-    return "'" + str(path).replace("'", "''") + "'"
+# Fake graphify for fail-closed cases: any invocation leaves a marker file.
+MARKER_GRAPHIFY = """Set-Content -Path $env:GRAPHIFY_TEST_MARKER -Value "invoked $args"
+exit 0
+"""
+
+
+def clean_env(**over):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHIFY_") and k != "PYTHON_EXE"}
+    env.update(over)
+    return env
+
+
+def run_script(pwsh, env, cwd=None):
+    return subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT)],
+                          capture_output=True, text=True, timeout=120, env=env, cwd=cwd)
+
+
+def config_failure_cases(pwsh):
+    """Missing / invalid config must fail closed: exit 1, FATAL log line,
+    config_status + config_error in health.json, prior last_success_at
+    preserved, and graphify never invoked."""
+    cases = {
+        "missing": (None, "missing"),
+        "placeholder": (json.dumps({"targets": [{"name": "x", "scan": "<path-to-backend>"}]}), "invalid"),
+        "no-targets": (json.dumps({"targets": []}), "invalid"),
+        "bad-json": ("{ nope", "invalid-json"),
+        "not-an-object": ("[]", "invalid-json"),
+        "bad-name": (json.dumps({"targets": [{"name": "has space/slash", "scan": "."}]}), "invalid"),
+        "drive-relative": (json.dumps({"targets": [{"name": "x", "scan": "C" + ":rel"}]}), "invalid"),
+        "placeholder-dashboard": (json.dumps({"targets": [{"name": "x", "scan": "."}],
+                                              "dashboard_dirs": ["<path-to-dashboard>"]}), "invalid"),
+        "embedded-placeholder": (json.dumps({"targets": [{"name": "x", "scan": "repos/<path-to-backend>"}]}), "invalid"),
+        # pwsh 7 would unwrap this one-element array into an object; 5.1 would not.
+        "wrapped-object": (json.dumps([{"targets": [{"name": "x", "scan": "."}]}]), "invalid-json"),
+    }
+    if "powershell" in os.path.basename(pwsh).lower():
+        # .NET Framework rejects '|' in paths; that must be a config error, not a crash.
+        cases["invalid-path-char"] = (json.dumps({"targets": [{"name": "x", "scan": "a|b"}]}), "invalid")
+    for label, (body, status) in cases.items():
+        tmp = Path(tempfile.mkdtemp(prefix=f"refresh-graphs-cfg-{label}-"))
+        try:
+            config = tmp / "graphify.local.json"
+            if body is not None:
+                config.write_text(body, encoding="utf-8")
+            (tmp / "health.json").write_text(json.dumps({"last_success_at": PREV_SUCCESS}), encoding="utf-8")
+            fake = tmp / "marker-graphify.ps1"
+            fake.write_text(MARKER_GRAPHIFY, encoding="utf-8")
+            marker = tmp / "graphify-invoked.txt"
+            env = clean_env(GRAPHIFY_ROOT=str(tmp), GRAPHIFY_CONFIG=str(config), GRAPHIFY_EXE=str(fake),
+                            PYTHON_EXE=sys.executable, GRAPHIFY_TEST_MARKER=str(marker))
+            p = run_script(pwsh, env)
+            check(f"8 config {label}: exits 1", p.returncode == 1, f"rc={p.returncode} stderr={p.stderr.strip()[:300]}")
+            health = json.loads((tmp / "health.json").read_text(encoding="utf-8-sig"))
+            run = health.get("last_run") or {}
+            check(f"8 config {label}: config_error recorded", bool(run.get("config_error")) and run.get("exit_code") == 1,
+                  f"run={run}")
+            check(f"8 config {label}: config_status {status}", run.get("config_status") == status,
+                  f"got {run.get('config_status')}")
+            check(f"8 config {label}: refresh did not run (graphify never invoked)", not marker.exists())
+            check(f"8 config {label}: last_success_at kept", health.get("last_success_at") == PREV_SUCCESS)
+            log = (tmp / "refresh-log.txt").read_text(encoding="utf-8-sig")
+            check(f"8 config {label}: FATAL config logged", "FATAL config (" in log)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def relative_path_cases(pwsh):
+    """Relative config paths resolve against the config file's folder, not the
+    (scheduled-task) working directory, and are recorded absolute."""
+    tmp = Path(tempfile.mkdtemp(prefix="refresh-graphs-relpath-"))
+    try:
+        cfg_dir = tmp / "cfg"
+        elsewhere = tmp / "elsewhere"
+        elsewhere.mkdir(parents=True)
+        good_graph = json.dumps({"built_at_commit": "", "nodes": [{"id": "a", "community": 0}], "links": []})
+        make_target(cfg_dir / "scans", "rel", good_graph)
+        (cfg_dir / "tools").mkdir(parents=True)
+        (cfg_dir / "tools" / "fake-graphify.ps1").write_text(FAKE_GRAPHIFY, encoding="utf-8")
+        config = cfg_dir / "graphify.local.json"
+        config.write_text(json.dumps({
+            "targets": [{"name": "rel", "scan": "scans/rel", "repo": "scans"}],
+            "graphify_exe": "tools/fake-graphify.ps1",
+            "python_exe": sys.executable,
+        }), encoding="utf-8")
+        env = clean_env(GRAPHIFY_ROOT=str(tmp), GRAPHIFY_CONFIG=str(config))
+        p = run_script(pwsh, env, cwd=str(elsewhere))
+        check("9 relative: exits 0 from a foreign cwd", p.returncode == 0,
+              f"rc={p.returncode} stderr={p.stderr.strip()[:300]}")
+        health = json.loads((tmp / "health.json").read_text(encoding="utf-8-sig"))
+        rec = (health.get("last_run") or {}).get("targets") or [{}]
+        expected = os.path.realpath(cfg_dir / "scans" / "rel")
+        got = rec[0].get("scan") or ""
+        # realpath on both sides: Windows TEMP may be an 8.3 short name that 5.1 expands.
+        check("9 relative: scan recorded absolute, anchored at the config folder",
+              os.path.isabs(got) and os.path.realpath(got) == expected, f"got {got} want {expected}")
+        check("9 relative: relative graphify_exe resolved (target ok)", rec[0].get("ok") is True, f"rec={rec[0]}")
+        check("9 relative: graph-meta.json written in the anchored scan dir",
+              (cfg_dir / "scans" / "rel" / "graphify-out" / "graph-meta.json").exists())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
-    pwsh = shutil.which("pwsh")
+    # GRAPHIFY_TEST_SHELL=powershell.exe re-runs the suite under Windows PowerShell 5.1.
+    pwsh = shutil.which(os.environ.get("GRAPHIFY_TEST_SHELL", "pwsh"))
     if not pwsh:
         print("FAIL: pwsh not found on PATH -- this suite needs PowerShell 7")
         sys.exit(1)
@@ -68,16 +167,10 @@ def main():
             "extract-fail": make_target(tmp, "extract-fail", good_graph),
         }
 
-        source = SCRIPT.read_text(encoding="utf-8-sig")
-        targets = "$targets = @(\n" + ",\n".join(
-            f"    @{{ Name = '{n}'; Scan = {ps_quote(s)}; Repo = {ps_quote(tmp)} }}" for n, s in scans.items()
-        ) + "\n)"
-        patched, n_subs = TARGETS_BLOCK.subn(lambda _m: targets, source)
-        check("0 setup: $targets block found exactly once", n_subs == 1, f"subs={n_subs}")
-        if n_subs != 1:
-            raise SystemExit(1)
-        script = tmp / "Refresh-Graphs.ps1"
-        script.write_text(patched, encoding="utf-8")
+        config = tmp / "graphify.local.json"
+        config.write_text(json.dumps({
+            "targets": [{"name": n, "scan": str(s), "repo": str(tmp)} for n, s in scans.items()],
+        }), encoding="utf-8")
 
         fake = tmp / "fake-graphify.ps1"
         fake.write_text(FAKE_GRAPHIFY, encoding="utf-8")
@@ -88,9 +181,10 @@ def main():
             "last_run": {"targets": [{"name": "good", "nodes": 3}]},
         }), encoding="utf-8")
 
-        env = dict(os.environ, GRAPHIFY_ROOT=str(tmp), GRAPHIFY_EXE=str(fake), PYTHON_EXE=sys.executable)
-        p = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
-                           capture_output=True, text=True, timeout=120, env=env)
+        # Env vars stay valid explicit overrides of the config's tool paths.
+        env = clean_env(GRAPHIFY_ROOT=str(tmp), GRAPHIFY_CONFIG=str(config),
+                        GRAPHIFY_EXE=str(fake), PYTHON_EXE=sys.executable)
+        p = run_script(pwsh, env)
         check("1 run: exits 1 when any target fails", p.returncode == 1,
               f"rc={p.returncode} stderr={p.stderr.strip()[:300]}")
 
@@ -143,6 +237,9 @@ def main():
               len(hist) == 1 and json.loads(hist[0])["exit_code"] == 1)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    config_failure_cases(pwsh)
+    relative_path_cases(pwsh)
 
     passed = sum(1 for _, c in results if c)
     print(f"\n{passed}/{len(results)} checks passed")

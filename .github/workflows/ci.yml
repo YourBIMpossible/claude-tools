@@ -54,6 +54,10 @@ jobs:
         # Drives graphify/Refresh-Graphs.ps1 under pwsh (preinstalled on ubuntu-latest).
         run: python graphify/test_refresh_graphs.py
 
+      - name: graphify health-check boundary tests
+        # Drives graphify/Check-GraphifyHealth.ps1 under pwsh; scheduled-task and PyPI calls are stubbed.
+        run: python graphify/test_health_check.py
+
       - name: evidence-relevance tests
         run: python evidence-relevance/test_measure_relevance.py
 
@@ -72,3 +76,28 @@ jobs:
         # --no-git on a fresh checkout scans exactly the tracked tree (git-ignored
         # dirs are not present in CI), mirroring the local release-check gate.
         run: ./gitleaks detect --source . --no-git --config .gitleaks.toml --redact --no-banner
+
+  graphify-winps51:
+    # The scheduled tasks run Windows PowerShell 5.1, whose JSON and path APIs
+    # differ from pwsh 7; the graphify suites run under it too.
+    name: graphify tests (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      GRAPHIFY_TEST_SHELL: powershell.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.11"
+
+      - name: graphify refresh tests (5.1)
+        run: python graphify/test_refresh_graphs.py
+
+      - name: graphify health-check boundary tests (5.1)
+        run: python graphify/test_health_check.py

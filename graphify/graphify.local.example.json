@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to graphify.local.json (gitignored) and fill in real paths. Relative paths resolve against this file's folder; bare exe names use PATH. Env vars GRAPHIFY_EXE / PYTHON_EXE / GRAPHIFY_DASHBOARD_DIRS override the matching keys.",
+  "targets": [
+    { "name": "my-backend",  "scan": "<path-to-backend>",  "repo": "<path-to-repo>" },
+    { "name": "my-frontend", "scan": "<path-to-frontend>", "repo": "<path-to-repo>" }
+  ],
+  "graphify_exe": "graphify",
+  "python_exe": "python",
+  "dashboard_dirs": []
+}

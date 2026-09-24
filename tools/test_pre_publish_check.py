@@ -139,6 +139,12 @@ def main() -> int:
 
     code, out = run_repo({"state/queue.yaml": "x: 1\n"})
     check("forbidden file class fails", code == 1 and "FORBIDDEN" in out, out)
+    for local in ("graphify/graphify.local.json", "graphify/graphify.local.bak.json",
+                  "graphify/publish-settings.lkg.json", "graphify/alerts.json", "graphify/refresh-log.txt"):
+        code, out = run_repo({local: "{}\n"})
+        check(f"graphify local state is forbidden: {local}", code == 1 and "FORBIDDEN" in out, out)
+    code, out = run_repo({"graphify/graphify.local.example.json": "{}\n"})
+    check("graphify config template stays publishable", code == 0, out)
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     for f in FAILURES:

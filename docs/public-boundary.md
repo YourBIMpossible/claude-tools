@@ -71,6 +71,44 @@ clone builds its own; nothing here depends on a pre-built private artifact.
    or third-party caches. Flag any such find explicitly so a history-rewrite
    decision can be made by the owner.
 
+## Graphify health dashboard boundary
+
+`graphify/graphify.local.json` holds real scan targets and tool paths. It is gitignored, never
+tracked, never published; `graphify.local.example.json` is the placeholder template. The
+last-known-good fallback `graphify/publish-settings.lkg.json` is gitignored too.
+
+`Check-GraphifyHealth.ps1` keeps two outputs apart:
+
+- **Local, full detail** — `alerts.json`, `health.json`, `health-check-log.txt`,
+  `refresh-log.txt`. These may name config paths, scan/repo paths, tool paths and parser errors.
+- **Public, `graphify-health.js`** — built only by `ConvertTo-GraphifyPublicHealth`
+  (`graphify/GraphifyPublic.ps1`), an allowlist projection; nothing is copied wholesale. Fields:
+  - top level: `checked_at`, `status` (ok|warn|error), `installed_version`, `latest_version`,
+    `version_checked`, `version_source` (pypi|cache|none), `update_available`, `last_success_at`,
+    `task_last_result`, `task_next_run`, `alerts`, `targets`
+  - `alerts[]`: `severity`, `code`, `message`, `action`, `context`. Messages are fixed generic
+    text; the local `detail` is never projected.
+  - `targets[]`: `name` (identifier-validated), `ok`, `exit_code`, `nodes`, `edges`,
+    `communities`, `node_drift_pct`, `drift_warning`, `head_match`, `ended_at`
+
+`Test-GraphifyPublicSafe` then re-scans the serialized result for drive, UNC, backslash,
+POSIX system/home, `~/`, `../` and URL-encoded path fragments and private keys; on a hit it publishes a minimal `public-projection-rejected`
+error stub instead. A config failure publishes a current `error` status, never a stale `ok`.
+An unreadable config, or a `python_exe` / `dashboard_dirs` value that fails validation,
+falls back per setting to the env override, then to the last-known-good settings (saved only
+from a fully valid config, never from env). With no dashboard dir from any of those, nothing is
+published and the local log says so. Alert text takes only validated values: target names
+pass the identifier check (else `target`), versions the version pattern, numbers are numbers;
+commit SHAs stay in the local `detail`.
+
+Relative-path policy: config-file paths resolve against the config file's folder and are
+normalized to absolute; bare executable names resolve on PATH; drive-relative (`C:x`) and
+root-relative (a single leading separator) values are rejected. Environment overrides are
+used verbatim.
+
+Regression coverage: `graphify/test_health_check.py` and `graphify/test_refresh_graphs.py`
+(both run in CI).
+
 ## Classification log — hardening pass 2026-09-12
 
 Baseline `351a644`. Dispositions applied:
@@ -84,8 +122,8 @@ Baseline `351a644`. Dispositions applied:
 | `ctxdex/audits/*` (1) | Remove — generated operational output | Deleted |
 | `graphify/recall/BASELINE.md` | Remove — benchmark data derived from private source | Deleted |
 | `graphify/recall/RERANK-EXPERIMENT.md` | Remove — same | Deleted |
-| `graphify/Refresh-Graphs.ps1` | Anonymize — machine paths + private scan targets | Parameterized ($PSScriptRoot, PATH, placeholder targets) |
-| `graphify/Check-GraphifyHealth.ps1` | Anonymize — machine paths + private dashboard dirs | Parameterized (env-driven, default off) |
+| `graphify/Refresh-Graphs.ps1` | Anonymize — machine paths + private scan targets | Parameterized ($PSScriptRoot, PATH); real targets/tool paths in gitignored graphify.local.json |
+| `graphify/Check-GraphifyHealth.ps1` | Anonymize — machine paths + private dashboard dirs | Parameterized (graphify.local.json / env, default off); published output is an allowlist projection — see [Graphify health dashboard boundary](#graphify-health-dashboard-boundary) |
 | `graphify/recall/measure_recall.py` | Anonymize — machine path + private example | PATH/env + generic example |
 | `local-audit/audit-repo.cmd` | Anonymize — default scanned a private repo | Default now current dir |
 | `local-audit/full-audit.cmd` | Anonymize — same | Default now current dir |

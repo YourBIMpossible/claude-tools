@@ -56,6 +56,11 @@
 /graphify/refresh-log.txt
 /graphify/alerts.json
 /graphify/pypi-version-cache.json
+# machine-local targets + tool paths (real private paths; template is graphify.local.example.json)
+/graphify/graphify.local*.json
+!/graphify/graphify.local.example.json
+# last-known-good python/dashboard settings the health check falls back to when the config is unparseable
+/graphify/publish-settings.lkg.json
 *.bak-cutover-*
 
 # Secrets / local env
