@@ -1,7 +1,9 @@
 # ============================================================
 # Refresh-Graphs.ps1 — scheduled AST-only refresh of the graphify code graphs.
 #
-# Edit the $targets array below to point at YOUR repositories.
+# Targets and tool paths come from graphify.local.json (gitignored; template:
+# graphify.local.example.json) via GraphifyConfig.ps1. A missing or invalid
+# config fails the run loudly (exit 1 + config_error in health.json).
 # Runs `graphify extract --code-only`
 # (no LLM, no API key; incremental via the manifest gate), then re-clusters +
 # regenerates GRAPH_REPORT.md, then writes a graph-meta.json sidecar
@@ -41,9 +43,6 @@ $root     = if ($env:GRAPHIFY_ROOT) { $env:GRAPHIFY_ROOT } else { $PSScriptRoot 
 $log      = Join-Path $root 'refresh-log.txt'
 $health   = Join-Path $root 'health.json'
 $history  = Join-Path $root 'health-history.jsonl'
-# Resolve graphify/python from PATH; override with env vars if not on PATH.
-$graphify = if ($env:GRAPHIFY_EXE) { $env:GRAPHIFY_EXE } else { 'graphify' }
-$python   = if ($env:PYTHON_EXE)   { $env:PYTHON_EXE }   else { 'python' }
 
 # Node-count drift above this (percent, vs the previous recorded run) sets
 # drift_warning on the target record; Check-GraphifyHealth.ps1 turns that into
@@ -57,6 +56,30 @@ function NowIso { (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') 
 
 $runStart = NowIso
 "=== $runStart refresh start ===" | Add-Content -Path $log -Encoding utf8
+
+# Real targets + tool paths live in the gitignored local config. Without it
+# there is nothing meaningful to refresh: record the failure where
+# Check-GraphifyHealth.ps1 will alert on it, and exit non-zero.
+. (Join-Path $PSScriptRoot 'GraphifyConfig.ps1')
+try {
+    $cfg = Read-GraphifyConfig -RequireTargets
+} catch {
+    $msg = $_.Exception.Message
+    $end = NowIso
+    "FATAL config: $msg" | Add-Content -Path $log -Encoding utf8
+    $prevSuccess = $null
+    try { $prevSuccess = (Get-Content $health -Raw -ErrorAction Stop | ConvertFrom-Json).last_success_at } catch {}
+    $run = [ordered]@{ started_at = $runStart; ended_at = $end; exit_code = 1; config_error = $msg; targets = @() }
+    ConvertTo-Json ([ordered]@{ updated_at = $end; installed_version = ''; drift_threshold_pct = $DriftThresholdPct
+                                last_success_at = $prevSuccess; last_run = $run }) -Depth 6 |
+        Set-Content -Path $health -Encoding utf8
+    (ConvertTo-Json $run -Depth 6 -Compress) | Add-Content -Path $history -Encoding utf8
+    "=== $end refresh aborted (config) ===" | Add-Content -Path $log -Encoding utf8
+    [Console]::Error.WriteLine("Refresh-Graphs: $msg")
+    exit 1
+}
+$graphify = $cfg.GraphifyExe
+$python   = $cfg.PythonExe
 
 # Run a native command without PS 5.1 turning benign stderr into a terminating
 # error under EAP=Stop; log combined output, return the real exit code.
@@ -100,14 +123,11 @@ $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 $installedVer = (& $python -c "from importlib.metadata import version; print(version('graphifyy'))" 2>$null | Select-Object -First 1)
 $ErrorActionPreference = $eap
 
-# EDIT THESE — one entry per repo you want graphed.
+# From graphify.local.json — one entry per repo:
 #   Name = label used in reports / health records
 #   Scan = folder to extract the AST graph from (graphify-out\ is written here)
 #   Repo = repo root (used to record HEAD; may equal Scan)
-$targets = @(
-    @{ Name = 'my-backend';  Scan = '<path-to-backend>'; Repo = '<path-to-repo>' },
-    @{ Name = 'my-frontend'; Scan = '<path-to-frontend>'; Repo = '<path-to-repo>' }
-)
+$targets = $cfg.Targets
 
 $failed  = 0
 $records = @()

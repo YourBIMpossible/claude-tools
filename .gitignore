@@ -56,6 +56,8 @@
 /graphify/refresh-log.txt
 /graphify/alerts.json
 /graphify/pypi-version-cache.json
+# machine-local targets + tool paths (real private paths; template is graphify.local.example.json)
+/graphify/graphify.local.json
 *.bak-cutover-*
 
 # Secrets / local env

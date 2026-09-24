@@ -6,12 +6,11 @@ Only the external `graphify` executable is faked (GRAPHIFY_EXE). The stats read
 is real: PYTHON_EXE is this interpreter, and the stats-failed target carries a
 malformed graph.json, so the script's own embedded json.loads is what fails.
 
-The script's hardcoded $targets block is swapped for synthetic targets in a
-temp copy; every other line runs verbatim. Run: python test_refresh_graphs.py
+Synthetic targets arrive via a temp graphify.local.json (GRAPHIFY_CONFIG); the
+shipped script runs verbatim. Config-failure cases assert the loud-fail path. Run: python test_refresh_graphs.py
 """
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +18,6 @@ import tempfile
 from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("Refresh-Graphs.ps1")
-TARGETS_BLOCK = re.compile(r"^\$targets = @\(\r?\n.*?^\)\r?$", re.M | re.S)
 
 # Fake graphify: `extract` exits 3 inside a scan dir named extract-fail, every
 # other call succeeds without touching graph.json.
@@ -45,8 +43,40 @@ def make_target(root, name, graph_text):
     return scan
 
 
-def ps_quote(path):
-    return "'" + str(path).replace("'", "''") + "'"
+def run_script(pwsh, env):
+    return subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT)],
+                          capture_output=True, text=True, timeout=120, env=env)
+
+
+def config_failure_cases(pwsh):
+    """Missing / placeholder config must fail loudly: exit 1, FATAL log line,
+    config_error in health.json, prior last_success_at preserved."""
+    cases = {
+        "missing": None,
+        "placeholder": json.dumps({"targets": [{"name": "x", "scan": "<path-to-backend>"}]}),
+        "no-targets": json.dumps({"targets": []}),
+        "bad-json": "{ nope",
+    }
+    for label, body in cases.items():
+        tmp = Path(tempfile.mkdtemp(prefix=f"refresh-graphs-cfg-{label}-"))
+        try:
+            config = tmp / "graphify.local.json"
+            if body is not None:
+                config.write_text(body, encoding="utf-8")
+            (tmp / "health.json").write_text(json.dumps({"last_success_at": PREV_SUCCESS}), encoding="utf-8")
+            env = dict(os.environ, GRAPHIFY_ROOT=str(tmp), GRAPHIFY_CONFIG=str(config),
+                       GRAPHIFY_EXE="does-not-exist", PYTHON_EXE=sys.executable)
+            p = run_script(pwsh, env)
+            check(f"8 config {label}: exits 1", p.returncode == 1, f"rc={p.returncode} stderr={p.stderr.strip()[:300]}")
+            health = json.loads((tmp / "health.json").read_text(encoding="utf-8-sig"))
+            run = health.get("last_run") or {}
+            check(f"8 config {label}: config_error recorded", bool(run.get("config_error")) and run.get("exit_code") == 1,
+                  f"run={run}")
+            check(f"8 config {label}: last_success_at kept", health.get("last_success_at") == PREV_SUCCESS)
+            log = (tmp / "refresh-log.txt").read_text(encoding="utf-8-sig")
+            check(f"8 config {label}: FATAL config logged", "FATAL config:" in log)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -68,16 +98,10 @@ def main():
             "extract-fail": make_target(tmp, "extract-fail", good_graph),
         }
 
-        source = SCRIPT.read_text(encoding="utf-8-sig")
-        targets = "$targets = @(\n" + ",\n".join(
-            f"    @{{ Name = '{n}'; Scan = {ps_quote(s)}; Repo = {ps_quote(tmp)} }}" for n, s in scans.items()
-        ) + "\n)"
-        patched, n_subs = TARGETS_BLOCK.subn(lambda _m: targets, source)
-        check("0 setup: $targets block found exactly once", n_subs == 1, f"subs={n_subs}")
-        if n_subs != 1:
-            raise SystemExit(1)
-        script = tmp / "Refresh-Graphs.ps1"
-        script.write_text(patched, encoding="utf-8")
+        config = tmp / "graphify.local.json"
+        config.write_text(json.dumps({
+            "targets": [{"name": n, "scan": str(s), "repo": str(tmp)} for n, s in scans.items()],
+        }), encoding="utf-8")
 
         fake = tmp / "fake-graphify.ps1"
         fake.write_text(FAKE_GRAPHIFY, encoding="utf-8")
@@ -88,9 +112,9 @@ def main():
             "last_run": {"targets": [{"name": "good", "nodes": 3}]},
         }), encoding="utf-8")
 
-        env = dict(os.environ, GRAPHIFY_ROOT=str(tmp), GRAPHIFY_EXE=str(fake), PYTHON_EXE=sys.executable)
-        p = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
-                           capture_output=True, text=True, timeout=120, env=env)
+        env = dict(os.environ, GRAPHIFY_ROOT=str(tmp), GRAPHIFY_CONFIG=str(config),
+                   GRAPHIFY_EXE=str(fake), PYTHON_EXE=sys.executable)
+        p = run_script(pwsh, env)
         check("1 run: exits 1 when any target fails", p.returncode == 1,
               f"rc={p.returncode} stderr={p.stderr.strip()[:300]}")
 
@@ -143,6 +167,8 @@ def main():
               len(hist) == 1 and json.loads(hist[0])["exit_code"] == 1)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    config_failure_cases(pwsh)
 
     passed = sum(1 for _, c in results if c)
     print(f"\n{passed}/{len(results)} checks passed")

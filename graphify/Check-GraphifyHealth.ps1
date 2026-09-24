@@ -28,7 +28,6 @@ $health    = Join-Path $root 'health.json'
 $alertsOut = Join-Path $root 'alerts.json'
 $log       = Join-Path $root 'health-check-log.txt'
 $verCache  = Join-Path $root 'pypi-version-cache.json'
-$python    = if ($env:PYTHON_EXE) { $env:PYTHON_EXE } else { 'python' }
 $taskName  = 'Graphify Weekly Graph Refresh'
 
 # Refresh is weekly; 8 days allows one missed-by-hours run before alerting.
@@ -45,6 +44,17 @@ function Add-Alert {
     }
 }
 
+# -- 0. local config (python path, dashboard dirs, targets) -------------------
+# Same file Refresh-Graphs.ps1 reads. Missing/invalid is an error alert, not a
+# silent fallback: it is exactly the state that makes the weekly refresh fail.
+
+. (Join-Path $PSScriptRoot 'GraphifyConfig.ps1')
+$cfg = $null
+try { $cfg = Read-GraphifyConfig -RequireTargets }
+catch { Add-Alert 'error' 'config-missing' "$($_.Exception.Message)" 'Create graphify.local.json from graphify.local.example.json.' }
+$python   = if ($cfg) { $cfg.PythonExe } elseif ($env:PYTHON_EXE) { $env:PYTHON_EXE } else { 'python' }
+$dashDirs = if ($cfg) { @($cfg.DashboardDirs) } elseif ($env:GRAPHIFY_DASHBOARD_DIRS) { @($env:GRAPHIFY_DASHBOARD_DIRS -split ';') } else { @() }
+
 # -- 1. the refresh record ---------------------------------------------------
 
 $h = $null
@@ -59,7 +69,9 @@ if (-not $installed) {
 }
 
 if ($h) {
-    if ($h.last_run -and $h.last_run.exit_code -ne 0) {
+    if ($h.last_run -and $h.last_run.config_error) {
+        Add-Alert 'error' 'refresh-config' "Last graph refresh aborted: $($h.last_run.config_error)" 'Fix graphify.local.json, then re-run Refresh-Graphs.ps1.'
+    } elseif ($h.last_run -and $h.last_run.exit_code -ne 0) {
         Add-Alert 'error' 'refresh-failed' "Last graph refresh exited $($h.last_run.exit_code)." 'Check refresh-log.txt for the failing target.'
     }
     foreach ($t in @($h.last_run.targets)) {
@@ -148,10 +160,8 @@ $doc = [ordered]@{
 
 ConvertTo-Json $doc -Depth 6 | Set-Content -Path $alertsOut -Encoding utf8
 
-# Optional: render health as a JS global for a dashboard panel. Set
-# $env:GRAPHIFY_DASHBOARD_DIRS to a semicolon-separated list of folders to
-# receive graphify-health.js; leave unset to skip (the default).
-$dashDirs = if ($env:GRAPHIFY_DASHBOARD_DIRS) { $env:GRAPHIFY_DASHBOARD_DIRS -split ';' } else { @() }
+# Optional: render health as a JS global for a dashboard panel, into each
+# folder in dashboard_dirs (config) / $env:GRAPHIFY_DASHBOARD_DIRS; empty = skip.
 if ($dashDirs.Count -gt 0) {
     $js = 'window.GRAPHIFY_HEALTH = ' + (ConvertTo-Json $doc -Depth 6 -Compress) + ';'
     foreach ($dir in $dashDirs) {
