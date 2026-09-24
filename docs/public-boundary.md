@@ -84,7 +84,7 @@ Baseline `351a644`. Dispositions applied:
 | `ctxdex/audits/*` (1) | Remove — generated operational output | Deleted |
 | `graphify/recall/BASELINE.md` | Remove — benchmark data derived from private source | Deleted |
 | `graphify/recall/RERANK-EXPERIMENT.md` | Remove — same | Deleted |
-| `graphify/Refresh-Graphs.ps1` | Anonymize — machine paths + private scan targets | Parameterized ($PSScriptRoot, PATH, placeholder targets) |
+| `graphify/Refresh-Graphs.ps1` | Anonymize — machine paths + private scan targets | Parameterized ($PSScriptRoot, PATH); real targets/tool paths in gitignored graphify.local.json |
 | `graphify/Check-GraphifyHealth.ps1` | Anonymize — machine paths + private dashboard dirs | Parameterized (env-driven, default off) |
 | `graphify/recall/measure_recall.py` | Anonymize — machine path + private example | PATH/env + generic example |
 | `local-audit/audit-repo.cmd` | Anonymize — default scanned a private repo | Default now current dir |

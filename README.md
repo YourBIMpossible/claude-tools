@@ -32,8 +32,9 @@ docs, big logs, exports). Lexical only, fully local.
 Persistent knowledge graph over code/docs for forward/impact questions ("what
 does X call", "what breaks if I change X"), architecture, cross-file relations.
 - Wraps the upstream `graphify` pip CLI. Ops scripts here: `graphify/Refresh-Graphs.ps1`,
-  `graphify/Check-GraphifyHealth.ps1`. Edit the scan targets at the top of
-  `Refresh-Graphs.ps1` to point at your own repos.
+  `graphify/Check-GraphifyHealth.ps1`. Both read scan targets and tool paths from
+  `graphify/graphify.local.json` (gitignored; copy `graphify.local.example.json`). A missing or
+  placeholder config fails the refresh loudly and raises a health alert.
 - `graphify/recall/` holds the retrieval-recall benchmark *method*
   (`measure_recall.py`, `rerank_bm25.py`) and its writeups. The query/baseline
   fixtures are repo-specific and git-ignored; bring your own.
@@ -64,8 +65,8 @@ census, counter-integrity, tested-but-dead). Reports; never edits.
 3. skillspector: clone upstream into `skillspector/src/`.
 4. graphify: `pip install graphifyy` (note the double **y** — PyPI package
    [`graphifyy`](https://pypi.org/project/graphifyy/), which installs a `graphify`
-   CLI command; do **not** `pip install graphify`, a different package). Then edit
-   scan targets in `Refresh-Graphs.ps1`.
+   CLI command; do **not** `pip install graphify`, a different package). Then copy
+   `graphify/graphify.local.example.json` to `graphify/graphify.local.json` and fill in your targets.
 
 ## What is deliberately not tracked
 
