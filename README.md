@@ -33,8 +33,16 @@ Persistent knowledge graph over code/docs for forward/impact questions ("what
 does X call", "what breaks if I change X"), architecture, cross-file relations.
 - Wraps the upstream `graphify` pip CLI. Ops scripts here: `graphify/Refresh-Graphs.ps1`,
   `graphify/Check-GraphifyHealth.ps1`. Both read scan targets and tool paths from
-  `graphify/graphify.local.json` (gitignored; copy `graphify.local.example.json`). A missing or
-  placeholder config fails the refresh loudly and raises a health alert.
+  `graphify/graphify.local.json` (gitignored; copy `graphify.local.example.json`). A missing,
+  unparseable, placeholder or empty-target config fails the refresh closed (graphify never runs)
+  and raises one `config-invalid` health alert. Env vars `GRAPHIFY_EXE` / `PYTHON_EXE` /
+  `GRAPHIFY_DASHBOARD_DIRS` / `GRAPHIFY_CONFIG` remain explicit overrides.
+- Relative paths in the config (`scan`, `repo`, `dashboard_dirs`, and `graphify_exe` /
+  `python_exe` when they contain a separator) resolve against the config file's folder, never the
+  working directory; bare command names use PATH; drive-/root-relative forms are rejected.
+- The dashboard's `graphify-health.js` is a sanitized allowlist projection (`graphify/GraphifyPublic.ps1`):
+  no paths, no config or exception text. Full diagnostics stay in the local `alerts.json`, logs and
+  `health.json`. See [docs/public-boundary.md](docs/public-boundary.md#graphify-health-dashboard-boundary).
 - `graphify/recall/` holds the retrieval-recall benchmark *method*
   (`measure_recall.py`, `rerank_bm25.py`) and its writeups. The query/baseline
   fixtures are repo-specific and git-ignored; bring your own.

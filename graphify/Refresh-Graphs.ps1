@@ -3,7 +3,8 @@
 #
 # Targets and tool paths come from graphify.local.json (gitignored; template:
 # graphify.local.example.json) via GraphifyConfig.ps1. A missing or invalid
-# config fails the run loudly (exit 1 + config_error in health.json).
+# config fails the run closed (exit 1 + config_status/config_error in the
+# local health.json; nothing is extracted).
 # Runs `graphify extract --code-only`
 # (no LLM, no API key; incremental via the manifest gate), then re-clusters +
 # regenerates GRAPH_REPORT.md, then writes a graph-meta.json sidecar
@@ -57,25 +58,27 @@ function NowIso { (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') 
 $runStart = NowIso
 "=== $runStart refresh start ===" | Add-Content -Path $log -Encoding utf8
 
-# Real targets + tool paths live in the gitignored local config. Without it
-# there is nothing meaningful to refresh: record the failure where
-# Check-GraphifyHealth.ps1 will alert on it, and exit non-zero.
+# Real targets + tool paths live in the gitignored local config. Anything but
+# a fully valid config fails closed: nothing is extracted, the failure is
+# recorded where Check-GraphifyHealth.ps1 alerts on it, and the run exits 1.
+# config_error / config_status stay in local health.json + log; the public
+# dashboard only ever sees a generic, path-free message.
 . (Join-Path $PSScriptRoot 'GraphifyConfig.ps1')
-try {
-    $cfg = Read-GraphifyConfig -RequireTargets
-} catch {
-    $msg = $_.Exception.Message
+$cfg = Get-GraphifyConfig
+if ($cfg.Status -ne 'ok') {
+    $msg = ($cfg.Errors -join ' | ')
     $end = NowIso
-    "FATAL config: $msg" | Add-Content -Path $log -Encoding utf8
+    "FATAL config ($($cfg.Status)): $msg" | Add-Content -Path $log -Encoding utf8
     $prevSuccess = $null
     try { $prevSuccess = (Get-Content $health -Raw -ErrorAction Stop | ConvertFrom-Json).last_success_at } catch {}
-    $run = [ordered]@{ started_at = $runStart; ended_at = $end; exit_code = 1; config_error = $msg; targets = @() }
+    $run = [ordered]@{ started_at = $runStart; ended_at = $end; exit_code = 1
+                       config_status = $cfg.Status; config_error = $msg; targets = @() }
     ConvertTo-Json ([ordered]@{ updated_at = $end; installed_version = ''; drift_threshold_pct = $DriftThresholdPct
                                 last_success_at = $prevSuccess; last_run = $run }) -Depth 6 |
         Set-Content -Path $health -Encoding utf8
     (ConvertTo-Json $run -Depth 6 -Compress) | Add-Content -Path $history -Encoding utf8
     "=== $end refresh aborted (config) ===" | Add-Content -Path $log -Encoding utf8
-    [Console]::Error.WriteLine("Refresh-Graphs: $msg")
+    [Console]::Error.WriteLine("Refresh-Graphs: config $($cfg.Status): $msg")
     exit 1
 }
 $graphify = $cfg.GraphifyExe
@@ -123,8 +126,8 @@ $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 $installedVer = (& $python -c "from importlib.metadata import version; print(version('graphifyy'))" 2>$null | Select-Object -First 1)
 $ErrorActionPreference = $eap
 
-# From graphify.local.json — one entry per repo:
-#   Name = label used in reports / health records
+# From graphify.local.json — one entry per repo (paths already absolute):
+#   Name = identifier used in reports / health records / the public dashboard
 #   Scan = folder to extract the AST graph from (graphify-out\ is written here)
 #   Repo = repo root (used to record HEAD; may equal Scan)
 $targets = $cfg.Targets

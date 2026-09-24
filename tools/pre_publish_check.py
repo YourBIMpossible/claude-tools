@@ -55,6 +55,9 @@ FORBIDDEN_PATHS = [
     (r"(^|/)skillspector/src/", "vendored upstream project"),
     (r"(^|/)graphify/backups/", "private graph exports"),
     (r"budget.*\.json$|csharp-queries\.json$", "private recall fixture"),
+    (r"(^|/)graphify/(graphify\.local(?!\.example\.json$)[^/]*\.json|publish-settings\.lkg\.json|alerts\.json"
+     r"|health\.json|health-history\.jsonl|pypi-version-cache\.json|[^/]*-log\.txt)$",
+     "graphify machine-local config / runtime state"),
 ]
 
 SEP = r"[\\/]"
