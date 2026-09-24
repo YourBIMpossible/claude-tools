@@ -135,9 +135,11 @@ def relative_path_cases(pwsh):
               f"rc={p.returncode} stderr={p.stderr.strip()[:300]}")
         health = json.loads((tmp / "health.json").read_text(encoding="utf-8-sig"))
         rec = (health.get("last_run") or {}).get("targets") or [{}]
-        expected = os.path.abspath(cfg_dir / "scans" / "rel")
+        expected = os.path.realpath(cfg_dir / "scans" / "rel")
+        got = rec[0].get("scan") or ""
+        # realpath on both sides: Windows TEMP may be an 8.3 short name that 5.1 expands.
         check("9 relative: scan recorded absolute, anchored at the config folder",
-              rec[0].get("scan") == expected, f"got {rec[0].get('scan')} want {expected}")
+              os.path.isabs(got) and os.path.realpath(got) == expected, f"got {got} want {expected}")
         check("9 relative: relative graphify_exe resolved (target ok)", rec[0].get("ok") is True, f"rec={rec[0]}")
         check("9 relative: graph-meta.json written in the anchored scan dir",
               (cfg_dir / "scans" / "rel" / "graphify-out" / "graph-meta.json").exists())

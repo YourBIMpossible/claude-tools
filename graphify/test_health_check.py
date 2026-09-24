@@ -255,7 +255,8 @@ def main():
         check("invalid-json: last-known-good python used", bool(doc) and doc["installed_version"] == FAKE_VERSION)
         lkg = json.loads((e.state / "publish-settings.lkg.json").read_text(encoding="utf-8-sig"))
         check("invalid-json: last-known-good holds the file's dashboard dir, not the env override",
-              lkg.get("dashboard_dirs") == [os.path.abspath(e.dash)], f"lkg={lkg}")
+              [os.path.realpath(d) for d in lkg.get("dashboard_dirs") or []] == [os.path.realpath(e.dash)],
+              f"lkg={lkg}")
     finally:
         e.close()
 
