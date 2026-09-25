@@ -61,6 +61,9 @@ jobs:
       - name: evidence-relevance tests
         run: python evidence-relevance/test_measure_relevance.py
 
+      - name: evidence-archive evacuation tests
+        run: python evidence-archive/test_evacuate_worktree.py
+
       - name: Install gitleaks (pinned, checksum-verified)
         run: |
           set -euo pipefail
