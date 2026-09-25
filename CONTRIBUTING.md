@@ -52,6 +52,7 @@ python ctxcheck/test_ctxcheck.py
 python ctxdex/test_ctxdex_gate.py
 python tools/test_pre_publish_check.py
 python evidence-relevance/test_measure_relevance.py
+python evidence-archive/test_evacuate_worktree.py
 python graphify/test_refresh_graphs.py   # needs pwsh (PowerShell 7)
 ```
 

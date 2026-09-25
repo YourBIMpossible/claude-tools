@@ -62,6 +62,17 @@ census, counter-integrity, tested-but-dead). Reports; never edits.
 - `local-audit/audit-repo.cmd [path]`, `local-audit/full-audit.cmd [path]`
   (default target is set at the top of each `.cmd` — edit for your machine).
 
+### evidence-archive — packet evacuation before worktree cleanup
+Evidence Compiler writes packets into each worktree's `.evidence-compiler/packets/`, so
+removing a worktree deletes them. Copy them out first.
+- `py evidence-archive/evacuate_worktree.py evacuate <worktree> --archive <dir>` — dry run
+  (default); add `--apply` to copy, verify and write a receipt. `--archive` falls back to
+  `EVIDENCE_ARCHIVE`.
+- `py evidence-archive/evacuate_worktree.py verify <receipt>` — re-hash the archived copies.
+- Deduplicates by packet id + sha256, quarantines invalid files byte-exact, never overwrites
+  or deletes anything, never touches transcripts. Remove the worktree only after an
+  `--apply` run prints `safe_to_remove: true`.
+
 ### bin/ — security scanners
 `trivy` and `gitleaks` binaries, fetched at setup (not committed). See
 `bin/README.md`.
