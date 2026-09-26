@@ -106,7 +106,7 @@ def row(pid: str, created: str, items: list[dict], calls: list[dict], *, head: s
                           {"name": "git", "diagnostic": {"dirty_count": dirty}},
                           {"name": "ripgrep", "diagnostic": {"truncated": False,
                                                              "filename_stem": {"items": 1}}}]},
-        "observed": {"tool_calls": calls},
+        "observed": {"tool_calls": calls, "cost": {"assistant_messages": 1 if calls else 0}},
         "prompt": {"text": prompt, "origin": "user", "prior_prompts": {} if prior is None else prior},
     }
 
@@ -166,14 +166,17 @@ def test_footprints(tmp: Path) -> None:
                 if k in c["input"]:
                     c["input"][k] = c["input"][k].replace(REPO, root)
     lost = {"packet_id": "ep_000000000000000c", "join_reason": "missing_packet"}
+    batched = row("ep_000000000000000d", "2026-09-21T00:04:00Z", [], [])
     episodes = tmp / "episodes.jsonl"
-    episodes.write_text("".join(json.dumps(r) + "\n" for r in (eb, lost, ea)), encoding="utf-8")
+    episodes.write_text("".join(json.dumps(r) + "\n" for r in (eb, lost, ea, batched)), encoding="utf-8")
 
     out1, out2 = tmp / "out1", tmp / "out2"
     s = fpm.run(episodes, out1, True)
     fpm.run(episodes, out2, True)
     rows = {r["packet_id"]: r for r in map(json.loads, (out1 / "footprints.jsonl").read_text("utf-8").splitlines())}
-    check(list(rows) == sorted(rows) and len(rows) == 3, "every episode row covered, sorted by packet_id")
+    check(list(rows) == sorted(rows) and len(rows) == 4, "every episode row covered, sorted by packet_id")
+    check(rows["ep_000000000000000d"]["status"] == "no_assistant_response",
+          "a batched prompt with no response of its own is not scored as zero work")
     check(rows["ep_000000000000000c"]["status"] == "not_joined:missing_packet", "unjoined rows carry status")
     m = rows["ep_000000000000000a"]["metrics"]
     check(m["hit"] is True and m["coverage"] == 0.25 and m["waste"] == 0.0,

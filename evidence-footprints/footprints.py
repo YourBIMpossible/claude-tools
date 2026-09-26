@@ -18,6 +18,11 @@ Sets per episode (paths repo-relative, lowercase, forward slashes):
 Two paths match when equal or when one ends with ``/`` + the other, so a path
 relative to a subdirectory still matches its repo-relative form.
 
+Rows are scored when joined with an observed turn that has at least one assistant
+message. Queued prompts delivered as a batch share one response, recorded on the
+batch's last row; the others get status ``no_assistant_response``, not a
+zero-work score.
+
 Metrics (``null`` when the denominator is empty):
 
   hit            B and T share a file                             (null if B empty)
@@ -416,6 +421,11 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
             status = "no_retrieved"
         elif not row.get("observed"):
             status = "no_observed"
+        elif not (row["observed"].get("cost") or {}).get("assistant_messages"):
+            # A queued prompt delivered in a batch: the batch's one response lands in the
+            # batch's last row, which is scored with it. Scoring this row would count a
+            # turn the agent never answered on its own as zero work.
+            status = "no_assistant_response"
         else:
             status = "scored"
         status_counts[status] += 1

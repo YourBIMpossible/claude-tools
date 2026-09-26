@@ -12,6 +12,13 @@ python footprints.py --episodes <episodes.jsonl> --out <dir> [--no-git]
 
 No dependencies beyond the standard library and `git` on `PATH`.
 
+## Which rows are scored
+
+Joined rows with an observed turn that has at least one assistant message.
+Queued prompts delivered as a batch share one response, which the episode
+builder records on the batch's last row; the other rows of the batch get status
+`no_assistant_response` instead of a zero-work score.
+
 ## Sets
 
 | Set | Holds |
