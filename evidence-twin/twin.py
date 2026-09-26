@@ -273,9 +273,16 @@ def kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+# Built-in plugins whose availability a remote feature flag decides per launch, so two runs of
+# one batch can differ in what is loaded. They are pinned off; ``init_plugins`` records what
+# actually loaded, and the report lists every run's set when they differ (``init_drift``).
+PINNED_OFF = ("agents-md@builtin",)
+
+
 def settings_for(brief_arg: str, python: str) -> dict:
     hook = f'"{Path(python).as_posix()}" "{(HERE / "replay_hook.py").as_posix()}" "{brief_arg}"'
     return {"permissions": {"allow": ALLOW, "deny": DENY},
+            "enabledPlugins": {p: False for p in PINNED_OFF},
             "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": hook}]}]}}
 
 
@@ -418,6 +425,8 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         "cli_version": init.get("claude_code_version"), "init_model": init.get("model"),
         "init_counts": {k: len(init[k]) if isinstance(init.get(k), list) else init.get(k)
                         for k in ("tools", "mcp_servers", "skills", "agents", "memory_paths", "slash_commands")},
+        "init_plugins": sorted(str(p.get("source") or p.get("name")) if isinstance(p, dict) else str(p)
+                               for p in init.get("plugins") or []),
         "cli_path_sha256": cli_sha, "env_dropped": dropped,
         "exit_code": proc.returncode, "killed": killed[0] if killed else None, "invalid": invalid,
         "is_error": (state.result or {}).get("is_error"), "result_subtype": (state.result or {}).get("subtype"),
@@ -507,6 +516,12 @@ def bootstrap_median_ci(values: list[float], seed: int, n: int = 10_000) -> tupl
     return meds[int(0.025 * n)], meds[int(0.975 * n) - 1]
 
 
+def init_drift(metas: dict[tuple[str, str], list[dict]]) -> dict[str, list[str]]:
+    """Every run's loaded plugins when the batch loaded more than one set (a held-equal breach), else {}."""
+    sets = {m["run_id"]: list(m.get("init_plugins") or []) for ms in metas.values() for m in ms}
+    return dict(sorted(sets.items())) if len({tuple(v) for v in sets.values()}) > 1 else {}
+
+
 def report(tasks: list[dict], plan_obj: dict, archive: Path, cap: int, seed: int) -> dict:
     metas: dict[tuple[str, str], list[dict]] = {}
     missing = []
@@ -537,7 +552,7 @@ def report(tasks: list[dict], plan_obj: dict, archive: Path, cap: int, seed: int
                                   "tokens_total_A": [m["tokens_total"] for m in a],
                                   "tokens_total_B": [m["tokens_total"] for m in b]}
     summary: dict[str, Any] = {"cap": cap, "missing_runs": missing, "lab": lab, "real": real,
-                               "guardrail": guard}
+                               "guardrail": guard, "init_drift": init_drift(metas)}
     positives = [v for v in lab.values() if v["family"] == "positive"]
     summary["bench_blind"] = bool(positives) and not all(v["pass"] for v in positives)
     logs = [v["mean_log_ratio"] for v in real.values()]

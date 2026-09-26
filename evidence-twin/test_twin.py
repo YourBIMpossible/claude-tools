@@ -180,6 +180,16 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
     rep = twin.report(neg, plan, archive, 100_000, 3)
     check(rep["lab"]["neg_irrelevant"]["pass"] is True and rep["guardrail"]["A"]["checked"] == 1,
           "report scores the negative control")
+    check(rep["init_drift"] == {} and a["init_plugins"] == ["telemetry@builtin"], "loaded plugins are recorded")
+    check(twin.settings_for("x", "py")["enabledPlugins"] == {"agents-md@builtin": False},
+          "flag-gated built-in plugins are pinned off")
+    meta_b = archive / plan["runs"][1]["run_id"] / "meta.json"
+    doctored = twin.read_json(meta_b)
+    twin.write_json(meta_b, dict(doctored, init_plugins=["agents-md@builtin", "telemetry@builtin"]))
+    drift = twin.report(neg, plan, archive, 100_000, 3)["init_drift"]
+    twin.write_json(meta_b, doctored)
+    check(sorted(drift) == sorted(r["run_id"] for r in plan["runs"]) and "agents-md@builtin" in drift[plan["runs"][1]["run_id"]],
+          "a batch that loaded different plugins is reported")
 
 
 def test_real(tmp: Path) -> None:

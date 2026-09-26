@@ -39,7 +39,8 @@ def main(argv: list[str]) -> int:
         return 0
     emit({"type": "system", "subtype": "init", "cwd": str(Path.cwd()), "model": model,
           "claude_code_version": "fake-0", "tools": ["Read", "Edit"], "mcp_servers": [], "skills": [],
-          "agents": [], "memory_paths": [], "permissionMode": "dontAsk"})
+          "agents": [], "memory_paths": [], "permissionMode": "dontAsk",
+          "plugins": [{"name": "telemetry", "path": "builtin", "source": "telemetry@builtin"}]})
     emit({"type": "assistant", "parent_tool_use_id": None, "message": {
         "id": "msg_fake_1", "model": model, "usage": USAGE,
         "content": [{"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"file_path": str(path)}}]}})
