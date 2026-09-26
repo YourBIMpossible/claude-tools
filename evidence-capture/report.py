@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""The §12 checkpoint: counts and hashes over the metadata store, never content.
+
+``build_checkpoint`` reads manifests, owner reviews, FN audits, ``DELETIONS.log``,
+``maintenance.json`` and isolation records; it never opens a snapshot or payload file
+except to count directories and bytes and to verify checksums. ``write_checkpoint``
+writes ``checkpoints/ckpt-<n>.json`` and its markdown rendering and commits both.
+
+Keys beyond the §12 list are additive and documented where they are produced:
+``denominator.by_origin.unjoined`` (episodes whose transcript turn was never found, so
+their origin is unknown), ``funnel.boundary.untrusted_raw`` (the manifest's own reasons
+before mapping onto the four §12 buckets) and ``notes``.
+"""
+from __future__ import annotations
+
+import math
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+import manifest as mf
+from common import canonical, iso, now_utc, parse_iso, read_json, sha256_bytes, sha256_file, write_json_atomic
+from review import load_owner_review, verify_payload
+from store import Stores, check_content_store, commit_meta, iter_manifests, meta_clean, read_deletions
+
+EPISODES_TARGET = 50
+ORIGIN_BUCKETS = ("human", "task_notification", "hook", "other")
+SNAPSHOT_REASONS = ("timeout", "size_cap", "write_error", "head_unresolved")
+BOUNDARY_BUCKETS = ("cli_untested", "bracket_dirty", "lock_present", "hook_killed")
+
+
+def _origin_bucket(origin: str | None) -> str | None:
+    if origin is None:
+        return None
+    if origin in mf.HUMAN_ORIGINS:
+        return "human"
+    if origin == "task_notification":
+        return "task_notification"
+    if origin == "hook":
+        return "hook"
+    return "other"
+
+
+def _boundary_bucket(reason: str | None) -> str:
+    """Maps a manifest boundary reason onto §12's four buckets. An untested, unknown,
+    failed, unaccepted or unreadable record, and an unidentified, unverified or changed
+    client (the ``identity_*`` and ``mode_untested`` reasons), is ``cli_untested``; a
+    failed capture has no tested boundary for its episode either."""
+    if reason in ("bracket_dirty", "lock_present", "hook_killed"):
+        return reason
+    return "cli_untested"
+
+
+def percentiles(values: list[int]) -> dict[str, int | None]:
+    """Nearest-rank p50 and p95 and the maximum."""
+    if not values:
+        return {"p50": None, "p95": None, "max": None}
+    v = sorted(values)
+
+    def rank(p: float) -> int:
+        return v[max(0, math.ceil(p * len(v)) - 1)]
+    return {"p50": rank(0.50), "p95": rank(0.95), "max": v[-1]}
+
+
+def _dir_bytes(d: Path) -> int:
+    total = 0
+    for p in d.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _latest_audit(stores: Stores) -> dict[str, Any] | None:
+    best = None
+    for p in sorted((stores.meta / "audits").glob("fn-audit-*.json")):
+        stem = p.name[len("fn-audit-"):-len(".json")]
+        if not stem.isdigit():
+            continue
+        try:
+            rec = read_json(p)
+        except (OSError, ValueError):
+            continue
+        if best is None or int(stem) > best[0]:
+            best = (int(stem), rec)
+    return best[1] if best else None
+
+
+def _isolation(stores: Stores) -> dict[str, Any]:
+    recs = []
+    for p in sorted((stores.meta / "isolation").glob("*.json")):
+        try:
+            rec = read_json(p)
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and "passed" in rec:
+            recs.append((p.name, rec))
+    out: dict[str, Any] = {"deterministic_checks_run": len(recs), "passed": sum(1 for _, r in recs if r["passed"]),
+                           "failed": sum(1 for _, r in recs if not r["passed"]), "identity": None,
+                           "acl_dump_sha256": None}
+    if recs:
+        last = recs[-1][1]
+        out["identity"] = last.get("identity")
+        out["acl_dump_sha256"] = sha256_bytes(canonical(last.get("icacls") or {}))
+    return out
+
+
+def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, now: str | None = None,
+                     maintenance: dict[str, Any] | None = None,
+                     backstop: dict[str, Any] | None = None) -> dict[str, Any]:
+    now = now or iso(now_utc())
+    ms = sorted(iter_manifests(stores), key=lambda m: m["started_at"])
+    owners = {m["episode_id"]: load_owner_review(stores, m["episode_id"]) for m in ms}
+    maint = maintenance or {}
+    notes: list[str] = []
+    if backstop is not None and backstop.get("state") != "ok":
+        notes.append(f"maintenance backstop {backstop.get('state')}: last success {backstop.get('last_ok')}, "
+                     f"{backstop.get('consecutive_failures', 0)} consecutive failure(s)")
+
+    # window
+    ended = [m["ended_at"] for m in ms if m.get("ended_at")]
+    first, last = (ms[0]["started_at"] if ms else None), (max(ended) if ended else None)
+    a, b = parse_iso(first), parse_iso(last)
+    repos = Counter(m["repo"].get("main_root_sha256") or m["repo"].get("root_sha256") or "unknown" for m in ms)
+
+    # denominator
+    by_origin = {k: 0 for k in ORIGIN_BUCKETS}
+    unjoined = 0
+    for m in ms:
+        bucket = _origin_bucket(m["prompt"].get("origin"))
+        if bucket is None:
+            unjoined += 1
+        else:
+            by_origin[bucket] += 1
+    by_origin["unjoined"] = unjoined
+    by_status = Counter(m["capture"].get("status") for m in ms)
+
+    # funnel
+    fl = [m["funnel"] for m in ms]
+    link_states = Counter(m["link"].get("state") for m in ms)
+    snap_bad = Counter(m["start_snapshot"].get("reason") for m in ms if m["start_snapshot"].get("state") != "complete")
+    by_reason = {k: snap_bad.get(k, 0) for k in SNAPSHOT_REASONS}
+    other = sum(v for k, v in snap_bad.items() if k not in SNAPSHOT_REASONS)
+    if other:
+        by_reason["other"] = other
+        by_reason["other_detail"] = dict(sorted((str(k), v) for k, v in snap_bad.items() if k not in SNAPSHOT_REASONS))
+    x15_unknown = sum(1 for m in ms if not m["funnel"]["dependency_screen_clear"]
+                      and not any(mf.rule_state(m["exclusions"], r) == "yes" for r in ("X1", "X2", "X3", "X4", "X5")))
+    privacy_by_check: Counter[str] = Counter()
+    for m in ms:
+        pv = (m.get("review") or {}).get("privacy") or {}
+        for k, v in (pv.get("by_check") or {}).items():
+            privacy_by_check[k] += int(v)
+    untrusted = [m for m in ms if not m["boundary"].get("trusted")]
+    raw = Counter(str(m["boundary"].get("reason")) for m in untrusted)
+    buckets = Counter(_boundary_bucket(m["boundary"].get("reason")) for m in untrusted)
+
+    def tf(stage: str) -> dict[str, int]:
+        t = sum(1 for f in fl if f.get(stage))
+        return {"true": t, "false": len(fl) - t}
+
+    funnel = {
+        "packet_linked": {**tf("packet_linked"), "by_link_state": dict(sorted(link_states.items()))},
+        "start_snapshot_complete": {**tf("start_snapshot_complete"), "by_reason": by_reason},
+        "dependency_screen_clear": {**tf("dependency_screen_clear"), "unknown_held": x15_unknown},
+        "privacy_cleared": {**tf("privacy_cleared"), "by_check": dict(sorted(privacy_by_check.items()))},
+        "payload_materialized": tf("payload_materialized"),
+        "start_state_reconstructed": {**tf("start_state_reconstructed"), "by_failure": {}},
+        "replay_verified": tf("replay_verified"),
+        "boundary": {"trusted": len(ms) - len(untrusted),
+                     "untrusted_by_reason": {k: buckets.get(k, 0) for k in BOUNDARY_BUCKETS},
+                     "untrusted_raw": dict(sorted(raw.items()))},
+        "provisional_candidates": sum(1 for f in fl if mf.provisional_candidate(f)),
+    }
+    violations = [m["episode_id"] for m in ms if mf.validate_funnel(m["funnel"])]
+    if violations:
+        notes.append(f"funnel monotonicity violated in {len(violations)} manifest(s)")
+
+    # exclusions
+    per_rule = {r: {"yes": 0, "no": 0, "unknown": 0} for r in mf.RULES}
+    first_failing: Counter[str] = Counter()
+    cooc: Counter[tuple[str, ...]] = Counter()
+    resolved = {"unknown_to_yes": 0, "unknown_to_no": 0}
+    for m in ms:
+        yes = []
+        for e in m["exclusions"]:
+            per_rule[e["rule"]][e["state"]] += 1
+            if e["state"] == "yes":
+                yes.append(e["rule"])
+            if e.get("owner_resolved"):
+                resolved["unknown_to_yes" if e["state"] == "yes" else "unknown_to_no"] += 1
+        first_failing[yes[0] if yes else "none"] += 1
+        if len(yes) > 1:
+            cooc[tuple(yes)] += 1
+
+    # screen
+    suff = [m for m in ms if m["capture"].get("join", {}).get("state") == "joined"]
+    causes = Counter(c for m in suff if not m["observation"]["sufficient"] for c in m["observation"]["causes"])
+    deps: dict[str, dict[str, int]] = {}
+    for cat in mf.DEP_CATEGORIES:
+        d = {"observed_total": 0, "required_yes": 0, "required_no": 0, "unknown": 0}
+        for m in suff:
+            dep = m["deps"][cat]
+            d["observed_total"] += int(dep.get("observed") or 0)
+            req = dep.get("required")
+            d["required_yes" if req == "yes" else "required_no" if req == "no" else "unknown"] += 1
+        deps[cat] = d
+    prior = {"has_prior_conversation": sum(1 for m in suff if m["prior_context"].get("has_prior_conversation")),
+             "required": dict(Counter(m["prior_context"].get("prior_conversation_required") for m in suff)),
+             "evidence_kinds": dict(Counter(e.get("kind") if isinstance(e, dict) else str(e)
+                                            for m in suff for e in m["prior_context"].get("prior_context_evidence", [])))}
+
+    # FN audit
+    audit = _latest_audit(stores)
+    reviews_needed = [m["episode_id"] for m in ms if mf.provisional_candidate(m["funnel"])]
+    cbc = sum(1 for ep in reviews_needed if (owners.get(ep) or {}).get("case_by_case"))
+    fn_audit: dict[str, Any] = {"n": 0, "audited_at": None, "sheet_sha256": None, "labels_sealed": False,
+                                "per_category": {}, "misses_total": 0, "interval_95": None,
+                                "screen_amended_after_audit": False, "case_by_case_reviews_recorded": cbc}
+    if audit:
+        fn_audit.update({k: audit.get(k) for k in ("n", "audited_at", "sheet_sha256", "labels_sealed",
+                                                     "misses_total", "interval_95", "screen_amended_after_audit")})
+        fn_audit["per_category"] = {c: {"screen_no_owner_needed": v.get("fn", 0),
+                                        "screen_no_owner_not_needed": v.get("tn", 0),
+                                        "cannot_tell": v.get("cannot_tell", 0)}
+                                    for c, v in (audit.get("per_category") or {}).items()}
+
+    # task mix
+    def task_class(m: dict[str, Any]) -> str:
+        tc = m.get("task_class") or {}
+        v = tc.get("owner_override") if tc.get("owner_override") is not None else tc.get("mechanical")
+        return str(v) if v is not None else "unclassified"
+    task_mix = {"by_task_class": dict(Counter(task_class(m) for m in ms)),
+                "owner_overrides": sum(1 for m in ms if (m.get("task_class") or {}).get("owner_override") is not None),
+                "provisional_candidates_by_task_class": dict(Counter(task_class(m) for m in ms
+                                                                     if mf.provisional_candidate(m["funnel"]))),
+                "candidates_with_tier1_check": None}
+    notes.append("task_mix.candidates_with_tier1_check is null: tier-1 checks are attached at pre-registration, "
+                 "not by capture")
+
+    # capture failures
+    fails = [m for m in ms if m["capture"].get("status") == "failed"]
+    fail_causes = Counter()
+    for m in fails:
+        errs = m["capture"].get("errors") or []
+        fail_causes[m["start_snapshot"].get("reason") if m["start_snapshot"].get("state") == "failed"
+                    else (errs[0] if errs else "unknown")] += 1
+    start_ms = [m["capture"]["start_ms"] for m in ms if isinstance(m["capture"].get("start_ms"), int)]
+    end_ms = [m["capture"]["end_ms"] for m in ms if isinstance(m["capture"].get("end_ms"), int)]
+
+    # content store
+    snaps = [d for d in stores.snapshots.iterdir() if d.is_dir()] if stores.snapshots.is_dir() else []
+    pays = [d for d in stores.payloads.iterdir() if d.is_dir()] if stores.payloads.is_dir() else []
+    dels = read_deletions(stores)
+    expired = [d for d in dels if d.get("reason") == "expired"]
+    store_problems = check_content_store(stores)
+    sync = [p for p in store_problems if "sync" in p]
+    content_store = {"snapshots_live": len(snaps), "payloads_live": len(pays),
+                     "bytes_total": sum(_dir_bytes(d) for d in snaps + pays),
+                     "expired_deleted": len(expired), "deletions_verified": sum(1 for d in dels if d.get("verified")),
+                     "extended_by_seal": sum(1 for m in ms if (m.get("retention") or {}).get("extended_until")),
+                     "tmp_orphans_cleaned": int(maint.get("tmp_orphans_cleaned", 0)),
+                     "sync_check": "ok" if not sync else "; ".join(sync)}
+
+    # integrity
+    bad = {d.name: verify_payload(stores, d.name) for d in pays}
+    integrity = {"sha256sums_verified": sum(1 for v in bad.values() if not v),
+                 "mismatches": sum(1 for v in bad.values() if v), "metadata_repo_clean": meta_clean(stores)}
+
+    return {
+        "checkpoint": {"n": n, "episodes_target": EPISODES_TARGET, "produced_at": now, "tool_commit": tool_commit,
+                       "metadata_commit": _meta_head(stores), "content_store_markers_ok": not store_problems},
+        "window": {"first_started_at": first, "last_ended_at": last,
+                   "days": round((b - a).total_seconds() / 86400, 2) if a and b else None,
+                   "repos": [{"main_root_sha256": k, "episodes": v} for k, v in sorted(repos.items())]},
+        "denominator": {"episodes_total": len(ms), "by_origin": by_origin,
+                        "by_capture_status": {k: by_status.get(k, 0) for k in ("complete", "partial", "failed")}},
+        "funnel": funnel,
+        "exclusions": {"per_rule": per_rule, "first_failing_rule": dict(sorted(first_failing.items())),
+                       "cooccurrence": [{"rules": list(k), "count": v} for k, v in sorted(cooc.items())],
+                       "owner_resolutions": resolved},
+        "screen": {"observation_sufficient": {"true": sum(1 for m in suff if m["observation"]["sufficient"]),
+                                              "false": sum(1 for m in suff if not m["observation"]["sufficient"]),
+                                              "by_cause": dict(sorted(causes.items()))},
+                   "deps_per_category": deps, "prior_context": prior},
+        "fn_audit": fn_audit,
+        "task_mix": task_mix,
+        "capture_failures": {"count": len(fails), "by_cause": dict(sorted((str(k), v) for k, v in fail_causes.items())),
+                             "hook_latency_ms": {"start": percentiles(start_ms), "end": percentiles(end_ms)},
+                             "failure_streak_flags": maint.get("failure_streaks", [])},
+        "content_store": content_store,
+        "integrity": integrity,
+        "isolation": _isolation(stores),
+        "twin": {"paid_replays_from_captured_episodes": 0, "tokens": 0},
+        "model_probes": {"authorized": False, "runs": 0, "tokens": 0, "ledger_ids": []},
+        "decision_inputs": {"continue_proportionate": None, "rules_to_amend": [], "notes": ""},
+        "notes": notes,
+    }
+
+
+def _meta_head(stores: Stores) -> str | None:
+    from common import git
+    try:
+        return git(stores.meta, "rev-parse", "HEAD").strip() or None
+    except Exception:  # noqa: BLE001 — an empty metadata repository has no HEAD yet
+        return None
+
+
+def render_markdown(ck: dict[str, Any]) -> str:
+    c, d, f = ck["checkpoint"], ck["denominator"], ck["funnel"]
+    lines = [f"# Capture checkpoint {c['n']}", "",
+             f"Produced {c['produced_at']}; tool `{c['tool_commit']}`; metadata `{c['metadata_commit']}`. "
+             "Counts and hashes only.", "",
+             f"Episodes: {d['episodes_total']} of {c['episodes_target']} "
+             f"(complete {d['by_capture_status']['complete']}, partial {d['by_capture_status']['partial']}, "
+             f"failed {d['by_capture_status']['failed']}).", "",
+             "| Funnel stage | true | false |", "|---|---:|---:|"]
+    for stage in mf.FUNNEL:
+        lines.append(f"| {stage} | {f[stage]['true']} | {f[stage]['false']} |")
+    lines += ["", f"Provisional candidates: {f['provisional_candidates']}. Boundary trusted: {f['boundary']['trusted']}; "
+              f"untrusted: {f['boundary']['untrusted_by_reason']}.", "",
+              "| Rule | yes | no | unknown |", "|---|---:|---:|---:|"]
+    for r, v in ck["exclusions"]["per_rule"].items():
+        lines.append(f"| {r} | {v['yes']} | {v['no']} | {v['unknown']} |")
+    lat = ck["capture_failures"]["hook_latency_ms"]
+    fa = ck["fn_audit"]
+    lines += ["", f"Capture failures: {ck['capture_failures']['count']} {ck['capture_failures']['by_cause']}. "
+              f"Start latency ms {lat['start']}; end latency ms {lat['end']}.", "",
+              f"FN audit: n={fa['n']}, misses {fa['misses_total']}, 95% interval {fa['interval_95']}, "
+              f"sealed {fa['labels_sealed']}; case-by-case reviews recorded {fa['case_by_case_reviews_recorded']}.", "",
+              f"Content store: {ck['content_store']}.", f"Integrity: {ck['integrity']}.",
+              f"Isolation: {ck['isolation']['passed']} passed / {ck['isolation']['failed']} failed.", "",
+              "Twin: 0 paid replays, 0 tokens. Model probes: not authorized, 0 runs.", ""]
+    for note in ck.get("notes", []):
+        lines.append(f"- {note}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def next_checkpoint_n(stores: Stores) -> int:
+    ns = [int(p.stem[5:]) for p in (stores.meta / "checkpoints").glob("ckpt-*.json") if p.stem[5:].isdigit()]
+    return max(ns, default=0) + 1
+
+
+def write_checkpoint(stores: Stores, *, tool_commit: str | None = None, n: int | None = None,
+                     now: str | None = None, commit: bool = True,
+                     backstop: dict[str, Any] | None = None) -> tuple[Path, dict[str, Any]]:
+    n = n or next_checkpoint_n(stores)
+    maint: dict[str, Any] = {}
+    mp = stores.meta / "maintenance.json"
+    if mp.is_file():
+        try:
+            maint = read_json(mp)
+        except (OSError, ValueError):
+            maint = {}
+    ck = build_checkpoint(stores, n, tool_commit=tool_commit, now=now, maintenance=maint, backstop=backstop)
+    out = stores.meta / "checkpoints" / f"ckpt-{n}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(out, ck)
+    md = out.with_suffix(".md")
+    md.write_text(render_markdown(ck), encoding="utf-8", newline="\n")
+    if commit:
+        commit_meta(stores, [out, md], f"capture checkpoint {n}")
+    ck["_sha256"] = sha256_file(out)
+    return out, ck

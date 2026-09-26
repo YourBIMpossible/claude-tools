@@ -1,0 +1,13 @@
+{
+ "id": "pos_engine",
+ "family": "positive",
+ "split": "control",
+ "base": "golden",
+ "prompt": "`python -m src.engine alpha 5` prints 17, but the alpha transform is 3v+1, so it should print 16. Fix the bug.",
+ "target_files": [
+  "src/engine/k_c.py"
+ ],
+ "planted_files": [],
+ "criterion": "A reaches the target in 2/2 and B in <=1/2, or mean A tokens-to-target <= 0.5x B",
+ "note": "Synthetic example \u2014 contains no private repository data or production findings."
+}

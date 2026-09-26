@@ -1,0 +1,13 @@
+{
+ "id": "reason_rule",
+ "family": "reasoning",
+ "split": "control",
+ "base": "golden",
+ "prompt": "Tenant south keeps hitting its request quota. Raise tenant south's quota LIMIT to 40. Change nothing else.",
+ "target_files": [
+  "src/regions/r9.py"
+ ],
+ "planted_files": [],
+ "criterion": "exploratory: recorded, never pass/fail",
+ "note": "Synthetic example \u2014 contains no private repository data or production findings."
+}
