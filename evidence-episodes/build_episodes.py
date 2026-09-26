@@ -623,6 +623,9 @@ def build_row(pid: str, copies: list[PacketCopy], cohorts: list[Cohort],
             "anchored_by": ("hash" if matched is not None
                             else "brief_order" if brief_pos is not None else "time"),
             "hash_matches_packet": None if not task.get("raw_prompt_hash") else matched is not None,
+            # delivered prompts earlier in this transcript, by origin (standalone checks)
+            "prior_prompts": dict(sorted(Counter(
+                str(ev.data.get("origin")) for ev in tr.events[:anchor_pos] if ev.kind == "prompt").items())),
         }
         # The hook answers at submission, so the brief marks where the turn's
         # response begins; a queued prompt can sit well before its delivery.

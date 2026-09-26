@@ -5,6 +5,8 @@ No framework, plain checks (ctxdex-suite style, matching ctxcheck/test_ctxcheck.
 Runs against synthetic tempfile fixtures only — never a real Claude Code projects
 directory, a real packet store, or a real archive. Requires ``evidence_compiler``
 importable (its src/ on PYTHONPATH).
+
+Synthetic example — contains no private repository data or production findings.
 """
 
 from __future__ import annotations
@@ -251,6 +253,8 @@ def test_build(tmp: Path) -> None:
     check(r["prompt"]["hash_matches_packet"] and r["prompt"]["text"] == "/review src/x.py"
           and r["prompt"]["transcript_text"].startswith("<command-message>"),
           "slash command matched through its typed form; stored markup kept")
+    check(rows["ep_00000000000000a1"]["prompt"]["prior_prompts"] == {}
+          and r["prompt"]["prior_prompts"] == {"user": 1}, "earlier delivered prompts counted by origin")
 
     r = rows["ep_00000000000000a3"]
     check(r["join_reason"] == "joined" and r["injected"]["rendered_nonempty"] is False,

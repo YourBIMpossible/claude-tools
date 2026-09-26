@@ -49,6 +49,8 @@ packet differ across sources), `parse_failure`, `other`.
    (no hash, placed by its brief), or `time` (nearest delivered prompt at or
    before packet creation — the app rewrote the text, e.g. pasted content).
    `hash_matches_packet: false` rows are listed in the summary.
+   `prompt.prior_prompts` counts the delivered prompts earlier in the same
+   transcript, by origin (`{}` for a session's first prompt).
 3. The window: from the anchor to the next prompt, the next packet's start, or
    end of transcript (`observed.ended_by`). Queued prompts delivered as a batch
    share one response: earlier rows end at the next prompt with no assistant
