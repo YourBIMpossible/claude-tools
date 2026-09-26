@@ -8,6 +8,11 @@ The snapshot records the checkout exactly as it is when the prompt is submitted:
 * ``worktree.patch``      ``git diff-files -p --binary --full-index --no-renames`` (unstaged vs index)
 * ``index.bin``           a byte copy of ``.git/index`` taken inside the bracket
 * ``ls-files-stage.z``    ``git ls-files --stage -z`` (unmerged entries appear as stages 1-3)
+* ``ls-tree-head.z``      ``git ls-tree -r -z --full-tree HEAD``
+* ``blobs/<oid>``         bytes of every index blob (any stage) not in HEAD's tree: staged content
+                          and conflict stages exist only in the source object store
+* ``worktree/<sha>``      bytes of tracked paths whose worktree differs from the index;
+                          ``worktree.json`` lists them (and worktree deletions)
 * ``state/*``             ``MERGE_HEAD``, ``REBASE_HEAD``, ``CHERRY_PICK_HEAD`` ... when present
 * ``untracked/<sha>``     every untracked, unignored file as bytes; ``untracked.json`` holds
                           path, mode, size, sha256 and symlink targets
@@ -54,6 +59,7 @@ STATUS_ARGS = ("status", "--porcelain=v2", "-z", "--untracked-files=all", "--ign
 INDEX_PATCH_ARGS = ("diff-index", "--cached", "HEAD", "-p", "--binary", "--full-index", "--no-renames")
 WORKTREE_PATCH_ARGS = ("diff-files", "-p", "--binary", "--full-index", "--no-renames")
 LS_STAGE_ARGS = ("ls-files", "--stage", "-z")
+LS_TREE_ARGS = ("ls-tree", "-r", "-z", "--full-tree", "HEAD")
 IDENTITY_ARGS = ("rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel", "--abbrev-ref", "HEAD")
 HEAD_ARGS = ("rev-parse", "--verify", "-q", "HEAD")
 CONFIG_ARGS = ("config", "--get-regexp", r"^core\.(symlinks|autocrlf|filemode)$")
@@ -203,9 +209,70 @@ def _config(raw: bytes) -> dict[str, str | None]:
 def _read_artifacts(repo: Path, dl: Deadline) -> dict[str, bytes]:
     """The git-derived artifacts, in one place so the second pass is identical."""
     art = run_git_parallel(repo, {"index.patch": INDEX_PATCH_ARGS, "worktree.patch": WORKTREE_PATCH_ARGS,
-                                  "ls-files-stage.z": LS_STAGE_ARGS}, dl.remaining())
+                                  "ls-files-stage.z": LS_STAGE_ARGS, "ls-tree-head.z": LS_TREE_ARGS},
+                           dl.remaining())
     dl.check("artifacts")
     return art
+
+
+def index_blobs_outside_head(stage_listing: bytes, tree_listing: bytes) -> list[str]:
+    """Object names of index entries (all stages) whose blob is not in HEAD's tree.
+
+    Staged content and conflict stages live only in the source's object store; the clone
+    is built from the start commit's ancestry, so these blobs travel in the snapshot.
+    """
+    head_blobs = set()
+    for rec in tree_listing.split(b"\0"):
+        if rec:
+            meta = rec.split(b"\t", 1)[0].split(b" ")
+            if len(meta) == 3 and meta[1] == b"blob":
+                head_blobs.add(meta[2].decode("ascii"))
+    need: set[str] = set()
+    for rec in stage_listing.split(b"\0"):
+        if rec:
+            mode, sha, _stage = rec.split(b"\t", 1)[0].split(b" ")
+            if mode != b"160000" and sha.decode("ascii") not in head_blobs:
+                need.add(sha.decode("ascii"))
+    return sorted(need)
+
+
+def cat_blobs(repo: Path, shas: list[str], timeout: float) -> dict[str, bytes]:
+    """Blob bytes by object name, in one ``cat-file --batch`` call."""
+    if not shas:
+        return {}
+    proc = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"], input=("\n".join(shas) + "\n").encode(),
+                          capture_output=True, timeout=timeout, env=git_env())
+    if proc.returncode != 0:
+        raise RuntimeError("git cat-file --batch failed")
+    out, pos, blobs = proc.stdout, 0, {}
+    for sha in shas:
+        nl = out.index(b"\n", pos)
+        header = out[pos:nl].split(b" ")
+        if len(header) != 3 or header[1] != b"blob" or header[0].decode("ascii") != sha:
+            raise RuntimeError(f"cat-file: unexpected header for {sha}")
+        size = int(header[2])
+        blobs[sha] = out[nl + 1:nl + 1 + size]
+        pos = nl + 1 + size + 1
+    return blobs
+
+
+def worktree_changed(status: bytes) -> list[tuple[str, bool]]:
+    """Tracked paths whose worktree differs from the index: ``(path, deleted)``.
+
+    From porcelain v2 ``1`` records with a worktree status other than ``.`` and every
+    unmerged ``u`` record (the conflicted file as it sits in the worktree).
+    """
+    out: list[tuple[str, bool]] = []
+    for rec in status.split(b"\0"):
+        if rec.startswith(b"1 "):
+            parts = rec.split(b" ", 8)
+            y = parts[1][1:2]
+            if y != b".":
+                out.append((parts[8].decode("utf-8", "surrogateescape"), y == b"D"))
+        elif rec.startswith(b"u "):
+            parts = rec.split(b" ", 10)
+            out.append((parts[10].decode("utf-8", "surrogateescape"), parts[1][1:2] == b"D"))
+    return out
 
 
 def _untracked_entry(top: Path, rel: str) -> tuple[dict[str, Any], bytes | None]:
@@ -283,19 +350,37 @@ def take_snapshot(repo: Path, episode: str, stores: Stores, *, budget_s: float =
                 (tmp / "state").mkdir(exist_ok=True)
                 shutil.copyfile(src, tmp / "state" / name)
 
-        untracked_meta: list[dict[str, Any]] = []
-        for rel in untracked_paths:
-            entry, data = _untracked_entry(top, rel)
-            total += entry["bytes"]
-            if total > size_cap:
-                raise SnapshotFailed("size_cap", f"{total} bytes > {size_cap}")
-            if data is not None:
-                (tmp / "untracked").mkdir(exist_ok=True)
-                (tmp / "untracked" / entry["sha256"]).write_bytes(data)
-            untracked_meta.append(entry)
-            dl.check("untracked")
+        blobs = cat_blobs(repo, index_blobs_outside_head(art["ls-files-stage.z"], art["ls-tree-head.z"]),
+                          dl.remaining())
+        for sha, data in blobs.items():
+            total += len(data)
+            (tmp / "blobs").mkdir(exist_ok=True)
+            (tmp / "blobs" / sha).write_bytes(data)
+        dl.check("blobs")
+
+        def keep_files(paths: list[str], subdir: str) -> list[dict[str, Any]]:
+            nonlocal total
+            meta: list[dict[str, Any]] = []
+            for rel in paths:
+                entry, data = _untracked_entry(top, rel)
+                total += entry["bytes"]
+                if total > size_cap:
+                    raise SnapshotFailed("size_cap", f"{total} bytes > {size_cap}")
+                if data is not None:
+                    (tmp / subdir).mkdir(exist_ok=True)
+                    (tmp / subdir / entry["sha256"]).write_bytes(data)
+                meta.append(entry)
+                dl.check(subdir)
+            return meta
+
+        untracked_meta = keep_files(untracked_paths, "untracked")
+        changed = worktree_changed(pre["_status"])
+        worktree_meta = keep_files([p for p, deleted in changed if not deleted], "worktree")
+        worktree_meta += [{"path": p, "path_sha256": path_sha256(p), "deleted": True} for p, deleted in changed if deleted]
         (tmp / "untracked.json").write_text(json.dumps(untracked_meta, sort_keys=True, indent=1) + "\n",
                                             encoding="utf-8")
+        (tmp / "worktree.json").write_text(json.dumps(worktree_meta, sort_keys=True, indent=1) + "\n",
+                                           encoding="utf-8")
         ignored = sorted(path_sha256(p) for p in ignored_paths)
         (tmp / "ignored.json").write_text(json.dumps(ignored) + "\n", encoding="utf-8")
 
@@ -307,7 +392,7 @@ def take_snapshot(repo: Path, episode: str, stores: Stores, *, budget_s: float =
         diffs = bracket_diff(pre, post)
         art2 = _read_artifacts(repo, dl)
         diffs += [name for name, data in art.items() if art2[name] != data]
-        for entry in untracked_meta:
+        for entry in untracked_meta + [e for e in worktree_meta if not e.get("deleted")]:
             try:
                 redo, _ = _untracked_entry(top, entry["path"])
             except OSError:

@@ -16,7 +16,7 @@ starts once it could cross the ceiling. The stream's tool calls are scored with
 the same Footprint extractor as natural episodes.
 
     python twin.py tasks-lab  --cases <dir> --golden <dir> --out tasks.json
-    python twin.py tasks-real --episodes <episodes.jsonl> --packets <id>[,<id>...] --out tasks.json
+    python twin.py tasks-real --episodes <episodes.jsonl> --packets <id>[,<id>...] --payloads <dir> --out tasks.json
     python twin.py plan       --tasks tasks.json --repeats 2 --seed <int> --out plan.json
     python twin.py run        --tasks tasks.json --plan plan.json --archive <dir> --scratch <dir>
                               --model <id> --ledger <ledger.json> [--cap 4000000] [--ceiling 150000000]
@@ -47,6 +47,8 @@ from typing import Any, Callable
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "evidence-footprints"))
+sys.path.insert(0, str(HERE.parent / "evidence-capture"))
+import clone_builder  # noqa: E402
 import footprints as fpm  # noqa: E402
 
 ARMS = ("A", "B")
@@ -139,7 +141,11 @@ def tasks_lab(cases: Path, golden: Path) -> list[dict]:
     return tasks
 
 
-def tasks_real(episodes: Path, packets: list[str]) -> list[dict]:
+def tasks_real(episodes: Path, packets: list[str], payloads: Path | None = None) -> list[dict]:
+    """One task per named packet. The run starts from the episode's start state: the
+    clone holds only the start commit's ancestry (``clone_start_only``) and the start's
+    index/worktree state is rebuilt from the episode's reviewed payload under
+    ``payloads``. A row without a payload yields a task that ``prepare`` refuses."""
     rows = {}
     for line in episodes.read_text(encoding="utf-8").splitlines():
         if line:
@@ -158,15 +164,21 @@ def tasks_real(episodes: Path, packets: list[str]) -> list[dict]:
             "task_id": pid, "kind": "real", "family": None,
             "prompt": row["prompt"]["text"], "brief": (row.get("injected") or {}).get("text") or "",
             "target_files": sorted(fp.edited), "planted_files": [],
-            "prepare": {"type": "clone", "source": fpm.main_root(row["identity"]["repository_root"]),
-                        "head": head},
+            "prepare": {"type": "clone_start_only",
+                        "source": fpm.main_root(row["identity"]["repository_root"]), "head": head,
+                        "snapshot": (str(payloads / row["episode_id"])
+                                     if payloads is not None and row.get("episode_id") else None)},
             "verify": None,
         })
     return tasks
 
 
-def prepare(spec: dict, dest: Path) -> str:
-    """Build the run's repository at ``dest``; return its HEAD."""
+def prepare(spec: dict, dest: Path, proofs: dict | None = None) -> str:
+    """Build the run's repository at ``dest``; return its HEAD.
+
+    ``clone_start_only`` fills ``proofs`` with the clone record (plan §7 P1–P10) and
+    refuses unless every proof passed. A plain ``clone`` is refused: it carries the
+    source's whole history, including commits made after the episode started."""
     if spec["type"] == "overlay":
         shutil.copytree(spec["base"], dest)
         overlay = Path(spec["overlay"])
@@ -175,14 +187,17 @@ def prepare(spec: dict, dest: Path) -> str:
         git(dest, "init", "-q")
         git(dest, "add", "-A")
         git(dest, "commit", "-q", "-m", "lab fixture")
+    elif spec["type"] == "clone_start_only":
+        if not spec.get("snapshot"):
+            raise RuntimeError("no start-state payload: the episode cannot be replayed")
+        record = clone_builder.clone_start_only(Path(spec["source"]), spec["head"], dest, Path(spec["snapshot"]))
+        if proofs is not None:
+            proofs.update(record)
+        if not record["start_state_reconstructed"]:
+            raise RuntimeError(f"start state not reproduced: failed {record['failed']} {record['error'] or ''}".strip())
     elif spec["type"] == "clone":
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(["git", "clone", "--quiet", "--no-checkout", spec["source"], str(dest)],
-                              capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"clone failed: {proc.stderr.strip()}")
-        git(dest, "checkout", "--quiet", "--detach", spec["head"])
-        git(dest, "remote", "remove", "origin")
+        raise ValueError("prepare type 'clone' is refused: a full clone carries post-start history; "
+                         "use 'clone_start_only'")
     else:
         raise ValueError(f"unknown prepare type {spec['type']!r}")
     if git(dest, "remote").strip():
@@ -352,9 +367,14 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
     work.mkdir(parents=True)
     repo = work / "repo"
     source_status = None
-    if task["prepare"]["type"] == "clone":
+    if task["prepare"]["type"] == "clone_start_only":
         source_status = sha256_bytes(git(Path(task["prepare"]["source"]), "status", "--porcelain").encode())
-    head = prepare(task["prepare"], repo)
+    proofs: dict = {}
+    try:
+        head = prepare(task["prepare"], repo, proofs)
+    finally:
+        if proofs:
+            write_json(out / "clone_proofs.json", proofs)
 
     brief_arg = "-"
     if run["arm"] == "A" and task["brief"]:
@@ -603,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("tasks-real")
     p.add_argument("--episodes", type=Path, required=True)
     p.add_argument("--packets", required=True)
+    p.add_argument("--payloads", type=Path, help="content-store payloads directory (start states)")
     p.add_argument("--out", type=Path, required=True)
     p = sub.add_parser("plan")
     p.add_argument("--tasks", type=Path, required=True)
@@ -638,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "tasks-lab":
         write_json(args.out, tasks_lab(args.cases, args.golden))
     elif args.cmd == "tasks-real":
-        write_json(args.out, tasks_real(args.episodes, [p for p in args.packets.split(",") if p]))
+        write_json(args.out, tasks_real(args.episodes, [p for p in args.packets.split(",") if p], args.payloads))
     elif args.cmd == "plan":
         write_json(args.out, plan(read_json(args.tasks), args.repeats, args.seed))
     elif args.cmd == "run":

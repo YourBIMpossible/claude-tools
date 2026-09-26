@@ -18,7 +18,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "evidence-capture"))
+import snapshot  # noqa: E402
+import store  # noqa: E402
 import twin  # noqa: E402
+
+EPISODE = "cap_0123456789abcdef"
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -206,21 +211,46 @@ def test_real(tmp: Path) -> None:
     twin.git(src, "add", "-A")
     twin.git(src, "commit", "-q", "-m", "one")
     head = twin.git(src, "rev-parse", "HEAD").strip()
+    (src / "notes.txt").write_text("untracked at the start\n", encoding="utf-8")
+    stores = store.Stores(tmp / "meta", tmp / "content")
+    store.init_stores(stores)
+    _, snap = snapshot.take_snapshot(src, EPISODE, stores, budget_s=60)
+    check(snap["state"] == "complete", "start snapshot taken")
+    (src / "notes.txt").unlink()
     (src / "README.md").write_text("changed later\n", encoding="utf-8")
     twin.git(src, "commit", "-qam", "two")
-    row = {"packet_id": "ep_1", "join_reason": "joined", "prompt": {"text": "p"},
+    row = {"packet_id": "ep_1", "episode_id": EPISODE, "join_reason": "joined", "prompt": {"text": "p"},
            "identity": {"repository_root": src.as_posix(), "head": head},
            "injected": {"text": "b"},
            "observed": {"tool_calls": [{"name": "Edit", "input": {"file_path": f"{src.as_posix()}/src/beta.py"}}]}}
     eps = tmp / "eps.jsonl"
     eps.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    tasks = twin.tasks_real(eps, ["ep_1"])
+    tasks = twin.tasks_real(eps, ["ep_1"], stores.snapshots)
     check(tasks[0]["target_files"] == ["src/beta.py"], "real task targets the recorded edits")
+    check(tasks[0]["prepare"]["type"] == "clone_start_only", "real tasks use the start-only clone")
     repo = tmp / "clone"
-    got = twin.prepare(tasks[0]["prepare"], repo)
+    proofs: dict = {}
+    got = twin.prepare(tasks[0]["prepare"], repo, proofs)
     check(got == head and (repo / "README.md").read_text(encoding="utf-8") == GOLDEN["README.md"],
           "clone is checked out at the recorded HEAD")
+    check((repo / "notes.txt").read_text(encoding="utf-8") == "untracked at the start\n",
+          "the start's untracked file is rebuilt")
     check(not twin.git(repo, "remote").strip(), "clone has no remote")
+    check(proofs.get("start_state_reconstructed") is True and not proofs["failed"], "every proof passed")
+    later = twin.git(src, "rev-parse", "HEAD").strip()
+    check(subprocess.run(["git", "-C", str(repo), "cat-file", "-e", later], capture_output=True).returncode != 0,
+          "the post-start commit is not in the clone")
+
+    refused = []
+    for spec in ({**tasks[0]["prepare"], "type": "clone"}, {**tasks[0]["prepare"], "snapshot": None}):
+        try:
+            twin.prepare(spec, tmp / f"refused{len(refused)}")
+            refused.append(False)
+        except (ValueError, RuntimeError):
+            refused.append(True)
+    check(refused == [True, True], "a plain clone and a clone without a start payload are refused")
+    no_payload = twin.tasks_real(eps, ["ep_1"])
+    check(no_payload[0]["prepare"]["snapshot"] is None, "no payload directory, no start state")
 
 
 def main() -> int:
