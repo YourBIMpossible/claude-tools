@@ -142,7 +142,13 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
     ledger = tmp / "ledger.json"
     kw = dict(archive=archive, scratch=scratch, model="m", ledger=ledger, cap=100_000, ceiling=1_000_000,
               wall=60, claude=FAKE, kind=None, limit=None, projects=projects)
-    res = twin.run_batch(neg, plan, **kw)
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k.upper().startswith(("CLAUDE", "ANTHROPIC"))}
+    os.environ["CLAUDE_TWIN_TEST_PARENT"] = "1"
+    try:
+        res = twin.run_batch(neg, plan, **kw)
+    finally:
+        del os.environ["CLAUDE_TWIN_TEST_PARENT"]
+        os.environ.update(saved)
     check(res["ran"] == 2 and res["stopped"] is None, "dry run: two runs")
     metas = {m["arm"]: m for m in (json.loads(p.read_text(encoding="utf-8")) for p in archive.glob("*/meta.json"))}
     a = metas["A"]
@@ -161,6 +167,7 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
     kw2 = dict(kw, archive=tmp / "archive2", ceiling=106_000)
     stop = twin.run_batch(neg, plan, **kw2)
     check(stop["ran"] == 0 and stop["stopped"], "no run starts once the cap could cross the ceiling")
+    check(a["env_dropped"] == ["CLAUDE_TWIN_TEST_PARENT"] and a["cli_path_sha256"], "parent Claude env is dropped")
     os.environ["FAKE_CLAUDE_ERROR"] = "1"
     try:
         bad = twin.run_batch(neg, plan, **dict(kw, archive=tmp / "archive3", ledger=tmp / "ledger3.json"))

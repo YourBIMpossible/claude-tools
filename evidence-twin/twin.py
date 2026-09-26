@@ -279,6 +279,33 @@ def settings_for(brief_arg: str, python: str) -> dict:
             "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": hook}]}]}}
 
 
+def child_env() -> tuple[dict[str, str], list[str]]:
+    """The run's environment: this process's, minus every Claude and Anthropic variable.
+
+    A harness launched from inside a Claude Code session inherits that session's
+    wiring (session IDs, a host-managed auth refresh, a local API base URL, effort).
+    None of it belongs to the run, and it differs between launch contexts, so it is
+    dropped; the CLI then uses its own login. Returns the env and the dropped names.
+    """
+    dropped = sorted(k for k in os.environ if k.upper().startswith(("CLAUDE", "ANTHROPIC")))
+    env = {k: v for k, v in os.environ.items() if k not in dropped}
+    env["EVIDENCE_HOOK"] = "0"
+    return env, dropped
+
+
+def resolve_cli(claude: str) -> tuple[str, str | None]:
+    """The CLI's resolved path and sha256, so a batch records exactly which binary ran."""
+    path = claude if claude.endswith(".py") else (shutil.which(claude) or claude)
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return path, None
+    return path, h.hexdigest()
+
+
 def claude_cmd(claude: str, prompt: str, model: str, settings: Path) -> list[str]:
     base = [sys.executable, claude] if claude.endswith(".py") else [shutil.which(claude) or claude]
     return base + ["-p", prompt, "--output-format", "stream-json", "--verbose", "--no-session-persistence",
@@ -305,7 +332,7 @@ def clear_project_trace(projects: Path, repo: Path) -> list[str]:
 
 
 def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, cap: int, wall: int,
-            claude: str, projects: Path) -> dict:
+            claude: str, projects: Path, cli_sha: str | None = None) -> dict:
     out = archive / run["run_id"]
     out.mkdir(parents=True, exist_ok=True)
     work = scratch / run["run_id"].replace(".", "_")
@@ -324,7 +351,7 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         brief_arg = brief_file.as_posix()
     settings = work / "settings.json"
     write_json(settings, settings_for(brief_arg, sys.executable))
-    env = {**os.environ, "EVIDENCE_HOOK": "0"}
+    env, dropped = child_env()
     if claude.endswith(".py"):
         env["FAKE_CLAUDE_TARGET"] = task["target_files"][0]
 
@@ -389,6 +416,7 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         "cli_version": init.get("claude_code_version"), "init_model": init.get("model"),
         "init_counts": {k: len(init[k]) if isinstance(init.get(k), list) else init.get(k)
                         for k in ("tools", "mcp_servers", "skills", "agents", "memory_paths", "slash_commands")},
+        "cli_path_sha256": cli_sha, "env_dropped": dropped,
         "exit_code": proc.returncode, "killed": killed[0] if killed else None, "invalid": invalid,
         "is_error": (state.result or {}).get("is_error"), "result_subtype": (state.result or {}).get("subtype"),
         "tokens_total": state.tokens(),
@@ -410,6 +438,7 @@ def run_batch(tasks: list[dict], plan_obj: dict, *, archive: Path, scratch: Path
     book = read_json(ledger) if ledger.is_file() else {"runs": {}, "total": 0}
     done = started = 0
     stopped = None
+    claude, cli_sha = resolve_cli(claude)
     for run in plan_obj["runs"]:
         if kind and run["kind"] != kind:
             continue
@@ -422,7 +451,7 @@ def run_batch(tasks: list[dict], plan_obj: dict, *, archive: Path, scratch: Path
             stopped = f"ceiling: {book['total']} spent, {cap} more could cross {ceiling}"
             break
         meta = run_one(by_id[run["task_id"]], run, archive=archive, scratch=scratch, model=model, cap=cap,
-                       wall=wall, claude=claude, projects=projects)
+                       wall=wall, claude=claude, projects=projects, cli_sha=cli_sha)
         spent = max(meta["tokens_total"], meta["tokens_result"])
         book["runs"][f"{archive.name}/{run['run_id']}"] = spent
         book["total"] = sum(book["runs"].values())

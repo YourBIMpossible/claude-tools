@@ -19,6 +19,10 @@ with:
   archived brief through `additionalContext` in arm A — the production adapter's exact
   output — and nothing in arm B;
 - `EVIDENCE_HOOK=0`, `--no-session-persistence`, `--strict-mcp-config`, stdin closed.
+- an environment without any `CLAUDE*` or `ANTHROPIC*` variable. A harness started
+  from inside a Claude Code session would otherwise hand the run that session's IDs,
+  host-managed auth refresh, API base URL and effort. The run uses the CLI's own
+  login. `meta.json` lists the dropped names (never values) and the CLI binary's sha256.
 
 The CLI still creates an empty `~/.claude/projects/<slug>/memory` stub for the run's
 directory. The harness removes it when it is empty and flags it in `meta.json`
