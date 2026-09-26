@@ -49,6 +49,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "evidence-footprints"))
 sys.path.insert(0, str(HERE.parent / "evidence-capture"))
 import clone_builder  # noqa: E402
+import store as capture_store  # noqa: E402
 import footprints as fpm  # noqa: E402
 
 ARMS = ("A", "B")
@@ -144,8 +145,9 @@ def tasks_lab(cases: Path, golden: Path) -> list[dict]:
 def tasks_real(episodes: Path, packets: list[str], payloads: Path | None = None) -> list[dict]:
     """One task per named packet. The run starts from the episode's start state: the
     clone holds only the start commit's ancestry (``clone_start_only``) and the start's
-    index/worktree state is rebuilt from the episode's reviewed payload under
-    ``payloads``. A row without a payload yields a task that ``prepare`` refuses."""
+    index/worktree state is rebuilt from the snapshot inside the episode's reviewed
+    payload (``payloads/<episode_id>/snapshot``). A row without a payload yields a task
+    that ``prepare`` refuses."""
     rows = {}
     for line in episodes.read_text(encoding="utf-8").splitlines():
         if line:
@@ -166,8 +168,8 @@ def tasks_real(episodes: Path, packets: list[str], payloads: Path | None = None)
             "target_files": sorted(fp.edited), "planted_files": [],
             "prepare": {"type": "clone_start_only",
                         "source": fpm.main_root(row["identity"]["repository_root"]), "head": head,
-                        "snapshot": (str(payloads / row["episode_id"])
-                                     if payloads is not None and row.get("episode_id") else None)},
+                        "payload": (str(payloads / row["episode_id"])
+                                    if payloads is not None and row.get("episode_id") else None)},
             "verify": None,
         })
     return tasks
@@ -188,9 +190,14 @@ def prepare(spec: dict, dest: Path, proofs: dict | None = None) -> str:
         git(dest, "add", "-A")
         git(dest, "commit", "-q", "-m", "lab fixture")
     elif spec["type"] == "clone_start_only":
-        if not spec.get("snapshot"):
+        if not spec.get("payload"):
             raise RuntimeError("no start-state payload: the episode cannot be replayed")
-        record = clone_builder.clone_start_only(Path(spec["source"]), spec["head"], dest, Path(spec["snapshot"]))
+        payload = Path(spec["payload"])
+        bad = (capture_store.verify_sums(payload) if (payload / "SHA256SUMS").is_file()
+               else ["payload SHA256SUMS missing"])
+        if bad:
+            raise RuntimeError(f"start-state payload fails verification: {bad[:5]}")
+        record = clone_builder.clone_start_only(Path(spec["source"]), spec["head"], dest, payload / "snapshot")
         if proofs is not None:
             proofs.update(record)
         if not record["start_state_reconstructed"]:

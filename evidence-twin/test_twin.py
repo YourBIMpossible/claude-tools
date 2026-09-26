@@ -19,6 +19,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "evidence-capture"))
+import review  # noqa: E402
 import snapshot  # noqa: E402
 import store  # noqa: E402
 import twin  # noqa: E402
@@ -225,7 +226,13 @@ def test_real(tmp: Path) -> None:
            "observed": {"tool_calls": [{"name": "Edit", "input": {"file_path": f"{src.as_posix()}/src/beta.py"}}]}}
     eps = tmp / "eps.jsonl"
     eps.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    tasks = twin.tasks_real(eps, ["ep_1"], stores.snapshots)
+    m = {"episode_id": EPISODE, "ended_at": "2026-09-26T00:00:00Z", "exclusions": [],
+         "prompt": {"sha256": "0" * 64}, "link": {"brief_sha256": "0" * 64},
+         "start_snapshot": {"sums_sha256": snap["sums_sha256"]}}
+    review.materialize_payload(stores, m, review.ReviewInputs(src, "p", "b"), {"passed": True},
+                               "2026-09-26T00:00:00Z")
+    check(not review.verify_payload(stores, EPISODE), "start payload materialized and verified")
+    tasks = twin.tasks_real(eps, ["ep_1"], stores.payloads)
     check(tasks[0]["target_files"] == ["src/beta.py"], "real task targets the recorded edits")
     check(tasks[0]["prepare"]["type"] == "clone_start_only", "real tasks use the start-only clone")
     repo = tmp / "clone"
@@ -242,15 +249,18 @@ def test_real(tmp: Path) -> None:
           "the post-start commit is not in the clone")
 
     refused = []
-    for spec in ({**tasks[0]["prepare"], "type": "clone"}, {**tasks[0]["prepare"], "snapshot": None}):
+    (stores.payloads / EPISODE / "brief.txt").write_text("tampered\n", encoding="utf-8")
+    for spec in ({**tasks[0]["prepare"], "type": "clone"}, {**tasks[0]["prepare"], "payload": None},
+                 tasks[0]["prepare"]):
         try:
             twin.prepare(spec, tmp / f"refused{len(refused)}")
             refused.append(False)
         except (ValueError, RuntimeError):
             refused.append(True)
-    check(refused == [True, True], "a plain clone and a clone without a start payload are refused")
+    check(refused == [True, True, True],
+          "a plain clone, a clone without a start payload and a tampered payload are refused")
     no_payload = twin.tasks_real(eps, ["ep_1"])
-    check(no_payload[0]["prepare"]["snapshot"] is None, "no payload directory, no start state")
+    check(no_payload[0]["prepare"]["payload"] is None, "no payload directory, no start state")
 
 
 def main() -> int:

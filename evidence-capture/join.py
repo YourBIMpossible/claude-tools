@@ -131,7 +131,7 @@ def parse_transcript(path: Path) -> Transcript:
                         continue
                     for m in BRIEF_TAG_RE.finditer(part):
                         events.append(Event(idx, "brief", ts, {"packet_id": m.group(1), "sha256": sha256_text(part),
-                                                               "len": len(part)}))
+                                                               "len": len(part), "text": part}))
                 continue
             msg = entry.get("message")
             if not isinstance(msg, dict):
@@ -287,6 +287,7 @@ def join(m: dict[str, Any], transcript: Path) -> dict[str, Any] | None:
     if brief is not None:
         m["link"].update(brief_sha256=brief["sha256"], brief_len=brief["len"], brief_empty=brief["len"] == 0)
     obs["turn"] = {"start": start, "end": end, "prompt_text": ev.data["text"],
+                   "brief_text": brief["text"] if brief is not None else None,
                    "earlier_result_text": [e.data["text"] for e in tr.events[:start] if e.kind == "tool_result"],
                    "earlier_prompt_text": [e.data["text"] for e in tr.events[:start] if e.kind == "prompt"],
                    "earlier_edit_paths": _edit_paths(tr.events[:start])}

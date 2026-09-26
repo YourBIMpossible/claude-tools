@@ -31,6 +31,7 @@ from common import iso, now_utc, read_json, sha256_file, write_json_atomic
 ENV_META = "EC_CAPTURE_META"
 ENV_CONTENT = "EC_CAPTURE_CONTENT"
 ENV_PACKET_DIRS = "EC_CAPTURE_PACKET_DIRS"
+ENV_SEALS = "EC_CAPTURE_SEALS"
 ENV_DISABLE = "EVIDENCE_CAPTURE"
 USER_CONFIG = Path.home() / ".claude" / "evidence-capture.json"
 SYNC_ROOT_NAMES = ("onedrive", "dropbox", "icloud", "google drive", "googledrive", "box sync", "box")
@@ -38,7 +39,9 @@ CONTENT_DIRS = ("snapshots", "payloads", "tmp")
 META_DIRS = ("manifests", "review", "audits", "checkpoints", "boundary")
 CONTENT_MARKERS = (".git-blocked", "NOSYNC")
 TMP_MAX_AGE_S = 3600
-META_GITIGNORE = "# capture content never enters this repository\n*.patch\n*.bin\nsnapshot*\npayload*\n*.tmp\n"
+META_GITIGNORE = ("# capture content never enters this repository\n*.patch\n*.bin\nsnapshot*\npayload*\n*.tmp\n"
+                  "# operational log: local only (the checkpoint summarises it)\ncapture.log\n")
+CONTENT_PATTERNS = ("*.patch", "*.bin", "snapshot*", "payload*")
 
 
 class StoreError(RuntimeError):
@@ -50,6 +53,7 @@ class Stores:
     meta: Path
     content: Path
     packet_dirs: tuple[Path, ...] = ()
+    seal_dirs: tuple[Path, ...] = ()  # directories of retention seals (``review.valid_seal``)
 
     @property
     def manifests(self) -> Path:
@@ -71,7 +75,8 @@ class Stores:
 def resolve_stores(env: dict[str, str] | None = None, config: Path = USER_CONFIG) -> Stores | None:
     """Store paths from the environment, else the user config; None when neither says."""
     env = os.environ if env is None else env
-    meta, content, packets = env.get(ENV_META), env.get(ENV_CONTENT), env.get(ENV_PACKET_DIRS)
+    meta, content = env.get(ENV_META), env.get(ENV_CONTENT)
+    packets, seals = env.get(ENV_PACKET_DIRS), env.get(ENV_SEALS)
     if not (meta and content) and config.is_file():
         try:
             cfg = read_json(config)
@@ -80,10 +85,14 @@ def resolve_stores(env: dict[str, str] | None = None, config: Path = USER_CONFIG
         meta = meta or cfg.get("meta")
         content = content or cfg.get("content")
         packets = packets or os.pathsep.join(cfg.get("packet_dirs") or [])
+        seals = seals or os.pathsep.join(cfg.get("seal_dirs") or [])
     if not (meta and content):
         return None
-    dirs = tuple(Path(p) for p in (packets or "").split(os.pathsep) if p)
-    return Stores(Path(meta), Path(content), dirs)
+
+    def split(value: str | None) -> tuple[Path, ...]:
+        return tuple(Path(p) for p in (value or "").split(os.pathsep) if p)
+
+    return Stores(Path(meta), Path(content), split(packets), split(seals))
 
 
 def init_stores(stores: Stores) -> None:
@@ -170,7 +179,90 @@ def check_meta_store(stores: Stores) -> list[str]:
     gi = m / ".gitignore"
     if not gi.is_file() or "*.patch" not in gi.read_text(encoding="utf-8"):
         problems.append("metadata .gitignore lacks the content exclusions")
+    exclude = _meta_exclude_file(stores)
+    wanted = _meta_exclude_lines(stores)
+    have = set(exclude.read_text(encoding="utf-8").splitlines()) if exclude and exclude.is_file() else set()
+    if not set(wanted) <= have:
+        problems.append("metadata .git/info/exclude lacks the content exclusions")
     return problems
+
+
+def _meta_toplevel(stores: Stores) -> Path | None:
+    proc = subprocess.run(["git", "-C", str(stores.meta), "rev-parse", "--show-toplevel"], capture_output=True,
+                          text=True)
+    return Path(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+def _meta_exclude_file(stores: Stores) -> Path | None:
+    proc = subprocess.run(["git", "-C", str(stores.meta), "rev-parse", "--git-path", "info/exclude"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    p = Path(proc.stdout.strip())
+    return p if p.is_absolute() else stores.meta / p
+
+
+def _meta_exclude_lines(stores: Stores) -> list[str]:
+    """The content store's directory name (anywhere) plus the content file patterns."""
+    return [f"**/{stores.content.name}/", *CONTENT_PATTERNS]
+
+
+def init_meta_repo(stores: Stores) -> None:
+    """Make the metadata store its own git repository (no remote) and write the content
+    exclusions into ``.git/info/exclude``; idempotent. Refuses a metadata directory that
+    sits inside another repository rather than nesting one."""
+    top = _meta_toplevel(stores)
+    if top is None:
+        subprocess.run(["git", "init", "-q", str(stores.meta)], check=True, capture_output=True)
+    elif top.resolve() != stores.meta.resolve():
+        raise StoreError("metadata store is inside another git repository")
+    exclude = _meta_exclude_file(stores)
+    if exclude is None:
+        raise StoreError("metadata repository has no info/exclude path")
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    have = exclude.read_text(encoding="utf-8").splitlines() if exclude.is_file() else []
+    missing = [line for line in _meta_exclude_lines(stores) if line not in have]
+    if missing:
+        with exclude.open("a", encoding="utf-8", newline="\n") as fh:
+            if have and have[-1] != "":
+                fh.write("\n")
+            fh.write("# evidence capture: content never enters this repository\n")
+            fh.write("\n".join(missing) + "\n")
+    commit_meta(stores, [stores.meta / ".gitignore", stores.meta / "DELETIONS.log"], "capture metadata store")
+
+
+def commit_meta(stores: Stores, paths: list[Path], message: str) -> bool:
+    """Commit exactly ``paths`` in the metadata repository; True when a commit was made or
+    nothing changed. Uses the repository's configured identity; never skips hooks. A
+    failure is logged and returned as False (the checkpoint reports the repo unclean)."""
+    rels = []
+    for p in paths:
+        try:
+            rels.append(p.resolve().relative_to(stores.meta.resolve()).as_posix())
+        except ValueError:
+            log_line(stores, f"commit_meta: refused path outside the metadata store ({p.name})")
+            return False
+    if not rels:
+        return True
+    add = subprocess.run(["git", "-C", str(stores.meta), "add", "--", *rels], capture_output=True, text=True)
+    if add.returncode != 0:
+        log_line(stores, f"commit_meta: git add failed: {add.stderr.strip()[:200]}")
+        return False
+    staged = subprocess.run(["git", "-C", str(stores.meta), "diff", "--cached", "--quiet", "--", *rels],
+                            capture_output=True)
+    if staged.returncode == 0:
+        return True
+    proc = subprocess.run(["git", "-C", str(stores.meta), "commit", "-q", "-m", message, "--", *rels],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        log_line(stores, f"commit_meta: git commit failed: {proc.stderr.strip()[:200]}")
+        return False
+    return True
+
+
+def meta_clean(stores: Stores) -> bool:
+    proc = subprocess.run(["git", "-C", str(stores.meta), "status", "--porcelain"], capture_output=True, text=True)
+    return proc.returncode == 0 and not proc.stdout.strip()
 
 
 def log_line(stores: Stores | None, message: str) -> None:
@@ -223,11 +315,26 @@ def clean_tmp_orphans(stores: Stores, max_age_s: int = TMP_MAX_AGE_S) -> list[st
         return gone
     cutoff = time.time() - max_age_s
     for entry in sorted(stores.tmp.iterdir()):
+        staged = entry / "snapshot"
+        episode = entry.name.split(".", 1)[0]
         try:
-            if entry.stat().st_mtime < cutoff and rmtree(entry):
-                gone.append(entry.name)
+            old = entry.stat().st_mtime < cutoff
         except OSError:
             continue
+        if old and staged.is_dir() and not (stores.snapshots / episode).exists() \
+                and not (stores.payloads / episode).exists():
+            # A payload build interrupted after its snapshot was moved in: put the
+            # snapshot back so it is reviewed again (or expires and is logged), never
+            # silently dropped with the orphan.
+            try:
+                os.replace(staged, stores.snapshots / episode)
+                log_line(stores, f"staging interrupted; snapshot restored: {episode}")
+            except OSError as exc:
+                log_line(stores, f"staging interrupted; snapshot restore failed: {episode}: {exc}")
+                continue
+        # ``old`` was taken before any restore (which touches the entry's mtime).
+        if old and rmtree(entry):
+            gone.append(entry.name)
     if gone:
         log_line(stores, f"tmp orphans removed: {','.join(gone)}")
     return gone
