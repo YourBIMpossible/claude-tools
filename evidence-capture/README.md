@@ -27,6 +27,7 @@ owner-approved step.
 | `dryrun.py` | The real hooks against synthetic fixtures |
 | `backstop.py` | Scheduled maintenance and expiry backstop, independent of prompts and hooks |
 | `desktop_boundary_test.py` | Pinned-client boundary tests in the desktop client's streaming mode (synthetic repository) |
+| `desktop_host_probe.py` | Probe hooks and analysis for the desktop app itself (`claude-desktop` mode), run from a disposable repository |
 | `capture.py` | Command line |
 
 ## Stores
@@ -134,12 +135,16 @@ untrusted until its boundary is tested and accepted:
    and exits non-zero when a relied-upon property or the identity check failed.
 2. **The desktop client (`claude-desktop`).** The harness cannot stand in for the desktop
    host, because its settings payload and initialize request are not reproducible here.
-   Test that mode in the desktop app itself:
-   - open a disposable repository outside every repository and sync root;
-   - put the harness's probe hooks in its `.claude/settings.json`;
-   - send the same synthetic prompts;
-   - build the candidate from the event log with `client_identity.tested_identity`, the
-     same way the harness does.
+   Test that mode in the desktop app itself with `desktop_host_probe.py`:
+   - `setup --out <dir>` builds a disposable repository (outside every repository and
+     sync root) whose committed `.claude/settings.json` registers the probe hooks, plus
+     synthetic stores;
+   - open that repository in the desktop app and send the synthetic prompts **one at a
+     time, waiting for each turn to finish** — a prompt queued behind a running turn is
+     folded into it, and the event windows then overlap;
+   - `arm --a-sleep 6` before one prompt and `disarm` after it, for the timeout property;
+   - `analyse --out <dir> --cli <executable>` builds the same result and candidate the
+     harness does, from the event log and the synthetic stores.
 3. **Acceptance.** The owner reviews the candidate, adds `accepted: {"at": <UTC>, "by":
    <name>}`, and places it in `boundary/` or in a directory named by
    `EC_CAPTURE_BOUNDARY_DIRS`. Nothing here writes an accepted record.
@@ -181,6 +186,7 @@ python test_review.py
 python test_hooks.py
 python test_backstop.py
 python test_identity.py
+python tests/test_host_probe.py
 ```
 
 All fixtures are synthetic and live in temporary directories. Hook subprocesses run
