@@ -9,6 +9,11 @@ brief attachment, a read and an edit). It runs ``capture_start.py`` and
 the stores, the transcript directory and ``EC_CAPTURE_MAINTAIN=0`` in their
 environment, and reports wall-clock latencies and the hooks' own ``start_ms``/``end_ms``.
 
+The client identity path runs for real: every inherited ``CLAUDE*`` variable is removed,
+this Python process stands in for the client (``CLAUDE_PID``, mode ``synthetic``) and an
+accepted boundary record for its interpreter is written inside ``out``
+(``EC_CAPTURE_BOUNDARY_DIRS``). The shipped boundary records are never consulted.
+
 ``out`` must be a dedicated directory: not inside any git repository, no path segment
 named ``scratchpad``, and either empty or already marked by ``.ec-capture-dry``. Nothing
 outside ``out`` is read or written apart from the capture tool itself and the temp-dir
@@ -25,7 +30,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from common import iso, now_utc, sha256_text
+import client_identity as ci
+from common import iso, now_utc, sha256_text, write_json_atomic
 from report import percentiles
 from store import Stores, init_meta_repo, init_stores, iter_manifests
 
@@ -36,6 +42,9 @@ PROMPT = "Change alpha so it returns x * 3 + 2 and keep the module docstring."
 FIXTURE_ENV = {"GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
                "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
                "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z"}
+
+
+SYNTHETIC_MODE = "synthetic"
 
 
 class DryError(RuntimeError):
@@ -133,12 +142,31 @@ def write_transcript(tdir: Path, session_id: str, entries: list[dict[str, Any]],
     return p
 
 
-def hook_env(stores: Stores, tdir: Path, base: dict[str, str] | None = None) -> dict[str, str]:
-    env = dict(base if base is not None else os.environ)
+def synthetic_boundary(d: Path, version: str = CLI_VERSION, *, accepted: bool = True) -> Path:
+    """An accepted boundary record whose client is this Python process's interpreter."""
+    image = ci.pid_image(os.getpid())
+    got = ci.hash_file(image) if image else None
+    if got is None:
+        raise DryError("cannot identify the synthetic client")
+    d.mkdir(parents=True, exist_ok=True)
+    rec = {"cli_version": version, "synthetic": True, "recorded_at": iso(now_utc()),
+           "identity": {"sha256": got[0], "cli_version": version, "mode": SYNTHETIC_MODE, "problem": None},
+           "accepted": {"at": iso(now_utc()), "by": "synthetic fixture"} if accepted else None,
+           "relied_upon": ["synthetic"], "results": {"synthetic": {"passed": True}}}
+    write_json_atomic(d / ci.record_name(version, SYNTHETIC_MODE), rec)
+    return d
+
+
+def hook_env(stores: Stores, tdir: Path, base: dict[str, str] | None = None,
+             boundary_dir: Path | None = None) -> dict[str, str]:
+    env = {k: v for k, v in (base if base is not None else os.environ).items() if not k.upper().startswith("CLAUDE")}
     for k in ("EVIDENCE_CAPTURE", "EVIDENCE_HOOK"):
         env.pop(k, None)
     env.update({"EC_CAPTURE_META": str(stores.meta), "EC_CAPTURE_CONTENT": str(stores.content),
-                "EC_CAPTURE_TRANSCRIPTS": str(tdir), "EC_CAPTURE_MAINTAIN": "0"})
+                "EC_CAPTURE_TRANSCRIPTS": str(tdir), "EC_CAPTURE_MAINTAIN": "0",
+                ci.ENV_PID: str(os.getpid()), ci.ENV_MODE: SYNTHETIC_MODE})
+    if boundary_dir is not None:
+        env["EC_CAPTURE_BOUNDARY_DIRS"] = str(boundary_dir)
     return env
 
 
@@ -157,7 +185,7 @@ def run_dry(out: Path, n: int = 10) -> dict[str, Any]:
     repo = build_fixture_repo(run)
     stores = build_stores(run)
     tdir = run / "transcripts"
-    env = hook_env(stores, tdir)
+    env = hook_env(stores, tdir, boundary_dir=synthetic_boundary(run / "boundary"))
     index_before = (repo / ".git" / "index").read_bytes()
     walls: dict[str, list[int]] = {"start": [], "end": []}
     outputs: list[str] = []

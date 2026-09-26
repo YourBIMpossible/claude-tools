@@ -42,9 +42,10 @@ def _origin_bucket(origin: str | None) -> str | None:
 
 
 def _boundary_bucket(reason: str | None) -> str:
-    """Maps a manifest boundary reason onto §12's four buckets; an untested, unknown,
-    failed or unreadable CLI record is ``cli_untested``; a failed capture has no tested
-    boundary for its episode either."""
+    """Maps a manifest boundary reason onto §12's four buckets. An untested, unknown,
+    failed, unaccepted or unreadable record, and an unidentified, unverified or changed
+    client (the ``identity_*`` and ``mode_untested`` reasons), is ``cli_untested``; a
+    failed capture has no tested boundary for its episode either."""
     if reason in ("bracket_dirty", "lock_present", "hook_killed"):
         return reason
     return "cli_untested"

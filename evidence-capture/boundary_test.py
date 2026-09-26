@@ -17,8 +17,10 @@ servers. Hooks come only from a ``--settings`` file this script writes. One shor
 per run asks for a single shell command; nothing else is sent.
 
 Output: ``boundary/<cli-version>.json`` with ``relied_upon``, ``results`` and raw timings.
-The capture tool trusts a CLI version only when that file exists and every relied-upon
-property passed (``manifest.load_boundary``).
+Such a version-only record carries no client identity (executable hash and invocation
+mode), so ``manifest.load_boundary`` never trusts it (``identity_untested``). It remains
+evidence for print mode; an identity-bearing record comes from ``desktop_boundary_test.py``
+and an owner acceptance.
 
 Usage::
 

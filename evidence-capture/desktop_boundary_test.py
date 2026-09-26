@@ -21,11 +21,16 @@ Measured, never assumed:
   (e) hook input fields (``UserPromptSubmit`` and ``Stop``), and whether the transcript
       holds the turn's final assistant message when ``Stop`` runs;
   (f) whether a child launched detached from a hook (as the capture start hook launches
-      maintenance) survives the hook's exit, a hook timeout kill and the CLI's exit.
+      maintenance) survives the hook's exit, a hook timeout kill and the CLI's exit;
+  (g) the client identity every probe hook observed (``client_identity.observe``:
+      executable, invocation mode), checked against the ``--cli`` executable's SHA-256.
 
 Isolation: a disposable git repository under ``--out``; ``--setting-sources project,local``
 (no user settings, so no live hook runs); ``--strict-mcp-config`` with no servers;
-``EVIDENCE_HOOK=0``, ``EVIDENCE_CAPTURE=0`` and ``EC_CAPTURE_MAINTAIN=0``. Sessions persist
+``EVIDENCE_HOOK=0``, ``EVIDENCE_CAPTURE=0`` and ``EC_CAPTURE_MAINTAIN=0``. Every inherited
+``CLAUDE*`` and ``DESKTOP_*`` variable is removed from the CLI's environment (the names, not
+the values, are recorded), so a harness launched from inside a client tests the mode the
+CLI sets for itself, not the parent's. Sessions persist
 (the desktop client persists them, and the ``Stop`` transcript check needs it); with
 ``--cleanup-transcripts`` the harness removes exactly the session files it created.
 
@@ -34,8 +39,10 @@ Not reproducible here and reported as such: the desktop host process itself, its
 hooks from the user settings source, ``--resume`` of an existing session, and interactive
 permission prompts answered by a person.
 
-This writes no ``boundary/<version>.json``: whether a CLI version is trusted for capture
-is an owner decision taken from the result.
+Output, in ``--out`` only: the full result, and a candidate boundary record
+``<version>--<mode>.json`` whose ``identity`` is the tested executable hash, version and
+mode, with ``accepted: null``. A candidate is never trusted. Accepting it (adding
+``accepted: {at, by}`` and placing it in ``boundary/``) is the owner's decision.
 
 Usage::
 
@@ -57,19 +64,33 @@ import time
 from pathlib import Path
 from typing import Any
 
+PKG = Path(__file__).resolve().parent
+sys.path.insert(0, str(PKG))
+import client_identity as ci  # noqa: E402
+
+RELIED_UPON = ("a_hooks_finish_before_first_tool", "a_hooks_finish_before_first_output",
+               "c_turn_waits_for_hook_within_timeout", "g_client_identity_observed")
+SCRUB_PREFIXES = ("CLAUDE", "DESKTOP_")
+
 HOOK_SRC = r'''
 import json, os, subprocess, sys, time
 from pathlib import Path
 log, name, sleep_s, detach = Path(sys.argv[1]), sys.argv[2], float(sys.argv[3]), sys.argv[4]
 raw = sys.stdin.read()
 def mark(ev, **kw):
-    with log.open("a", encoding="utf-8") as f:
+    with log.with_name(f"{log.stem}-{os.getpid()}{log.suffix}").open("a", encoding="utf-8") as f:
         f.write(json.dumps({"hook": name, "ev": ev, "t": time.time(), "pid": os.getpid(), **kw}) + "\n")
 try:
     payload = json.loads(raw)
 except ValueError:
     payload = {"_unparsed": raw[:200]}
-mark("start", payload=payload)
+try:
+    sys.path.insert(0, os.environ["EC_PROBE_PKG"])
+    import client_identity as ci
+    client = ci.persisted(ci.observe(dict(os.environ)))
+except Exception as e:
+    client = {"problem": "probe_error:" + type(e).__name__}
+mark("start", payload=payload, client=client)
 if detach != "-":
     flags = 0
     if os.name == "nt":
@@ -86,7 +107,7 @@ import json, os, sys, time
 from pathlib import Path
 log, name = Path(sys.argv[1]), sys.argv[2]
 def mark(ev):
-    with log.open("a", encoding="utf-8") as f:
+    with log.with_name(f"{log.stem}-{os.getpid()}{log.suffix}").open("a", encoding="utf-8") as f:
         f.write(json.dumps({"hook": "child-" + name, "ev": ev, "t": time.time(), "pid": os.getpid()}) + "\n")
 mark("start")
 end = time.time() + float(os.environ.get("EC_PROBE_CHILD_S", "20"))
@@ -96,16 +117,16 @@ while time.time() < end:
 mark("end")
 '''
 TOOL_HOOK_SRC = r'''
-import json, sys, time
+import json, os, sys, time
 from pathlib import Path
 log = Path(sys.argv[1])
 payload = json.loads(sys.stdin.read() or "{}")
-with log.open("a", encoding="utf-8") as f:
+with log.with_name(f"{log.stem}-{os.getpid()}{log.suffix}").open("a", encoding="utf-8") as f:
     f.write(json.dumps({"hook": "pretool", "ev": "tool", "t": time.time(),
                         "tool": payload.get("tool_name")}) + "\n")
 '''
 STOP_HOOK_SRC = r'''
-import json, sys, time
+import json, os, sys, time
 from pathlib import Path
 log = Path(sys.argv[1])
 t = time.time()
@@ -128,7 +149,7 @@ if isinstance(tx, str) and Path(tx).is_file():
                     last_assistant_text = b.get("text")
     info = {"tx_exists": True, "tx_lines": len(lines), "tx_last_types": types[-3:],
             "tx_last_assistant_text": (last_assistant_text or "")[:40]}
-with log.open("a", encoding="utf-8") as f:
+with log.with_name(f"{log.stem}-{os.getpid()}{log.suffix}").open("a", encoding="utf-8") as f:
     f.write(json.dumps({"hook": "stop", "ev": "stop", "t": t, "payload": payload, **info}) + "\n")
 '''
 PROMPT = ("Use the Bash tool exactly once to run: echo boundary-probe-{n} . "
@@ -294,6 +315,24 @@ def _argv(cli: Path, model: str, inline: dict[str, Any], permission_mode: str, e
     return argv
 
 
+def read_events(work: Path) -> list[dict[str, Any]]:
+    """Every probe's events in time order. Each process appends to its own file: concurrent
+    appends to one file interleave on Windows."""
+    events = []
+    for f in sorted(work.glob("events-*.jsonl")):
+        events += [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines()]
+    return sorted(events, key=lambda e: e["t"])
+
+
+def scrubbed_names() -> list[str]:
+    return sorted(k for k in os.environ if k.upper().startswith(SCRUB_PREFIXES))
+
+
+def scrubbed_env() -> dict[str, str]:
+    """The harness's environment without any inherited client variable."""
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith(SCRUB_PREFIXES)}
+
+
 def run_session(cli: Path, base: Path, model: str, turns: int, hooks_file: list[tuple[str, float, int, bool]],
                 hooks_inline: list[tuple[str, float, int, bool]], permission_mode: str, effort: str | None,
                 child_s: float, wait_after_s: float) -> dict[str, Any]:
@@ -310,8 +349,8 @@ def run_session(cli: Path, base: Path, model: str, turns: int, hooks_file: list[
     inline = {"hooks": {"UserPromptSubmit": [{"hooks": [_ups_hook(py, log, *h) for h in hooks_inline]}]}} \
         if hooks_inline else {}
     repo = _repo(work, project)
-    env = {**os.environ, "EVIDENCE_HOOK": "0", "EVIDENCE_CAPTURE": "0", "EC_CAPTURE_MAINTAIN": "0",
-           "EC_PROBE_CHILD_S": str(child_s)}
+    env = {**scrubbed_env(), "EVIDENCE_HOOK": "0", "EVIDENCE_CAPTURE": "0", "EC_CAPTURE_MAINTAIN": "0",
+           "EC_PROBE_CHILD_S": str(child_s), "EC_PROBE_PKG": str(PKG)}
     s = Session(_argv(cli, model, inline, permission_mode, effort), repo, env)
     t_spawn = time.time()
     init = s.initialize()
@@ -319,7 +358,7 @@ def run_session(cli: Path, base: Path, model: str, turns: int, hooks_file: list[
     recs = [s.turn(PROMPT.format(n=i + 1)) for i in range(turns)]
     t_exit = s.close()
     time.sleep(max(wait_after_s, t_spawn + child_s + 4 - time.time()) if child_s else wait_after_s)
-    events = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+    events = read_events(work)
     return {"work": str(work), "repo": str(repo), "rc": s.proc.returncode, "t_spawn": t_spawn, "t_init": t_init,
             "init_ok": (init.get("response") or {}).get("subtype") == "success", "turns": recs, "t_exit": t_exit,
             "events": events, "stderr_tail": "".join(s.stderr)[-600:]}
@@ -442,6 +481,12 @@ def analyse(order_runs: list[dict[str, Any]], timeout_run: dict[str, Any], timeo
     return res
 
 
+def observations(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The client observation of every probe hook start (the pretool and stop probes do not observe)."""
+    return [e.get("client") or {"problem": "not_recorded"} for run in runs for e in run["events"]
+            if e["ev"] == "start" and not e["hook"].startswith("child-")]
+
+
 def cleanup_transcripts(runs: list[dict[str, Any]]) -> list[str]:
     """Remove exactly the session files these runs created (transcript and sibling directory)."""
     removed = []
@@ -480,9 +525,17 @@ def main() -> int:
     ap.add_argument("--effort", default=None)
     ap.add_argument("--cleanup-transcripts", action="store_true")
     args = ap.parse_args()
+    out_dir = args.out.resolve()
+    if out_dir == PKG or PKG in out_dir.parents:
+        print("refusing: --out is inside the capture package (boundary records are placed by the owner)",
+              file=sys.stderr)
+        return 2
     args.out.mkdir(parents=True, exist_ok=True)
     if subprocess.run(["git", "-C", str(args.out), "rev-parse"], capture_output=True).returncode == 0:
         print("refusing: --out is inside a git repository", file=sys.stderr)
+        return 2
+    if not args.cli.is_file():
+        print("refusing: --cli is not a file", file=sys.stderr)
         return 2
     version = subprocess.run([str(args.cli), "--version"], capture_output=True, text=True, timeout=60).stdout.split()[0]
     order_runs = [run_session(args.cli, args.out, args.model, args.turns,
@@ -494,17 +547,32 @@ def main() -> int:
                               hooks_inline=[], permission_mode=args.permission_mode, effort=args.effort,
                               child_s=15, wait_after_s=5)
     res = analyse(order_runs, timeout_run, timeout_s, ["A", "B"])
+    obs = observations(order_runs + [timeout_run])
+    identity = ci.tested_identity(args.cli.resolve(), version, obs)
+    res["g_client_identity_observed"] = {
+        "passed": identity["problem"] is None, "problem": identity["problem"], "observations": len(obs),
+        "modes": sorted({str(o.get("mode")) for o in obs}), "problems": sorted({str(o.get("problem")) for o in obs})}
     removed = cleanup_transcripts(order_runs + [timeout_run]) if args.cleanup_transcripts else []
-    rec = {"cli_version": version, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rec = {"cli_version": version, "recorded_at": now,
            "mode": "desktop-style SDK streaming (stream-json in/out, await-initialize, stdio permission prompts)",
            "model": args.model, "permission_mode": args.permission_mode, "effort": args.effort,
+           "scrubbed_env_names": scrubbed_names(), "identity": identity,
            "results": res, "transcripts_removed": removed,
            "raw": {"order_runs": order_runs, "timeout_run": timeout_run}}
     out = args.out / f"desktop-boundary-{version}.json"
     out.write_text(json.dumps(rec, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    candidate = {"cli_version": version, "recorded_at": now, "harness": "desktop_boundary_test",
+                 "mode_description": rec["mode"], "model": args.model, "identity": identity, "accepted": None,
+                 "relied_upon": list(RELIED_UPON), "results": {k: res[k] for k in RELIED_UPON},
+                 "full_result": out.name}
+    cand = args.out / ci.record_name(version, identity["mode"] or "unidentified")
+    cand.write_text(json.dumps(candidate, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({k: v.get("passed") for k, v in res.items() if isinstance(v, dict) and "passed" in v}))
+    print(json.dumps({k: identity[k] for k in ("cli_version", "mode", "problem", "observations")}))
     print(out)
-    return 0
+    print(cand)
+    return 0 if all(res[k]["passed"] for k in RELIED_UPON) else 1
 
 
 if __name__ == "__main__":

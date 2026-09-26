@@ -8,6 +8,7 @@ manifest so they can be recomputed identically at any time.
 from __future__ import annotations
 
 import json
+from glob import escape as glob_escape
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,7 @@ def new_manifest(*, episode_id: str, session_id: str, started_at: str, prompt_sh
                  "branch": None, "detached": None},
         "start_snapshot": {"state": "failed", "reason": "not_taken"},
         "boundary": {"cli_version": None, "trusted": False, "reason": "cli_unknown"},
+        "client": None,
         "link": {"state": "none", "packet_id": None, "brief_sha256": None, "brief_len": None,
                  "brief_empty": None, "matched_on": [], "reason": None, "checked_at": None},
         "prompt": {"sha256": prompt_sha256, "len": prompt_len, "origin": None, "index_in_session": None,
@@ -166,29 +168,57 @@ def provisional_candidate(f: dict[str, Any]) -> bool:
     return all(bool(f.get(s)) for s in FUNNEL[:4])
 
 
-def load_boundary(cli_version: str | None, search_dirs: list[Path]) -> dict[str, Any]:
-    """The boundary block for a CLI version from the first ``<dir>/<version>.json`` found.
+def load_boundary(cli_version: str | None, search_dirs: list[Path],
+                  client: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The boundary block for the client an episode ran under.
 
-    Trusted only when that file exists, was produced by the ordering tests and every
-    relied-upon property passed. Unknown or untested versions are never trusted.
+    The client is identified by executable SHA-256, CLI version (from the transcript) and
+    invocation mode (``client_identity``). The record is the first
+    ``<dir>/<version>--<mode>.json`` found. It is trusted only when that record names the
+    same executable hash and version, carries an owner acceptance, and every relied-upon
+    property passed. An unidentified client, a record for another executable, a record
+    without an identity (the version-only records that predate identity) or an
+    unaccepted candidate is never trusted.
     """
     if not cli_version:
         return {"cli_version": None, "trusted": False, "reason": "cli_unknown"}
+    base: dict[str, Any] = {"cli_version": cli_version, "trusted": False,
+                            "client": {k: (client or {}).get(k) for k in ("sha256", "mode", "host_version")}}
+    legacy = any((d / f"{cli_version}.json").is_file() for d in search_dirs)
+    if not legacy and not any(any(d.glob(f"{glob_escape(cli_version)}--*.json")) for d in search_dirs if d.is_dir()):
+        return {**base, "reason": "boundary_untested"}
+    if not client or client.get("problem") == "not_observed":
+        return {**base, "reason": "identity_unknown"}
+    if client.get("problem"):
+        return {**base, "reason": f"identity_unverified:{client['problem']}"}
+    if not client.get("sha256") or not client.get("mode"):
+        return {**base, "reason": "identity_unknown"}
+    name = f"{cli_version}--{client['mode']}.json"
     for d in search_dirs:
-        p = d / f"{cli_version}.json"
+        p = d / name
         if not p.is_file():
             continue
         try:
             rec = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {"cli_version": cli_version, "trusted": False, "reason": "boundary_file_unreadable"}
+            return {**base, "reason": "boundary_file_unreadable"}
+        ident = rec.get("identity") or {}
+        if ident.get("cli_version") != cli_version or ident.get("mode") != client["mode"] or ident.get("problem"):
+            return {**base, "reason": "boundary_record_mismatch"}
+        if ident.get("sha256") != client["sha256"]:
+            return {**base, "reason": "identity_changed"}
+        if not (rec.get("accepted") or {}).get("at"):
+            return {**base, "reason": "boundary_unaccepted"}
         required = rec.get("relied_upon") or []
         results = rec.get("results") or {}
+        if not required:
+            return {**base, "reason": "boundary_failed:nothing_relied_upon"}
         failed = [k for k in required if not results.get(k, {}).get("passed")]
         if failed:
-            return {"cli_version": cli_version, "trusted": False, "reason": "boundary_failed:" + ",".join(failed)}
-        return {"cli_version": cli_version, "trusted": True, "reason": None, "recorded_at": rec.get("recorded_at")}
-    return {"cli_version": cli_version, "trusted": False, "reason": "boundary_untested"}
+            return {**base, "reason": "boundary_failed:" + ",".join(failed)}
+        return {**base, "trusted": True, "reason": None, "recorded_at": rec.get("recorded_at"),
+                "accepted_at": rec["accepted"]["at"]}
+    return {**base, "reason": "identity_untested" if legacy else "mode_untested"}
 
 
 def refresh(m: dict[str, Any], owner: dict[str, Any] | None = None) -> dict[str, Any]:

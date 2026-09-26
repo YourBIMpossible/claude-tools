@@ -41,7 +41,7 @@ CONTENT_MARKERS = (".git-blocked", "NOSYNC")
 TMP_MAX_AGE_S = 3600
 META_GITIGNORE = ("# capture content never enters this repository\n*.patch\n*.bin\nsnapshot*\npayload*\n*.tmp\n"
                   "# operational log and state: local only (the checkpoint summarises them)\ncapture.log\n"
-                  "maintain.lock\nstore-check.json\nmaintenance.json\nopen/\nlocks/\n")
+                  "maintain.lock\nstore-check.json\nmaintenance.json\nidentity-cache.json\nopen/\nlocks/\n")
 CONTENT_PATTERNS = ("*.patch", "*.bin", "snapshot*", "payload*")
 
 

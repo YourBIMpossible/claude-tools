@@ -16,6 +16,7 @@ owner-approved step.
 |---|---|
 | `snapshot.py` | Starting-state snapshot inside a concurrent-change bracket; only git commands that leave `.git/index` byte-identical (tested) |
 | `manifest.py` | Episode manifest v2, exclusion rules, funnel, pinned-client boundary |
+| `client_identity.py` | The client a hook runs under: executable SHA-256, invocation mode |
 | `linkage.py`, `join.py`, `screen.py` | Packet link, transcript join, dependency screen |
 | `clone_builder.py`, `isolation.py` | Start-only replay clone with proofs P1–P10; filesystem-isolation check |
 | `review.py` | Review states, privacy scope, payload, expiry, seals |
@@ -36,8 +37,9 @@ Two directories, named by `EC_CAPTURE_META` and `EC_CAPTURE_CONTENT` or by
 
 - **metadata**: its own git repository with no remote. Manifests, review records,
   audits, checkpoints. Content never enters it (`.gitignore` and `info/exclude`).
-  `capture.log`, `store-check.json`, `maintenance.json`, `maintain.lock`, `open/` and
-  `locks/` are local operational state and are never committed.
+  `capture.log`, `store-check.json`, `maintenance.json`, `maintain.lock`,
+  `identity-cache.json`, `open/` and `locks/` are local operational state and are never
+  committed.
 - **content**: snapshots and payloads, outside any repository and any sync root,
   marked `.git-blocked` and `NOSYNC`. Expires after 90 days unless sealed.
 
@@ -72,7 +74,78 @@ the repository has no `.evidence-compiler/`, or when its config says `capture: f
 
 Other environment: `EC_CAPTURE_TRANSCRIPTS` (transcript root; default the client's
 projects directory), `EC_CAPTURE_PACKET_DIRS`, `EC_CAPTURE_SEALS`,
-`EC_CAPTURE_MAINTAIN=0` (the start hook does not launch maintenance).
+`EC_CAPTURE_MAINTAIN=0` (the start hook does not launch maintenance),
+`EC_CAPTURE_BOUNDARY_DIRS` (boundary record directories, replacing `boundary/`).
+
+## Client identity and the boundary
+
+An episode is replay-eligible only if its start snapshot provably preceded every tool
+call, and that ordering was measured for one client, not assumed. A client is identified
+by three things:
+
+- **executable**: SHA-256 of the image of the process named by `CLAUDE_PID` (cross-checked
+  against `CLAUDE_CODE_EXECPATH`);
+- **version**: the CLI version recorded in the transcript;
+- **mode**: `CLAUDE_CODE_ENTRYPOINT` (`unset` when absent). One executable runs in several
+  modes, each with its own hook path: the desktop client sets `claude-desktop`, a bare
+  stream-json process sets `sdk-cli`.
+
+The host's version (`CLAUDE_CODE_DESKTOP_APP_VERSION`) is recorded, not matched. No
+command line, argument value, token or socket is read. The start hook only observes
+(a process query and a `stat`). The end hook or maintenance hashes the executable once per
+path, size and modification time, via `identity-cache.json`. Manifests hold a hash of the
+path, never the path.
+
+A record `boundary/<version>--<mode>.json` holds `identity {sha256, cli_version, mode}`,
+`accepted {at, by}`, `relied_upon` and `results`. An episode's boundary is trusted only
+when:
+
+- its client matches the record's hash, version and mode;
+- the record is accepted;
+- every relied-upon result passed.
+
+Anything else fails closed for replay eligibility and is reported as `cli_untested`.
+Capture, the hooks and the client carry on unchanged. The reasons are:
+
+| Reason | Meaning |
+|---|---|
+| `boundary_untested` | no record for this version |
+| `mode_untested` | records exist for this version, but not for this mode |
+| `identity_untested` | only a version-only record, predating identity |
+| `identity_changed` | the record names another executable |
+| `identity_unknown`, `identity_unverified:<problem>` | the client could not be identified or hashed |
+| `boundary_unaccepted` | a candidate without owner acceptance |
+| `boundary_record_mismatch`, `boundary_file_unreadable`, `boundary_failed:<keys>` | the record is inconsistent, unreadable or failed |
+
+Maintenance re-evaluates every untrusted terminal episode. An acceptance placed later
+therefore takes effect without rerunning capture, and so does a hash cached later. The
+scheduled backstop has no client process, so it relies on that cache.
+
+### After identity drift
+
+A client update changes the executable hash, and the version usually changes with it. A
+new invocation path changes the mode. Either way, episodes from the new identity stay
+untrusted until its boundary is tested and accepted:
+
+1. **Headless modes (`sdk-cli`).** Run `desktop_boundary_test.py --cli <new executable>
+   --out <dedicated dir> --cleanup-transcripts`. It removes inherited `CLAUDE*` and
+   `DESKTOP_*` variables, and the probe hooks record the identity they ran under. It
+   writes the full result and a candidate `<version>--<mode>.json` with `accepted: null`,
+   and exits non-zero when a relied-upon property or the identity check failed.
+2. **The desktop client (`claude-desktop`).** The harness cannot stand in for the desktop
+   host, because its settings payload and initialize request are not reproducible here.
+   Test that mode in the desktop app itself:
+   - open a disposable repository outside every repository and sync root;
+   - put the harness's probe hooks in its `.claude/settings.json`;
+   - send the same synthetic prompts;
+   - build the candidate from the event log with `client_identity.tested_identity`, the
+     same way the harness does.
+3. **Acceptance.** The owner reviews the candidate, adds `accepted: {"at": <UTC>, "by":
+   <name>}`, and places it in `boundary/` or in a directory named by
+   `EC_CAPTURE_BOUNDARY_DIRS`. Nothing here writes an accepted record.
+4. **Re-evaluation.** The next maintenance or backstop pass re-evaluates held episodes of
+   that identity. Episodes whose own start showed the boundary did not hold stay
+   untrusted: `bracket_dirty`, `lock_present` and `hook_killed` override the record.
 
 ## Command line
 
@@ -91,8 +164,9 @@ python desktop_boundary_test.py --cli EXE --out DIR [--runs N] [--turns N] [--cl
 `desktop_boundary_test.py` drives the CLI the way the desktop client does (streaming
 JSON input and output, initialize handshake, project and inline hook sources) against
 a disposable repository. It makes small model calls, so it is not free. It writes
-results only to `--out` and never writes a trusted boundary file: accepting a client
-identity stays the owner's decision.
+results and an unaccepted candidate record only to `--out`, and refuses an `--out` inside
+this package or any repository. Accepting a client identity stays the owner's decision.
+`boundary_test.py` (print mode) writes version-only records, which are never trusted.
 
 `dry` refuses a directory inside a git repository, any path with a `scratchpad`
 segment, and a non-empty directory it did not create.
@@ -106,6 +180,7 @@ python test_clone.py
 python test_review.py
 python test_hooks.py
 python test_backstop.py
+python test_identity.py
 ```
 
 All fixtures are synthetic and live in temporary directories. Hook subprocesses run

@@ -52,7 +52,8 @@ class Fixture:
         base.update(HOME=str(home), USERPROFILE=str(home), TEMP=str(tmp), TMP=str(tmp), TMPDIR=str(tmp))
         # the isolated home has no git identity; the metadata commits use the environment's
         base.update({k: v for k, v in dryrun.FIXTURE_ENV.items() if not k.endswith("_DATE")})
-        self.env = dryrun.hook_env(self.stores, self.tdir, base)
+        self.boundary = dryrun.synthetic_boundary(self.root / "boundary")
+        self.env = dryrun.hook_env(self.stores, self.tdir, base, boundary_dir=self.boundary)
         self.tmp = tmp
 
     def start(self, sid: str, prompt: str = PROMPT, packet: bool = True, env: dict | None = None,
@@ -265,21 +266,30 @@ def test_end_waits_for_episode_lock(root: Path) -> None:
 def test_boundary_overrides(root: Path) -> None:
     m = mf.new_manifest(episode_id="cap_0", session_id="s", started_at=iso(now_utc()), prompt_sha256="0" * 64,
                         prompt_len=1, tool_commit=None, tool_sha256=None, cwd_sha256="0" * 64)
+    bdir = dryrun.synthetic_boundary(root / "boundary")
+    env = {"EC_CAPTURE_BOUNDARY_DIRS": str(bdir)}
+    ident = read_json(next(bdir.glob("*.json")))["identity"]
+    m["client"] = {"sha256": ident["sha256"], "mode": dryrun.SYNTHETIC_MODE, "problem": None}
     m["boundary"]["cli_version"] = dryrun.CLI_VERSION
     m["capture"]["status"] = "complete"
     m["start_snapshot"] = {"state": "complete", "reason": None}
-    assert pipeline.boundary_for(m)["trusted"] is True
+    assert pipeline.boundary_for(m, env=env)["trusted"] is True
     m["start_snapshot"] = {"state": "failed", "reason": "concurrent_change", "detail": "lock present: index.lock"}
-    assert pipeline.boundary_for(m)["reason"] == "lock_present"
+    assert pipeline.boundary_for(m, env=env)["reason"] == "lock_present"
     m["start_snapshot"]["detail"] = "bracket differs"
-    assert pipeline.boundary_for(m)["reason"] == "bracket_dirty"
+    assert pipeline.boundary_for(m, env=env)["reason"] == "bracket_dirty"
     m["capture"]["phase"] = "killed"
-    assert pipeline.boundary_for(m)["reason"] == "hook_killed"
+    assert pipeline.boundary_for(m, env=env)["reason"] == "hook_killed"
     m["capture"]["phase"] = "started"
     m["start_snapshot"] = {"state": "complete"}
     m["boundary"]["cli_version"] = "0.0.0-untested"
-    b = pipeline.boundary_for(m)
+    b = pipeline.boundary_for(m, env=env)
     assert not b["trusted"] and b["reason"] == "boundary_untested"
+    assert report._boundary_bucket(b["reason"]) == "cli_untested"
+    # the shipped records: the version-only record predates identity and is never trusted
+    m["boundary"]["cli_version"] = dryrun.CLI_VERSION
+    b = pipeline.boundary_for(m, env={})
+    assert not b["trusted"] and b["reason"] == "identity_untested", b
     assert report._boundary_bucket(b["reason"]) == "cli_untested"
 
 

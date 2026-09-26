@@ -39,6 +39,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import client_identity as ci
 import manifest as mf
 from common import iso, norm_path, now_utc, parse_iso, read_json, sha256_bytes, sha256_text, write_json_atomic
 from common import episode_id as make_episode_id
@@ -53,6 +54,7 @@ from store import (CONTENT_DIRS, CONTENT_MARKERS, ENV_DISABLE, Stores, _under_sy
 
 PKG = Path(__file__).resolve().parent
 BOUNDARY_DIRS = [PKG / "boundary"]
+ENV_BOUNDARY_DIRS = "EC_CAPTURE_BOUNDARY_DIRS"  # replaces BOUNDARY_DIRS (synthetic tests, dry runs)
 START_BUDGET_MS = 2000
 END_BUDGET_S = 20.0
 END_LOCK_WAIT_S = 5.0
@@ -333,11 +335,38 @@ def drain_pending(stores: Stores, env: dict[str, str]) -> list[str]:
 
 # ---------------------------------------------------------------------- boundary
 
-def boundary_for(m: dict[str, Any]) -> dict[str, Any]:
-    """The episode's boundary: the CLI version's tested record, overridden when this
-    episode's own start shows the boundary did not hold."""
+def boundary_dirs(env: dict[str, str] | None) -> list[Path]:
+    raw = (env if env is not None else os.environ).get(ENV_BOUNDARY_DIRS)
+    return [Path(p) for p in raw.split(os.pathsep) if p] if raw else BOUNDARY_DIRS
+
+
+def client_for(m: dict[str, Any], stores: Stores | None, env: dict[str, str] | None) -> dict[str, Any]:
+    """The episode's client identity with its executable hash resolved when possible.
+
+    The metadata store's cache supplies the hash, or the executable is hashed when the
+    calling process (end hook, or maintenance launched by a start hook) runs under a
+    client whose executable has the episode's path, size and modification time. The
+    scheduled backstop has no client, so only the cache serves it. A resolved hash is
+    kept in the manifest; an unresolved one is retried at the next pass."""
+    start = m.get("client")
+    if not start:
+        return {"sha256": None, "problem": "not_observed"}
+    if start.get("sha256") or start.get("problem"):
+        return start
+    cache = stores.meta / ci.CACHE_NAME if stores is not None and stores.meta.is_dir() else None
+    got = ci.resolve(start, env, cache)
+    if got.get("sha256"):
+        m["client"] = {**start, "sha256": got["sha256"]}
+    return got
+
+
+def boundary_for(m: dict[str, Any], stores: Stores | None = None,
+                 env: dict[str, str] | None = None) -> dict[str, Any]:
+    """The episode's boundary: the tested record for its client (executable hash, CLI
+    version, invocation mode), overridden when this episode's own start shows the
+    boundary did not hold."""
     cap, snap = m["capture"], m["start_snapshot"]
-    rec = mf.load_boundary(m["boundary"].get("cli_version"), BOUNDARY_DIRS)
+    rec = mf.load_boundary(m["boundary"].get("cli_version"), boundary_dirs(env), client_for(m, stores, env))
     override = None
     if cap.get("phase") == "killed":
         override = "hook_killed"
@@ -428,7 +457,7 @@ def _pick_brief(obs: dict[str, Any], m: dict[str, Any]) -> dict[str, Any] | None
 # ---------------------------------------------------------------------- finalize
 
 def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str], *, now: str, by: str,
-             t0: float | None = None) -> ReviewInputs | None:
+             t0: float | None = None, env: dict[str, str] | None = None) -> ReviewInputs | None:
     """Join, link, bound, screen and refresh ``m`` in place; the review inputs, or None.
 
     The episode's end is the ``Stop`` time for the end hook, else the transcript's last
@@ -453,7 +482,7 @@ def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str
     brief = _pick_brief(obs, m)
     m["link"].update(brief_sha256=brief["sha256"] if brief else None, brief_len=brief["len"] if brief else None,
                      brief_empty=(brief["len"] == 0) if brief else None)
-    m["boundary"] = boundary_for(m)
+    m["boundary"] = boundary_for(m, stores, env)
     status = "complete"
     if root is None:
         errors.append("root:unresolved")
@@ -554,6 +583,10 @@ def run_start(payload: dict[str, Any], env: dict[str, str], *, now: str | None =
     m = mf.new_manifest(episode_id=ep, session_id=session_id, started_at=started_at, prompt_sha256=psha,
                         prompt_len=len(prompt), tool_commit=commit, tool_sha256=tsha, cwd_sha256=rec["cwd_sha256"])
     m["repo"]["root_sha256"] = rec["root_sha256"]
+    try:
+        m["client"] = ci.persisted(ci.observe(env))
+    except Exception as exc:  # noqa: BLE001 — an unidentified client is untrusted, never a failed start
+        m["client"] = {"sha256": None, "problem": f"observe_error:{type(exc).__name__}"}
     m["capture"]["phase"] = "begun"
     write_manifest(stores, m)  # a start killed after this line is found by maintenance
     budget = max(0.2, START_BUDGET_MS / 1000 - (time.perf_counter() - t0))
@@ -655,7 +688,7 @@ def run_end(payload: dict[str, Any], env: dict[str, str], *, now: str | None = N
         cwds = transcript_cwds(tr)
         if isinstance(payload.get("cwd"), str):
             cwds.append(payload["cwd"])
-        inputs = finalize(stores, m, tr, cwds, now=now, by="end", t0=t0)
+        inputs = finalize(stores, m, tr, cwds, now=now, by="end", t0=t0, env=env)
         write_manifest(stores, m)
         problems = store_problems(stores)
         result: dict[str, Any] = {"action": "ended", "episode_id": ep, "status": m["capture"]["status"],
@@ -781,7 +814,7 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
                 elif phase == "started":
                     tr = find_transcript(m["session_id"], env)
                     if tr is not None and _turn_over(m, manifests, tr, now):
-                        inputs = finalize(stores, m, tr, transcript_cwds(tr), now=now, by="maintain")
+                        inputs = finalize(stores, m, tr, transcript_cwds(tr), now=now, by="maintain", env=env)
                         counts["rejoined"] += 1
                         changed = True
                         if inputs is not None and content_ok:
@@ -799,6 +832,13 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
                         changed = True
                 if m["capture"].get("phase") in ("ended", "killed", "failed", None) and not reviewed:
                     # terminal now, including episodes killed or expired in this pass
+                    if m["boundary"].get("cli_version") and not m["boundary"].get("trusted"):
+                        # an owner-accepted boundary record, or a hash cached since, takes effect here
+                        new_b = boundary_for(m, stores, env)
+                        if new_b != m["boundary"]:
+                            m["boundary"] = new_b
+                            mf.refresh(m, (load_owner_review(stores, ep) or {}).get("rules"))
+                            changed = True
                     if m["link"].get("state") not in mf.FINAL_LINK_STATES and m.get("ended_at"):
                         tr = find_transcript(m["session_id"], env)
                         root = resolve_repo_root(m, transcript_cwds(tr)) if tr else None
