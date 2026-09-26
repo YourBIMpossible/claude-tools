@@ -107,12 +107,16 @@ def _isolation(stores: Stores) -> dict[str, Any]:
 
 
 def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, now: str | None = None,
-                     maintenance: dict[str, Any] | None = None) -> dict[str, Any]:
+                     maintenance: dict[str, Any] | None = None,
+                     backstop: dict[str, Any] | None = None) -> dict[str, Any]:
     now = now or iso(now_utc())
     ms = sorted(iter_manifests(stores), key=lambda m: m["started_at"])
     owners = {m["episode_id"]: load_owner_review(stores, m["episode_id"]) for m in ms}
     maint = maintenance or {}
     notes: list[str] = []
+    if backstop is not None and backstop.get("state") != "ok":
+        notes.append(f"maintenance backstop {backstop.get('state')}: last success {backstop.get('last_ok')}, "
+                     f"{backstop.get('consecutive_failures', 0)} consecutive failure(s)")
 
     # window
     ended = [m["ended_at"] for m in ms if m.get("ended_at")]
@@ -339,7 +343,8 @@ def next_checkpoint_n(stores: Stores) -> int:
 
 
 def write_checkpoint(stores: Stores, *, tool_commit: str | None = None, n: int | None = None,
-                     now: str | None = None, commit: bool = True) -> tuple[Path, dict[str, Any]]:
+                     now: str | None = None, commit: bool = True,
+                     backstop: dict[str, Any] | None = None) -> tuple[Path, dict[str, Any]]:
     n = n or next_checkpoint_n(stores)
     maint: dict[str, Any] = {}
     mp = stores.meta / "maintenance.json"
@@ -348,7 +353,7 @@ def write_checkpoint(stores: Stores, *, tool_commit: str | None = None, n: int |
             maint = read_json(mp)
         except (OSError, ValueError):
             maint = {}
-    ck = build_checkpoint(stores, n, tool_commit=tool_commit, now=now, maintenance=maint)
+    ck = build_checkpoint(stores, n, tool_commit=tool_commit, now=now, maintenance=maint, backstop=backstop)
     out = stores.meta / "checkpoints" / f"ckpt-{n}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(out, ck)

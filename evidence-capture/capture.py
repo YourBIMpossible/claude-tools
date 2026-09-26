@@ -10,6 +10,9 @@
                        record that the screen was amended after audit K
   admit EPISODE        first-batch admission check for one episode
   expire               delete expired snapshots and payloads now
+  backstop [--health | --task-xml PATH]
+                       scheduled maintenance and expiry backstop (exit 0 ok, 3 warn, 4 fail);
+                       --task-xml writes a Task Scheduler definition for review only
   dry --out DIR [-n N] run the real hooks against synthetic fixtures in DIR only
 
 Stores come from ``EC_CAPTURE_META``/``EC_CAPTURE_CONTENT`` or the user config file
@@ -64,6 +67,9 @@ def main(argv: list[str] | None = None) -> int:
     ad = sub.add_parser("admit")
     ad.add_argument("episode")
     sub.add_parser("expire")
+    bp = sub.add_parser("backstop")
+    bp.add_argument("--health", action="store_true", help="print the backstop's standing and exit")
+    bp.add_argument("--task-xml", type=Path, help="write a Task Scheduler definition for review; never registers it")
     dp = sub.add_parser("dry")
     dp.add_argument("--out", required=True, type=Path)
     dp.add_argument("-n", type=int, default=10)
@@ -78,6 +84,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"refused: {exc}", file=sys.stderr)
             return 2
         return 0
+    if args.cmd == "backstop":
+        import backstop
+        if args.task_xml:
+            args.task_xml.write_text(backstop.task_xml(), encoding="utf-16")
+            print(args.task_xml)
+            return 0
+        if args.health:
+            _print(backstop.health(backstop.status_path(env)))
+            return 0
+        rec = backstop.run_backstop(env)
+        _print(rec)
+        return int(rec["exit"])
     st = _stores(env)
     if args.cmd == "init":
         init_stores(st)
@@ -91,7 +109,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "report":
         commit, _ = pipeline.tool_identity()
-        path, ck = write_checkpoint(st, tool_commit=commit)
+        import backstop
+        path, ck = write_checkpoint(st, tool_commit=commit, backstop=backstop.health(backstop.status_path(env)))
         _print({"checkpoint": str(path), "episodes": ck["denominator"]["episodes_total"],
                 "provisional_candidates": ck["funnel"]["provisional_candidates"]})
         return 0

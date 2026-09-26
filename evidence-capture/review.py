@@ -50,7 +50,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import manifest as mf
 from common import iso, norm_path, now_utc, parse_iso, plus_days, read_json, sha256_bytes, sha256_file, sha256_text
@@ -636,14 +636,10 @@ def _expiry_of(kind: str, d: Path, m: dict[str, Any] | None) -> datetime | None:
         return None
 
 
-def expire(stores: Stores, *, now: str | None = None, commit: bool = True) -> dict[str, int]:
-    """Delete every snapshot and payload past its expiry without a valid seal; verified,
-    logged in ``DELETIONS.log`` and committed with the updated manifests."""
-    now_s = now or iso(now_utc())
-    now_dt = parse_iso(now_s)
-    assert now_dt is not None
-    counts = {"expired_deleted": 0, "deletions_verified": 0, "extended_by_seal": 0, "undated": 0, "errors": 0}
-    touched: list[Path] = []
+def _content_due(stores: Stores, now_dt: datetime) -> Iterator[tuple[str, str, Path, dict[str, Any] | None,
+                                                                   datetime | None, dict[str, Any] | None]]:
+    """Every snapshot and payload that is undated (expiry None) or past its expiry, with
+    its manifest and any valid seal: ``(kind, episode, manifest path, manifest, expiry, seal)``."""
     for kind in ("payloads", "snapshots"):
         base = stores.content / kind
         if not base.is_dir():
@@ -658,36 +654,60 @@ def expire(stores: Stores, *, now: str | None = None, commit: bool = True) -> di
                 except (OSError, ValueError):
                     m = None
             expires = _expiry_of(kind, d, m)
-            if expires is None:
-                counts["undated"] += 1
-                log_line(stores, f"expire {kind}/{ep}: no expiry date; kept and flagged")
+            if expires is not None and now_dt < expires:
                 continue
-            if now_dt < expires:
-                continue
-            sums = d / "SHA256SUMS"
-            seal = valid_seal(stores, ep, sha256_file(sums) if sums.is_file() else None, now_dt)
-            if seal is not None:
-                counts["extended_by_seal"] += 1
-                if m is not None and (m.get("retention") or {}).get("extended_until") != seal["until"]:
-                    m.setdefault("retention", {}).update(extended_until=seal["until"], extended_by=seal["seal"])
-                    write_manifest(stores, m)
-                    touched.append(mp)
-                continue
-            try:
-                rec = verified_delete(stores, kind, ep, "expired")
-            except StoreError as exc:
-                counts["errors"] += 1
-                log_line(stores, f"expire {kind}/{ep}: {exc}")
-                touched.append(stores.meta / "DELETIONS.log")
-                continue
-            counts["expired_deleted"] += 1
-            counts["deletions_verified"] += int(rec["verified"])
-            touched.append(stores.meta / "DELETIONS.log")
-            if m is not None:
-                m.setdefault("retention", {}).update(deleted_at=rec["deleted_at"], deleted_kind=kind,
-                                                     deletion_verified=rec["verified"])
+            seal = None
+            if expires is not None:
+                sums = d / "SHA256SUMS"
+                seal = valid_seal(stores, ep, sha256_file(sums) if sums.is_file() else None, now_dt)
+            yield kind, ep, mp, m, expires, seal
+
+
+def overdue(stores: Stores, *, now: str | None = None) -> list[dict[str, str]]:
+    """Read-only: snapshots and payloads past expiry with no valid seal. Empty after a
+    successful expiry pass; anything listed here is retention the store still holds."""
+    now_dt = parse_iso(now or iso(now_utc()))
+    assert now_dt is not None
+    return [{"kind": kind, "episode_id": ep, "expired_at": iso(expires)}
+            for kind, ep, _mp, _m, expires, seal in _content_due(stores, now_dt)
+            if expires is not None and seal is None]
+
+
+def expire(stores: Stores, *, now: str | None = None, commit: bool = True) -> dict[str, int]:
+    """Delete every snapshot and payload past its expiry without a valid seal; verified,
+    logged in ``DELETIONS.log`` and committed with the updated manifests."""
+    now_s = now or iso(now_utc())
+    now_dt = parse_iso(now_s)
+    assert now_dt is not None
+    counts = {"expired_deleted": 0, "deletions_verified": 0, "extended_by_seal": 0, "undated": 0, "errors": 0}
+    touched: list[Path] = []
+    for kind, ep, mp, m, expires, seal in _content_due(stores, now_dt):
+        if expires is None:
+            counts["undated"] += 1
+            log_line(stores, f"expire {kind}/{ep}: no expiry date; kept and flagged")
+            continue
+        if seal is not None:
+            counts["extended_by_seal"] += 1
+            if m is not None and (m.get("retention") or {}).get("extended_until") != seal["until"]:
+                m.setdefault("retention", {}).update(extended_until=seal["until"], extended_by=seal["seal"])
                 write_manifest(stores, m)
                 touched.append(mp)
+            continue
+        try:
+            rec = verified_delete(stores, kind, ep, "expired")
+        except StoreError as exc:
+            counts["errors"] += 1
+            log_line(stores, f"expire {kind}/{ep}: {exc}")
+            touched.append(stores.meta / "DELETIONS.log")
+            continue
+        counts["expired_deleted"] += 1
+        counts["deletions_verified"] += int(rec["verified"])
+        touched.append(stores.meta / "DELETIONS.log")
+        if m is not None:
+            m.setdefault("retention", {}).update(deleted_at=rec["deleted_at"], deleted_kind=kind,
+                                                 deletion_verified=rec["verified"])
+            write_manifest(stores, m)
+            touched.append(mp)
     if touched and commit:
         commit_meta(stores, sorted(set(touched)), f"capture expire: {counts['expired_deleted']} deleted")
     return counts

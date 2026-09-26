@@ -827,7 +827,8 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
 
         if content_ok:
             exp = expire(stores, now=now, commit=False)
-            counts["expired_deleted"] = exp["expired_deleted"]
+            counts.update(expired_deleted=exp["expired_deleted"], expire_errors=exp["errors"],
+                          expire_undated=exp["undated"])
         flags = failure_streaks(iter_manifests(stores))
         for f in flags:
             log_line(stores, f"flag: {f['consecutive_failures']} consecutive capture failures in repo "
