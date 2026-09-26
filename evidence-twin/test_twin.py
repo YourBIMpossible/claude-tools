@@ -35,10 +35,10 @@ GOLDEN = {
 }
 # A minimal correct edit per case, to prove each verify.py can pass and fail.
 SOLVE = {
-    "pos_region": ("src/regions/r7.py", "LIMIT = 17", "LIMIT = 40"),
+    "pos_region_v2": ("src/regions/r7.py", "LIMIT = 17", "LIMIT = 40"),
     "pos_engine": ("src/engine/k_c.py", "value * 3 + 2", "value * 3 + 1"),
     "neg_irrelevant": ("src/beta.py", "factor=4", "factor=5"),
-    "mis_old_copy": ("src/beta.py", "sum(service.run(v) for v in values)",
+    "mis_old_copy_v2": ("src/beta.py", "sum(service.run(v) for v in values)",
                      "sum(service.run(v) for v in values if v >= 0)"),
     "reason_rule": ("src/regions/r9.py", "LIMIT = 19", "LIMIT = 40"),
 }
@@ -65,6 +65,9 @@ def test_lab(tmp: Path) -> list[dict]:
     tasks = twin.tasks_lab(HERE / "lab", gold)
     check(sorted(t["family"] for t in tasks) == ["misleading", "negative", "positive", "positive", "reasoning"],
           "five Lab controls: 2 positive, 1 negative, 1 misleading, 1 reasoning")
+    ids = {t["task_id"] for t in tasks}
+    check({"pos_region_v2", "mis_old_copy_v2"} <= ids and not ids & {"pos_region", "mis_old_copy"},
+          "a superseded case is kept on disk but not planned")
     check(all("{head}" in t["brief"] and "<context_brief" in t["brief"] for t in tasks),
           "every brief uses the adapter format with a head placeholder")
     for t in tasks:

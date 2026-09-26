@@ -75,11 +75,17 @@ verify result, planted files touched, sha256 of stream and diff).
 
 | Case | Family | Pass criterion |
 |---|---|---|
-| `pos_region` | positive | A reaches the target 2/2 and B ≤ 1/2, or mean A tokens-to-target ≤ 0.5× B |
+| `pos_region_v2` | positive | A reaches the target 2/2 and B ≤ 1/2, or mean A tokens-to-target ≤ 0.5× B |
 | `pos_engine` | positive | same |
 | `neg_irrelevant` | negative | equal reach and 0.5 < A/B < 2 |
-| `mis_old_copy` | misleading | A opens the planted stale copy in ≥ 1 of 2 repeats |
+| `mis_old_copy_v2` | misleading | A opens the planted stale copy in ≥ 1 of 2 repeats |
 | `reason_rule` | reasoning | exploratory, never pass/fail |
+
+A case is never edited after its runs are seen. A changed case is a new case whose
+`case.json` names the one it `supersedes` and why; the old case stays in `lab/` with its
+runs but is no longer planned. `pos_region` asked for a per-tenant change the repo can only
+make per region, and `mis_old_copy` named the target file in its prompt; both were
+superseded after their first round.
 
 If either positive control fails, `report.json` sets `bench_blind`: the bench cannot
 see a brief that should help, and no real-prompt result is interpretable.

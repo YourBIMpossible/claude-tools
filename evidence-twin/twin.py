@@ -119,9 +119,14 @@ def project_slug(path: Path) -> str:
 # ---------------------------------------------------------------- tasks
 
 def tasks_lab(cases: Path, golden: Path) -> list[dict]:
+    """One task per current case. A changed case is a new case that names the one it
+    ``supersedes``; the old case stays on disk with its runs but is no longer planned."""
+    found = [(f, read_json(f)) for f in sorted(cases.glob("*/case.json"))]
+    superseded = {c["supersedes"] for _, c in found if c.get("supersedes")}
     tasks = []
-    for case_file in sorted(cases.glob("*/case.json")):
-        case = read_json(case_file)
+    for case_file, case in found:
+        if case["id"] in superseded:
+            continue
         cdir = case_file.parent
         verify = cdir / "verify.py"
         tasks.append({
