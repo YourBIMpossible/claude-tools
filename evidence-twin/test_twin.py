@@ -175,6 +175,7 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
         del os.environ["FAKE_CLAUDE_ERROR"]
     kept = [p.name for p in (tmp / "archive3").iterdir()]
     check(bad["ran"] == 1 and "invalid run" in (bad["stopped"] or ""), "an errored CLI run stops the batch")
+    check((bad["stopped"] or "").endswith("cli_error: api 401"), "the invalid reason names the API status")
     check(kept == [plan["runs"][0]["run_id"] + ".invalid-1"], "the invalid attempt is kept and its run ID freed")
     rep = twin.report(neg, plan, archive, 100_000, 3)
     check(rep["lab"]["neg_irrelevant"]["pass"] is True and rep["guardrail"]["A"]["checked"] == 1,

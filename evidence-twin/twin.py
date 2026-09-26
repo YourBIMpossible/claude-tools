@@ -409,7 +409,9 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         if state.result is None:
             invalid = "no_result"
         elif state.result.get("is_error"):
-            invalid = f"cli_error: {state.result.get('subtype')}"
+            r = state.result
+            invalid = ("cli_error: " + (f"api {r['api_error_status']}" if r.get("api_error_status")
+                                        else str(r.get("terminal_reason") or r.get("subtype"))))
     result_usage = (state.result or {}).get("usage") or {}
     meta = {
         **run, "family": task.get("family"), "model": model, "head": head,

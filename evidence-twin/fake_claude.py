@@ -34,7 +34,8 @@ def main(argv: list[str]) -> int:
               "claude_code_version": "fake-0"})
         emit({"type": "assistant", "parent_tool_use_id": None, "message": {
             "id": "msg_fake_err", "model": "<synthetic>", "content": [{"type": "text", "text": "401"}]}})
-        emit({"type": "result", "subtype": "success", "is_error": True, "num_turns": 1, "usage": {}})
+        emit({"type": "result", "subtype": "success", "is_error": True, "num_turns": 1, "usage": {},
+              "terminal_reason": "api_error", "api_error_status": 401})
         return 0
     emit({"type": "system", "subtype": "init", "cwd": str(Path.cwd()), "model": model,
           "claude_code_version": "fake-0", "tools": ["Read", "Edit"], "mcp_servers": [], "skills": [],
