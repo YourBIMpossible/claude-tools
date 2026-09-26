@@ -99,6 +99,25 @@ filter from the measurement plan (S1.3):
 summary gives the funnel in this order and the count eligible if any one
 filter were dropped.
 
+## Blind labeling sheets
+
+```
+python blind_sheets.py make --episodes <episodes.jsonl> --transcripts <source>=<dir> ...                             --seed <int> [--per-stratum 5] --out <dir>
+python blind_sheets.py seal --labels <dir>/labels.json --out <dir>/seal.json
+```
+
+`make` draws a seeded sample from scored episodes that edited a repo file and had a
+non-empty brief, `--per-stratum` from anchored and from unanchored, and shuffles
+them under blind IDs `b01`, `b02`, …. Each sheet shows the prompt, the brief, the
+tool calls, the agent's main-thread text in the turn, and what this extractor
+recorded (edited and touched files). No metric, rule verdict, packet ID or
+timestamp. The blind-ID key goes to `key/key.json`; `manifest.json` records the
+input hashes, the seed and each sheet's sha256. Same inputs and seed give
+byte-identical output.
+
+`seal` refuses an incomplete labels file (`extractor` agree/disagree, with a note
+on disagree; `outcome` from the six-way tree) and records its sha256.
+
 ## Output
 
 - `footprints.jsonl` — one row per episode row, sorted by `packet_id`; unscored rows carry `status`.
@@ -111,6 +130,7 @@ of the episodes file and of both scripts.
 
 ```
 python test_footprints.py
+python test_blind_sheets.py
 ```
 
 Synthetic tempfile fixtures only (a throwaway git repository for the pool check).
