@@ -442,6 +442,28 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
     return meta
 
 
+def attempt_key(runs: dict[str, int], key: str) -> str:
+    """A ledger key for this attempt: a rerun of a run ID adds to the spend, never replaces it."""
+    n, out = 1, key
+    while out in runs:
+        n += 1
+        out = f"{key}#{n}"
+    return out
+
+
+def ledger_from_archives(archives: list[Path]) -> dict:
+    """The spend of every attempt kept under these archives, set-aside ones included, from their meta."""
+    runs: dict[str, int] = {}
+    for archive in archives:
+        for meta_path in sorted(archive.rglob("meta.json")):
+            meta = read_json(meta_path)
+            if "run_id" not in meta or "tokens_total" not in meta:
+                continue
+            key = f"{archive.name}/{meta_path.parent.relative_to(archive).as_posix()}"
+            runs[key] = max(meta["tokens_total"], meta["tokens_result"])
+    return {"runs": runs, "total": sum(runs.values())}
+
+
 def run_batch(tasks: list[dict], plan_obj: dict, *, archive: Path, scratch: Path, model: str, ledger: Path,
               cap: int, ceiling: int, wall: int, claude: str, kind: str | None, limit: int | None,
               projects: Path) -> dict:
@@ -464,7 +486,7 @@ def run_batch(tasks: list[dict], plan_obj: dict, *, archive: Path, scratch: Path
         meta = run_one(by_id[run["task_id"]], run, archive=archive, scratch=scratch, model=model, cap=cap,
                        wall=wall, claude=claude, projects=projects, cli_sha=cli_sha)
         spent = max(meta["tokens_total"], meta["tokens_result"])
-        book["runs"][f"{archive.name}/{run['run_id']}"] = spent
+        book["runs"][attempt_key(book["runs"], f"{archive.name}/{run['run_id']}")] = spent
         book["total"] = sum(book["runs"].values())
         write_json(ledger, book)
         started += 1
@@ -596,6 +618,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kind", choices=("lab", "real"))
     p.add_argument("--limit", type=int)
     p.add_argument("--projects", type=Path, default=Path.home() / ".claude" / "projects")
+    p = sub.add_parser("ledger")
+    p.add_argument("--archive", type=Path, action="append", required=True)
+    p.add_argument("--out", type=Path, required=True)
     p = sub.add_parser("report")
     p.add_argument("--tasks", type=Path, required=True)
     p.add_argument("--plan", type=Path, required=True)
@@ -616,6 +641,8 @@ def main(argv: list[str] | None = None) -> int:
                         model=args.model, ledger=args.ledger, cap=args.cap, ceiling=args.ceiling, wall=args.wall,
                         claude=args.claude, kind=args.kind, limit=args.limit, projects=args.projects)
         print(json.dumps(res, indent=1))
+    elif args.cmd == "ledger":
+        write_json(args.out, ledger_from_archives(args.archive))
     elif args.cmd == "report":
         write_json(args.out, report(read_json(args.tasks), read_json(args.plan), args.archive, args.cap, args.seed))
     return 0

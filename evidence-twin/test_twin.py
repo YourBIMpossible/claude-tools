@@ -188,6 +188,11 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
     twin.write_json(meta_b, dict(doctored, init_plugins=["agents-md@builtin", "telemetry@builtin"]))
     drift = twin.report(neg, plan, archive, 100_000, 3)["init_drift"]
     twin.write_json(meta_b, doctored)
+    rerun = twin.attempt_key({"a/x": 5, "a/x#2": 6}, "a/x")
+    check(rerun == "a/x#3", "a rerun of a run ID gets its own ledger entry")
+    book = twin.ledger_from_archives([archive, tmp / "archive3"])
+    check(len(book["runs"]) == 3 and book["total"] == sum(book["runs"].values())
+          and any(k.endswith(".invalid-1") for k in book["runs"]), "the ledger rebuilds from every kept attempt")
     check(sorted(drift) == sorted(r["run_id"] for r in plan["runs"]) and "agents-md@builtin" in drift[plan["runs"][1]["run_id"]],
           "a batch that loaded different plugins is reported")
 
