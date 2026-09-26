@@ -36,11 +36,12 @@ ENV_DISABLE = "EVIDENCE_CAPTURE"
 USER_CONFIG = Path.home() / ".claude" / "evidence-capture.json"
 SYNC_ROOT_NAMES = ("onedrive", "dropbox", "icloud", "google drive", "googledrive", "box sync", "box")
 CONTENT_DIRS = ("snapshots", "payloads", "tmp")
-META_DIRS = ("manifests", "review", "audits", "checkpoints", "boundary")
+META_DIRS = ("manifests", "review", "audits", "checkpoints", "boundary", "isolation")
 CONTENT_MARKERS = (".git-blocked", "NOSYNC")
 TMP_MAX_AGE_S = 3600
 META_GITIGNORE = ("# capture content never enters this repository\n*.patch\n*.bin\nsnapshot*\npayload*\n*.tmp\n"
-                  "# operational log: local only (the checkpoint summarises it)\ncapture.log\n")
+                  "# operational log and state: local only (the checkpoint summarises them)\ncapture.log\n"
+                  "maintain.lock\nstore-check.json\nmaintenance.json\nopen/\nlocks/\n")
 CONTENT_PATTERNS = ("*.patch", "*.bin", "snapshot*", "payload*")
 
 
@@ -216,6 +217,9 @@ def init_meta_repo(stores: Stores) -> None:
         subprocess.run(["git", "init", "-q", str(stores.meta)], check=True, capture_output=True)
     elif top.resolve() != stores.meta.resolve():
         raise StoreError("metadata store is inside another git repository")
+    # manifests are hashed and compared byte for byte; no line-ending conversion
+    subprocess.run(["git", "-C", str(stores.meta), "config", "core.autocrlf", "false"], check=True,
+                   capture_output=True)
     exclude = _meta_exclude_file(stores)
     if exclude is None:
         raise StoreError("metadata repository has no info/exclude path")
@@ -255,7 +259,7 @@ def commit_meta(stores: Stores, paths: list[Path], message: str) -> bool:
     proc = subprocess.run(["git", "-C", str(stores.meta), "commit", "-q", "-m", message, "--", *rels],
                           capture_output=True, text=True)
     if proc.returncode != 0:
-        log_line(stores, f"commit_meta: git commit failed: {proc.stderr.strip()[:200]}")
+        log_line(stores, f"commit_meta: git commit failed: {proc.stderr.strip()[-300:]}")
         return False
     return True
 

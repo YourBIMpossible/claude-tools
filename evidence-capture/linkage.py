@@ -7,10 +7,17 @@ select exactly one packet. Anything else is ``none`` (retried at every capture s
 in the daily backstop), ``ambiguous`` (final) or ``mismatch`` (final). Capture never reads
 a packet at start time; packets are read here, afterwards, from the repository's own
 ``.evidence-compiler/packets/`` and any extra directories the store configuration names.
+
+The episode's lower bound is the capture's ``started_at`` less ``HOOK_START_SKEW_S``: the
+capture hook and the Evidence Compiler hook are started concurrently for the same prompt
+(boundary test b), so the packet's ``created_at`` may precede the capture's own clock
+reading by the difference in interpreter start-up. The session, prompt-hash and head
+equalities still have to hold; a second identical prompt inside the skew is ``ambiguous``.
 """
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +26,7 @@ from manifest import FINAL_LINK_STATES
 from store import Stores, log_line, write_manifest
 
 PACKET_GLOB = "ep_*.json"
+HOOK_START_SKEW_S = 10
 
 
 def packet_dirs(repo_root: Path | None, stores: Stores) -> list[Path]:
@@ -76,6 +84,8 @@ def resolve_link(m: dict[str, Any], packets: list[dict[str, Any]], now: str | No
     if prev.get("state") in FINAL_LINK_STATES:
         return dict(prev)  # final states are never recomputed
     start = parse_iso(m["started_at"])
+    if start is not None:
+        start -= timedelta(seconds=HOOK_START_SKEW_S)
     end = parse_iso(m.get("ended_at")) or parse_iso(now)
     session = m["session_id"]
     want = m["prompt"]["sha256"]

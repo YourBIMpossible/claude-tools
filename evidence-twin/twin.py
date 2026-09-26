@@ -7,8 +7,8 @@ checkout. ``claude -p`` runs there with isolated settings: only the ``project``
 setting source (the clone has none) plus a generated ``--settings`` file that
 allows local tools, denies network and push, and installs the replay hook in both
 arms. Arm A's hook injects the brief through ``additionalContext``, exactly as the
-Evidence Compiler adapter does; arm B's injects nothing. ``EVIDENCE_HOOK=0`` and
-``--no-session-persistence`` are always set.
+Evidence Compiler adapter does; arm B's injects nothing. ``EVIDENCE_HOOK=0``,
+``EVIDENCE_CAPTURE=0`` and ``--no-session-persistence`` are always set.
 
 The stream is archived, tokens are counted as it arrives and the run is killed at
 the per-run cap. A ledger keeps the running total across batches and no run
@@ -324,6 +324,7 @@ def child_env() -> tuple[dict[str, str], list[str]]:
     dropped = sorted(k for k in os.environ if k.upper().startswith(("CLAUDE", "ANTHROPIC")))
     env = {k: v for k, v in os.environ.items() if k not in dropped}
     env["EVIDENCE_HOOK"] = "0"
+    env["EVIDENCE_CAPTURE"] = "0"  # a replay is never itself captured (plan §8)
     return env, dropped
 
 
