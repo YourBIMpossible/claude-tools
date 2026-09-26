@@ -16,5 +16,197 @@
     "rule": "claude-worktree-path",
     "line_sha256": "c311dd613b8dff66ddfc132b1b9c46d3cd7bc7ffe0db89aca94b307d7a7b92c3",
     "reason": "Functional regex that strips a repo-relative Claude Code worktree prefix when joining transcript paths; no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/boundary_test.py",
+    "rule": "email-address",
+    "line_sha256": "85e5d72ebadf31ce3bc6f42c7717e6984319946165260f096eabff5999ba4729",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/boundary_test.py",
+    "rule": "email-address",
+    "line_sha256": "da38f2a08a351307942ca6f3a493fc4377c6d29825b481ff4e947aa434eabae2",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/desktop_boundary_test.py",
+    "rule": "email-address",
+    "line_sha256": "154e8b1bf6e0fc2b8737cd87f80c464a9e8023a06963eb4c35cd839256bf1284",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/desktop_boundary_test.py",
+    "rule": "email-address",
+    "line_sha256": "da38f2a08a351307942ca6f3a493fc4377c6d29825b481ff4e947aa434eabae2",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/desktop_host_probe.py",
+    "rule": "email-address",
+    "line_sha256": "154e8b1bf6e0fc2b8737cd87f80c464a9e8023a06963eb4c35cd839256bf1284",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/desktop_host_probe.py",
+    "rule": "email-address",
+    "line_sha256": "da38f2a08a351307942ca6f3a493fc4377c6d29825b481ff4e947aa434eabae2",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/dryrun.py",
+    "rule": "email-address",
+    "line_sha256": "a24366558f606f8329c4b5dc6b70adb9c62c49a74fc112c31bebb93897a052b6",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/dryrun.py",
+    "rule": "email-address",
+    "line_sha256": "49097365955b517413a7152e1dacea9a95980bdb38e63a22e4936bcf452ea0f2",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/screen.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "2887c32459ffff96e3a50052f2b4c8d9b9ce737ee3f16a476f78b25cce4df398",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/screen.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "e8a62c844ba292390f96c2ea2d8bbf6eaf683c96af6ff84f4e46e48ee19ccc87",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/screen.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "c31d3e13ac3ece1437ed661a84930b556066b8c5d4a7f5fdb7fdee8bca559458",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/tests/fixture_repo.py",
+    "rule": "email-address",
+    "line_sha256": "ace31e3c843d81a9de6bc1f13b4470058bf7cc1ba6151824acbecab33145f6ac",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/fixture_repo.py",
+    "rule": "email-address",
+    "line_sha256": "30ba2ed407e0533c6a624b7cee9d976da1c62f674ef5b28aa1e5b647073f2cfb",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/fixture_repo.py",
+    "rule": "email-address",
+    "line_sha256": "22e82b682a1188d26977f299ab9b9f07d58abef3f8b5da23106cdff22930d4a7",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "email-address",
+    "line_sha256": "30ba2ed407e0533c6a624b7cee9d976da1c62f674ef5b28aa1e5b647073f2cfb",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "email-address",
+    "line_sha256": "22e82b682a1188d26977f299ab9b9f07d58abef3f8b5da23106cdff22930d4a7",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/test_review.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "23f05029a4eeae1bef9a1991541993582dec9fca351553805b888caea5307be9",
+    "reason": "Synthetic drive-letter path in a test fixture; not a real location on any machine."
+  },
+  {
+    "path": "evidence-capture/tests/test_review.py",
+    "rule": "unc-path",
+    "line_sha256": "7c7c567ee16d0938a3fbd51264cae6cc7080b80a77325756b42f80b132c9231f",
+    "reason": "Synthetic UNC path in a test fixture; not a real share."
+  },
+  {
+    "path": "evidence-footprints/footprints.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "c311dd613b8dff66ddfc132b1b9c46d3cd7bc7ffe0db89aca94b307d7a7b92c3",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-footprints/footprints.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "1b60cab84a3a80461c78094cfea75a68245beff61f04265e1e18d7903c75b346",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-footprints/test_blind_sheets.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "78b9c1b3473f9c7f8e917d5e48b962849ecf42a451f36a503395fd32b8c5d38f",
+    "reason": "Synthetic drive-letter path in a test fixture; not a real location on any machine."
+  },
+  {
+    "path": "evidence-footprints/test_blind_sheets.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "78b9c1b3473f9c7f8e917d5e48b962849ecf42a451f36a503395fd32b8c5d38f",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "6257840107e2f8f75afb79a23c117a6e3ce9639ab93c489b2e63e9e47817e843",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "user-home-path",
+    "line_sha256": "7f72c198f0db5e3c275f97239751a8dadacf38505b9dbe5fab513c2c6e37c6ff",
+    "reason": "Synthetic home path in a test fixture; not a real user."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "49bb92ab933e87c8329e823103577d722126b6e3a5634bf4d3205c37fc9bca66",
+    "reason": "Synthetic drive-letter path in a test fixture; not a real location on any machine."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "email-address",
+    "line_sha256": "308820e143eea1b42628e217afe7e90a6fd8fa3733b037be3d550cfcedb9e39c",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "74265353aa601b176f505d4ce12fd49f95ad0d5a5913e0fb89ea9ce9e01adec2",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-twin/README.md",
+    "rule": "claude-user-home",
+    "line_sha256": "6a1c3fb1c8438c8ce26bb470dcc4adfb331db324d1728fa1f1cbda8ebbe1c8e8",
+    "reason": "Documentation of the client's projects-directory layout; no real path."
+  },
+  {
+    "path": "evidence-twin/twin.py",
+    "rule": "email-address",
+    "line_sha256": "9839a6eb20ad266a49490e844562b09cee9913d865dea6e52af79f94de6af24c",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-twin/twin.py",
+    "rule": "email-address",
+    "line_sha256": "e525f4fb7c098d0609e6a4fd74d9b92a13b0d09756fd777c5f33085fcf373fa7",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-twin/twin.py",
+    "rule": "claude-user-home",
+    "line_sha256": "dde46e81b8337884adfa741762313f4d24b5936fad04c6fd02af42781302307d",
+    "reason": "Documentation of the client's projects-directory layout; no real path."
+  },
+  {
+    "path": "evidence-twin/twin.py",
+    "rule": "claude-user-home",
+    "line_sha256": "d5e0d77b0fe7fc2245436123c01991d4ee18d117e70aabd198fc6855703b948d",
+    "reason": "Documentation of the client's projects-directory layout; no real path."
   }
 ]
