@@ -1,0 +1,13 @@
+{
+ "id": "neg_irrelevant",
+ "family": "negative",
+ "split": "control",
+ "base": "golden",
+ "prompt": "In src/beta.py, build_service should construct AlphaService with factor 5 instead of 4.",
+ "target_files": [
+  "src/beta.py"
+ ],
+ "planted_files": [],
+ "criterion": "no detectable difference: equal reach counts and 0.5 < mean A/B tokens-to-target < 2",
+ "note": "Synthetic example \u2014 contains no private repository data or production findings."
+}
