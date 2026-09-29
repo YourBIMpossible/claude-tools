@@ -441,27 +441,44 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
     alt_log_calls = sum(1 for s in organic for u in s.units.values() for c in u.calls if c.alt_log)
 
     # ---- stage 1: availability
+    def post_hint(s: Session) -> bool:
+        return bool(hint_live and s.first_ts and s.first_ts >= hint_live)
+
     by_repo: dict[str, dict[str, int]] = {}
     missing_expected, hint_missing = [], []
     for s in organic:
         key = s.repo or (s.cwd or "<unknown cwd>")
-        row = by_repo.setdefault(key, {"sessions": 0, "graph": 0, "hinted": 0})
+        row = by_repo.setdefault(key, {"sessions": 0, "graph": 0, "graph_pre": 0, "hinted_pre": 0,
+                                       "graph_post": 0, "hinted_post": 0})
         row["sessions"] += 1
         if s.resolved:
             row["graph"] += 1
-        if s.hint_seen:
-            row["hinted"] += 1
+            phase = "post" if post_hint(s) else "pre"
+            row[f"graph_{phase}"] += 1
+            if s.hint_seen:
+                row[f"hinted_{phase}"] += 1
         if s.repo and norm(s.repo) in targets and not s.resolved:
             missing_expected.append(s)
-        if s.resolved and hint_live and s.first_ts and s.first_ts >= hint_live and not s.hint_seen:
+        if s.resolved and post_hint(s) and not s.hint_seen:
             hint_missing.append(s)
     graph_backed = [s for s in organic if s.resolved]
-    if missing_expected or hint_missing:
-        v1 = FAIL
+    graph_post = [s for s in graph_backed if post_hint(s)]
+    # 1a: did a graph resolve where one is expected?
+    if missing_expected:
+        v1a = FAIL
     elif graph_backed:
-        v1 = PASS
+        v1a = PASS
     else:
-        v1 = INSUFFICIENT
+        v1a = INSUFFICIENT
+    # 1b: did the hint reach graph-backed sessions that started after it went live?
+    # Pre-hint sessions (and hints they saw on resume) are no evidence either way.
+    if hint_missing:
+        v1b = FAIL
+    elif graph_post:
+        v1b = PASS
+    else:
+        v1b = INSUFFICIENT
+    v1 = FAIL if FAIL in (v1a, v1b) else PASS if (v1a, v1b) == (PASS, PASS) else INSUFFICIENT
 
     # ---- stage 2: routing
     scopes = {s.session_id: coverage(s) for s in graph_backed}
@@ -476,8 +493,7 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
                       key=lambda u: -(u.searches + u.reads))
     other_callers = [u for u in units
                      if real_calls(u) and not u.is_exploration(scopes[u.session.session_id])]
-    after_hint = [u for u in exploration
-                  if hint_live and u.session.first_ts and u.session.first_ts >= hint_live]
+    after_hint = [u for u in exploration if post_hint(u.session)]
     spawns = [sp for u in units for sp in u.spawned if sp["type"] in EXPLORE_AGENT_TYPES]
     if bypassed:
         v2 = FAIL
@@ -493,9 +509,12 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
     ok_calls = [c for c in organic_calls if c.status == "ok"]
     unlogged = [c for c in ok_calls if c.via_wrapper and c.record is None]
     wrapper_errors = [c for c in organic_calls if c.status == "wrapper-error"]
-    unrecovered = [c for c in organic_calls if c.status == "shell-error"
-                   and not any(o.status == "ok" and o.unit is c.unit and o.ts and c.ts and o.ts >= c.ts
-                               for o in c.unit.calls)]
+    def recovered(c: Call) -> bool:
+        return any(o.status == "ok" and o.ts and c.ts and o.ts >= c.ts for o in c.unit.calls)
+
+    shell_errors = [c for c in organic_calls if c.status == "shell-error"]
+    unrecovered = [c for c in shell_errors if not recovered(c)]
+    recovered_errors = [c for c in shell_errors if recovered(c)]
     bare = [c for c in organic_calls if not c.via_wrapper]
     if unlogged or wrapper_errors or unrecovered:
         v3 = FAIL
@@ -517,9 +536,12 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
         return {"n": len(rs), "zero_nodes": sum(1 for r in rs if r.get("nodes_returned") == 0),
                 "median_ms": statistics.median(d) if d else None, "p90_ms": percentile(d, 90)}
 
+    # Only wrapper records carry an explicit rerank stamp, and both arms are wrapper wall
+    # time. A record without the field is a bare CLI call with traversal-only timing: it is
+    # reported on its own, never folded into the stock arm.
     reranked = arm(lambda r: r.get("rerank") is True)
-    stock = arm(lambda r: r.get("rerank") is not True)
-    stock["missing_field"] = sum(1 for r in organic_recs if "rerank" not in r)
+    stock = arm(lambda r: r.get("rerank") is False)
+    unlabelled = arm(lambda r: "rerank" not in r)
     if reranked["n"] < MIN_RERANKED:
         v4 = INSUFFICIENT
     elif ((reranked["median_ms"] or 0) > LATENCY_MEDIAN_MS
@@ -534,7 +556,11 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
                      "excluded": [{"session": s.session_id, "reason": s.excluded}
                                   for s in sessions if s.excluded]},
         "availability": {
-            "verdict": v1, "by_repo": by_repo, "graph_backed": len(graph_backed),
+            "verdict": v1, "graph_resolution": v1a, "hint_delivery": v1b,
+            "by_repo": by_repo, "graph_backed": len(graph_backed),
+            "graph_backed_pre_hint": len(graph_backed) - len(graph_post),
+            "graph_backed_post_hint": len(graph_post),
+            "hinted_post_hint": sum(1 for s in graph_post if s.hint_seen),
             "hint_live_since": funnel.get("hint_live_since"),
             "expected_graph_missing": [f"{s.session_id[:8]} {s.cwd}" for s in missing_expected],
             "hint_missing": [f"{s.session_id[:8]} {s.cwd}" for s in hint_missing],
@@ -544,7 +570,10 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
             "graph_backed_units": len(units), "exploration_units": len(exploration),
             "used_graphify": [u.label for u in used],
             "after_hint_live": {"exploration_units": len(after_hint),
-                                "used_graphify": sum(1 for u in after_hint if real_calls(u))},
+                                "used_graphify": sum(1 for u in after_hint if real_calls(u)),
+                                "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} "
+                                             f"transcript={u.session.path}"
+                                             for u in after_hint if not real_calls(u)]},
             "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} files={len(u.files)} "
                          f"in_graph={u.covered(scopes[u.session.session_id])} "
                          f"cwd={u.session.cwd}" for u in bypassed],
@@ -560,10 +589,12 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
             "unlogged_ok_wrapper_calls": [c.unit.label for c in unlogged],
             "wrapper_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in wrapper_errors],
             "unrecovered_shell_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in unrecovered],
+            "recovered_shell_errors": [f"{c.unit.label}: {c.command[:160]!r} -> {c.output[:160]!r}"
+                                       for c in recovered_errors],
             "bare_cli_calls": len(bare), "test_alt_log_calls": alt_log_calls},
         "measurement": {
             "verdict": v4, "organic_records": len(organic_recs), "reranked": reranked,
-            "stock": stock, "min_reranked": MIN_RERANKED,
+            "stock": stock, "unlabelled_bare_cli": unlabelled, "min_reranked": MIN_RERANKED,
             "latency_ceiling_ms": {"median": LATENCY_MEDIAN_MS, "p90": LATENCY_P90_MS},
             "excluded_session_records": len(excluded_recs),
             "unattributed_records": len(unattributed)},
@@ -582,16 +613,24 @@ def render(summary: dict) -> str:
     L = [f"# Graphify adoption funnel {w['since'][:10]} -> {w['until'][:10]}", "",
          f"Sessions in window: {s['total']} ({s['organic']} organic, {len(s['excluded'])} excluded as tests/smoke).",
          "", "| Stage | Verdict | Evidence |", "|---|---|---|",
-         f"| 1 Availability | {a['verdict']} | {a['graph_backed']}/{s['organic']} organic sessions resolved a graph; "
-         f"{len(a['expected_graph_missing'])} in graph-expected repos without one; {len(a['hint_missing'])} missing the hint |",
-         f"| 2 Routing | {r['verdict']} | {len(r['used_graphify'])}/{r['exploration_units']} graph-backed exploration units "
-         f"(heuristic) queried graphify; {len(r['bypassed'])} bypassed |",
+         f"| 1a Graph resolution | {a['graph_resolution']} | {a['graph_backed']}/{s['organic']} organic sessions "
+         f"resolved a graph; {len(a['expected_graph_missing'])} in graph-expected repos without one |",
+         f"| 1b Hint delivery | {a['hint_delivery']} | {a['hinted_post_hint']}/{a['graph_backed_post_hint']} graph-backed "
+         f"sessions started after go-live saw the hint ({a['graph_backed_pre_hint']} pre-hint sessions are no evidence) |",
+         f"| 2 Routing | {r['verdict']} | after go-live: {r['after_hint_live']['used_graphify']}/"
+         f"{r['after_hint_live']['exploration_units']} exploration units queried graphify; whole window: "
+         f"{len(r['used_graphify'])}/{r['exploration_units']} (heuristic), {len(r['bypassed'])} bypassed |",
          f"| 3 Execution | {e['verdict']} | {e['calls']} calls, {e['by_status']}, {e['logged']} logged |",
          f"| 4 Measurement | {m['verdict']} | {m['organic_records']} organic records: {m['reranked']['n']} reranked, "
-         f"{m['stock']['n']} stock |", ""]
-    L += ["## 1 Availability", "", "| Starting repo | Sessions | Graph resolved | Hint seen |", "|---|---|---|---|"]
+         f"{m['stock']['n']} stock, {m['unlabelled_bare_cli']['n']} unlabelled bare CLI |", ""]
+    L += ["## 1 Availability", "",
+          "Graph resolution and hint delivery are separate claims: only graph-backed sessions that started "
+          "after the hint went live show whether the hook delivers it.", "",
+          "| Starting repo | Sessions | Graph resolved | Pre-hint: graph / hint seen | Post-hint: graph / hint seen |",
+          "|---|---|---|---|---|"]
     for repo, row in sorted(a["by_repo"].items(), key=lambda kv: -kv[1]["sessions"]):
-        L.append(f"| {repo} | {row['sessions']} | {row['graph']} | {row['hinted']} |")
+        L.append(f"| {repo} | {row['sessions']} | {row['graph']} | {row['graph_pre']} / {row['hinted_pre']} | "
+                 f"{row['graph_post']} / {row['hinted_post']} |")
     L += ["", f"Hint live since: {a['hint_live_since'] or 'not configured'}; subagent hints injected: {a['subagent_hints']}."]
     for title, items in (("Graph-expected repo, no graph resolved (graph missing or resolver failing)", a["expected_graph_missing"]),
                          ("Graph resolved but no hint injected (hook failure)", a["hint_missing"])):
@@ -607,11 +646,14 @@ def render(summary: dict) -> str:
           f"- Units with enough lookups but no file/path evidence (shell-only, eligibility unknown): "
           f"{r['lookup_units_without_path_evidence']}",
           f"- Queried graphify: {len(r['used_graphify'])} {r['used_graphify'] or ''}",
-          f"- Sessions started after the hint went live: {r['after_hint_live']['used_graphify']}/"
-          f"{r['after_hint_live']['exploration_units']} exploration units queried graphify",
+          f"- **Decisive line — after the hint went live: {r['after_hint_live']['used_graphify']}/"
+          f"{r['after_hint_live']['exploration_units']} graph-backed exploration units queried graphify**",
           f"- Graphify calls from non-exploration units: {r['non_exploration_callers']}",
           f"- Skill tool selected graphify: {r['skill_selected_units']} units",
           f"- Explore-type subagents spawned: {r['explore_spawns']} ({r['explore_spawns_passed_graph']} prompts carried the graph/command)"]
+    if r["after_hint_live"]["bypassed"]:
+        L += ["", "**Bypassed after go-live (open these transcripts first):**",
+              *[f"- {x}" for x in r["after_hint_live"]["bypassed"][:BYPASS_SHOWN]]]
     if r["bypassed"]:
         shown = r["bypassed"][:BYPASS_SHOWN]
         L += ["", f"**Bypassed (routing failures to investigate this week; largest {len(shown)} of "
@@ -621,19 +663,24 @@ def render(summary: dict) -> str:
           f"- Test runs against a redirected GRAPHIFY_QUERY_LOG (not counted): {e['test_alt_log_calls']}"]
     for title, key in (("Completed wrapper calls with no log record", "unlogged_ok_wrapper_calls"),
                        ("Wrapper/query errors", "wrapper_errors"),
-                       ("Shell errors never followed by a successful call", "unrecovered_shell_errors")):
+                       ("Shell errors never followed by a successful call", "unrecovered_shell_errors"),
+                       ("Shell errors recovered by a later call (kept as evidence)", "recovered_shell_errors")):
         if e[key]:
             L += ["", f"**{title}:**", *[f"- {x}" for x in e[key]]]
-    rr, st = m["reranked"], m["stock"]
+    rr, st, ul = m["reranked"], m["stock"], m["unlabelled_bare_cli"]
     L += ["", "## 4 Measurement (organic only)", "",
           "| Arm | Records | Zero-node | Median ms | p90 ms |", "|---|---|---|---|---|",
           f"| reranked | {rr['n']} | {rr['zero_nodes']} | {_fmt_ms(rr['median_ms'])} | {_fmt_ms(rr['p90_ms'])} |",
-          f"| stock | {st['n']} | {st['zero_nodes']} | {_fmt_ms(st['median_ms'])} | {_fmt_ms(st['p90_ms'])} |", "",
-          f"Stock records with no `rerank` field (bare CLI, treated as stock): {st['missing_field']}. "
+          f"| stock (wrapper, rerank=false) | {st['n']} | {st['zero_nodes']} | {_fmt_ms(st['median_ms'])} | "
+          f"{_fmt_ms(st['p90_ms'])} |",
+          f"| unlabelled bare CLI (not an arm) | {ul['n']} | {ul['zero_nodes']} | {_fmt_ms(ul['median_ms'])} | "
+          f"{_fmt_ms(ul['p90_ms'])} |", "",
+          "Reranked and stock are both wrapper wall time. Bare-CLI records carry no `rerank` stamp and "
+          "traversal-only timing, so they sit outside both arms. "
           f"Reranked latency ceiling: median {m['latency_ceiling_ms']['median']:.0f} / p90 {m['latency_ceiling_ms']['p90']:.0f} ms; "
           f"quality verdicts need >= {m['min_reranked']} reranked records. Excluded-session records: "
           f"{m['excluded_session_records']}; unattributed records (manual/test/unmatched): {m['unattributed_records']}.",
-          "", "Wrapper `duration_ms` is wall time; stock CLI `duration_ms` is traversal only — do not compare them as like for like."]
+          "", "Latency and quality verdicts use organic records only; smoke and test runs never count toward them."]
     return "\n".join(L) + "\n"
 
 

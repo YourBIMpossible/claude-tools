@@ -158,6 +158,14 @@ class Routing(FunnelCase):
         self.assertEqual(out["measurement"]["verdict"], gf.INSUFFICIENT)
         self.assertEqual(out["execution"]["verdict"], gf.INSUFFICIENT)
 
+    def test_post_hint_bypass_links_its_transcript(self):
+        self.cfg["funnel"]["hint_live_since"] = iso(T0 - timedelta(days=1))
+        path = Transcript(self.repo).hint().greps(6).reads(self.backend_files(3)) \
+            .write(self.projects, "p", "s-post")
+        after = self.run_funnel()["routing"]["after_hint_live"]
+        self.assertEqual((after["exploration_units"], after["used_graphify"]), (1, 0))
+        self.assertIn(f"transcript={path}", after["bypassed"][0])
+
     def test_subagent_query_routes_and_matches_log(self):
         sub = Transcript(self.repo, T0 + timedelta(minutes=1)).query("who calls sync").greps(2) \
             .reads(self.backend_files(2))
@@ -190,12 +198,18 @@ class Routing(FunnelCase):
 
 class Execution(FunnelCase):
     def test_shell_failure_before_wrapper_recovers_on_retry(self):
-        Transcript(self.repo).query("q1", output="cd: no such directory", is_error=True) \
+        # Shape of the acceptance run: Git Bash `cd` on a backslash path failed, the retry worked.
+        Transcript(self.repo).query("q1", output="cd: reposub: No such file or directory", is_error=True,
+                                    extra="cd repo\\sub && ") \
             .query("q1").write(self.projects, "p", "s-retry")
         self.log_record("q1", T0 + timedelta(seconds=4))
         ex = self.run_funnel()["execution"]
         self.assertEqual(ex["verdict"], gf.PASS)
         self.assertEqual(ex["by_status"], {"shell-error": 1, "ok": 1})
+        self.assertEqual(ex["unrecovered_shell_errors"], [])
+        self.assertEqual(len(ex["recovered_shell_errors"]), 1)
+        self.assertIn("No such file or directory", ex["recovered_shell_errors"][0])
+        self.assertIn("cd repo", ex["recovered_shell_errors"][0])
 
     def test_completed_wrapper_call_without_log_record_fails(self):
         Transcript(self.repo).query("lost").write(self.projects, "p", "s-unlogged")
@@ -261,10 +275,25 @@ class Availability(FunnelCase):
         self.assertEqual(av["verdict"], gf.FAIL)
         self.assertEqual(len(av["hint_missing"]), 1)
 
-    def test_hint_not_required_before_go_live(self):
+    def test_pre_hint_sessions_are_no_evidence_for_delivery(self):
         self.cfg["funnel"]["hint_live_since"] = iso(T0 + timedelta(days=1))
         Transcript(self.repo).greps(1).write(self.projects, "p", "s-early")
-        self.assertEqual(self.run_funnel()["availability"]["verdict"], gf.PASS)
+        av = self.run_funnel()["availability"]
+        self.assertEqual(av["graph_resolution"], gf.PASS)
+        self.assertEqual(av["hint_delivery"], gf.INSUFFICIENT)
+        self.assertEqual(av["verdict"], gf.INSUFFICIENT)
+        self.assertEqual((av["graph_backed_pre_hint"], av["graph_backed_post_hint"]), (1, 0))
+
+    def test_hint_seen_after_go_live_passes(self):
+        self.cfg["funnel"]["hint_live_since"] = iso(T0 - timedelta(days=1))
+        Transcript(self.repo).hint().greps(1).write(self.projects, "p", "s-hinted")
+        Transcript(self.repo, T0 - timedelta(days=2)).greps(1).write(self.projects, "p", "s-before")
+        av = self.run_funnel()["availability"]
+        self.assertEqual((av["graph_resolution"], av["hint_delivery"], av["verdict"]),
+                         (gf.PASS, gf.PASS, gf.PASS))
+        row = av["by_repo"][str(self.repo)]
+        self.assertEqual((row["graph_pre"], row["hinted_pre"], row["graph_post"], row["hinted_post"]),
+                         (1, 0, 1, 1))
 
     def test_expected_repo_without_graph_fails(self):
         self.cfg["targets"].append({"repo": str(self.other)})
@@ -297,6 +326,17 @@ class Measurement(FunnelCase):
     def test_fail_above_latency_ceiling(self):
         self._queries(gf.MIN_RERANKED, 3500)
         self.assertEqual(self.run_funnel()["measurement"]["verdict"], gf.FAIL)
+
+    def test_bare_cli_record_is_not_the_stock_arm(self):
+        t = Transcript(self.repo)
+        t.tool("Bash", {"command": 'graphify query "bare q"'}, output="NODE x [src=a.py]")
+        self.log_record("bare q", t.t, rerank=None, duration=600)
+        t.query("wrapped q")
+        self.log_record("wrapped q", t.t, rerank=False, duration=1500)
+        t.write(self.projects, "p", "s-arms")
+        m = self.run_funnel()["measurement"]
+        self.assertEqual((m["reranked"]["n"], m["stock"]["n"], m["unlabelled_bare_cli"]["n"]), (0, 1, 1))
+        self.assertEqual(m["stock"]["median_ms"], 1500)
 
 
 class TempDirRule(FunnelCase):
