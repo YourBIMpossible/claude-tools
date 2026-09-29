@@ -58,6 +58,10 @@ jobs:
         # Drives graphify/Check-GraphifyHealth.ps1 under pwsh; scheduled-task and PyPI calls are stubbed.
         run: python graphify/test_health_check.py
 
+      - name: graphify adoption-funnel tests
+        # Synthetic transcripts, log and stub resolver; no local data.
+        run: python graphify/test_graphify_funnel.py
+
       - name: evidence-relevance tests
         run: python evidence-relevance/test_measure_relevance.py
 
