@@ -109,6 +109,12 @@ used verbatim.
 Regression coverage: `graphify/test_health_check.py` and `graphify/test_refresh_graphs.py`
 (both run in CI).
 
+`graphify/graphify_funnel.py` (weekly adoption audit) reads local session transcripts and the
+query log, and takes its resolver path, log path and smoke-session exclusions from
+`graphify.local.json`. Its report names local repos, worktrees and session ids, so it is
+written outside this repo (`--out`) and never committed. `graphify/test_graphify_funnel.py`
+uses synthetic transcripts only (runs in CI).
+
 ## Classification log — hardening pass 2026-09-12
 
 Baseline `351a644`. Dispositions applied:
