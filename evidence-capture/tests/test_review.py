@@ -189,8 +189,6 @@ def test_review_materializes_clean_episode(root: Path) -> None:
                                                 capture_output=True, text=True).stdout
     again = review.review_episode(st, got, inputs)
     assert again["state"] == "materialized" and not again["changed"], "review is idempotent"
-    counts = review.review_pending(st, lambda _m: inputs)
-    assert counts["materialized"] == 1 and counts["changed"] == 0, counts
 
 
 def test_round_trip_snapshot_payload_clone(root: Path) -> None:
@@ -392,8 +390,6 @@ def test_review_excluded_held(root: Path) -> None:
     m, i = fresh("open episode")
     m["ended_at"] = None
     assert review.review_episode(st, m, i)["reason"] == "episode_open"
-    counts = review.review_pending(st, lambda _m: None)
-    assert counts["errors"] == 0 and counts["excluded"] >= 3, counts
 
 
 def test_owner_review_resolves_unknown(root: Path) -> None:

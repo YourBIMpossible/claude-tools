@@ -25,12 +25,14 @@ HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(HERE))
+import audit  # noqa: E402
 import backstop  # noqa: E402
+import pipeline  # noqa: E402
 import report  # noqa: E402
 import store  # noqa: E402
 from common import iso, now_utc, read_json, write_json_atomic  # noqa: E402
 from review import overdue  # noqa: E402
-from test_hooks import PROMPT, Fixture  # noqa: E402
+from test_hooks import PROMPT, Fixture, manifests  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -201,9 +203,220 @@ def test_task_xml_is_reviewable_not_registered(root: Path) -> None:
     assert "schtasks" not in src and "Register-ScheduledTask" not in src, "nothing registers a task"
 
 
+def _started(fx: Fixture) -> dict:
+    sid = str(uuid.uuid4())
+    fx.start(sid, packet=False)
+    return fx.episode(sid)
+
+
+def _run_maintain_cli(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, str(PKG / "capture.py"), "maintain"], env=env,
+                          capture_output=True, text=True, timeout=300)
+
+
+def test_episode_errors_fail_the_pass_and_expiry_still_runs(root: Path) -> None:
+    """M4, L11: an episode maintenance cannot handle is counted, fails the backstop and the
+    maintain CLI, and does not stop the rest of the pass (expiry included)."""
+    fx = Fixture(root)
+    status = root / "status.json"
+    orphan = _orphan(fx, "cap_orphan000000003", age_days=100)
+    bad_key = _started(fx)
+    bad_key["capture"]["phase"] = "ended"
+    bad_key["ended_at"] = iso(now_utc())
+    del bad_key["boundary"]  # KeyError inside the episode
+    store.write_manifest(fx.stores, bad_key)
+    bad_type = _started(fx)
+    bad_type["capture"]["phase"] = "ended"
+    bad_type["ended_at"] = iso(now_utc())
+    bad_type["link"] = None  # AttributeError: outside the old per-episode tuple
+    store.write_manifest(fx.stores, bad_type)
+
+    rec = backstop.run_backstop(fx.env, status=status, lock_wait_s=0)
+    assert rec["exit"] == backstop.EXIT_FAIL and rec["status"] == "fail", rec
+    assert rec["counts"]["episode_errors"] == 2 and "error" not in rec["counts"], rec["counts"]
+    assert set(rec["counts"]["episode_error_ids"]) == {bad_key["episode_id"], bad_type["episode_id"]}
+    assert any(p.startswith("episode_errors: 2") for p in rec["problems"]), rec["problems"]
+    assert rec["counts"]["expired_deleted"] >= 1 and not orphan.exists(), "expiry ran despite the bad episodes"
+
+    res = _run_maintain_cli(fx.env)
+    out = json.loads(res.stdout)
+    assert res.returncode == backstop.EXIT_FAIL and out["status"] == "fail", (res.returncode, out, res.stderr)
+    assert out["episode_errors"] == 2, out
+
+
+def test_busy_episode_is_reported_not_silent(root: Path) -> None:
+    """M4: an episode skipped because another process holds its lock makes the pass a warning."""
+    fx = Fixture(root)
+    m = _started(fx)
+    lock = pipeline.episode_lock(fx.stores, m["episode_id"])
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("1 end hook\n", encoding="utf-8")
+    rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=0)
+    assert rec["exit"] == backstop.EXIT_WARN and rec["counts"]["busy_skipped"] == 1, rec
+    assert "episodes_busy: 1" in rec["warnings"] and not rec["problems"], rec
+    lock.unlink()
+    rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=0)
+    assert rec["exit"] == backstop.EXIT_OK and rec["counts"]["busy_skipped"] == 0, rec
+
+
+def test_unreadable_manifest_is_counted_everywhere(root: Path) -> None:
+    """M5: a truncated manifest fails the backstop, shows in the checkpoint denominator and
+    blocks an FN-audit sample instead of vanishing from all three."""
+    fx = Fixture(root)
+    _materialized(fx)
+    (fx.stores.manifests / "cap_truncated0000000.json").write_text('{"episode_id": "cap_trunc', encoding="utf-8")
+    scan = store.scan_manifests(fx.stores)
+    assert scan.unreadable == ["cap_truncated0000000.json"] and len(scan.manifests) == 1, scan
+    rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=0)
+    assert rec["exit"] == backstop.EXIT_FAIL and "manifests_unreadable: 1" in rec["problems"], rec
+    ck = report.build_checkpoint(fx.stores, 1, tool_commit="0" * 40)
+    d = ck["denominator"]
+    assert d["episodes_total"] == 1 and d["manifests_unreadable"] == 1, d
+    assert any("manifest(s) unreadable" in n for n in ck["notes"]), ck["notes"]
+    try:
+        audit.build_sheet(fx.stores, commit=False)
+    except audit.AuditError as exc:
+        assert "unreadable" in str(exc), exc
+    else:
+        raise AssertionError("an FN-audit sample was drawn with a manifest unreadable")
+
+
+def _pending_starts(fx: Fixture, n: int) -> Path:
+    """``n`` starts the content store could not take: each becomes a pending record."""
+    markers = {k: (fx.stores.content / k).read_bytes() for k in store.CONTENT_MARKERS}
+    for k in markers:
+        (fx.stores.content / k).unlink()
+    for _ in range(n):
+        fx.start(str(uuid.uuid4()), packet=False)
+    for k, data in markers.items():
+        (fx.stores.content / k).write_bytes(data)
+    pending = fx.tmp / pipeline.PENDING_NAME
+    assert len(pending.read_text(encoding="utf-8").splitlines()) == n
+    return pending
+
+
+def test_pending_record_kept_until_its_manifest_is_written(root: Path) -> None:
+    """M6: a pending record whose manifest write fails, or does not read back, stays pending
+    and fails the pass; the next good pass records it."""
+    fx = Fixture(root)
+    status = root / "status.json"
+    pending = _pending_starts(fx, 2)
+    real = pipeline.write_manifest
+    try:
+        def unwritable(stores: store.Stores, m: dict) -> Path:
+            raise OSError("synthetic: manifest store refused the write")
+        pipeline.write_manifest = unwritable  # type: ignore[assignment]
+        rec = backstop.run_backstop(fx.env, status=status, lock_wait_s=0)
+        assert rec["exit"] == backstop.EXIT_FAIL, rec
+        assert rec["counts"]["pending_kept"] == 2 and rec["counts"]["pending_drained"] == 0, rec["counts"]
+        assert any(p.startswith("pending_errors: 2") for p in rec["problems"]), rec["problems"]
+        assert len(pending.read_text(encoding="utf-8").splitlines()) == 2, "records put back"
+
+        def lost(stores: store.Stores, m: dict) -> Path:  # reports success, writes nothing
+            return store.manifest_path(stores, m["episode_id"])
+        pipeline.write_manifest = lost  # type: ignore[assignment]
+        rec = backstop.run_backstop(fx.env, status=status, lock_wait_s=0)
+        assert rec["counts"]["pending_kept"] == 2 and rec["exit"] == backstop.EXIT_FAIL, rec["counts"]
+    finally:
+        pipeline.write_manifest = real  # type: ignore[assignment]
+    assert not list(fx.tmp.glob(f"{pipeline.PENDING_NAME}.*.draining")), "no claimed file left behind"
+    rec = backstop.run_backstop(fx.env, status=status, lock_wait_s=0)
+    assert rec["counts"]["pending_drained"] == 2 and rec["counts"]["pending_errors"] == 0, rec["counts"]
+    assert not pending.exists()
+    assert sum(1 for m in manifests(fx.stores) if m["capture"]["status"] == "failed") == 2
+
+
+def test_orphaned_draining_file_is_recovered(root: Path) -> None:
+    """M6: a drain that died after claiming the pending file leaves a ``.draining`` file;
+    once stale, the next pass records it. A fresh one (a drain still running) is left alone."""
+    fx = Fixture(root)
+    pending = _pending_starts(fx, 2)
+    first, second = pending.read_text(encoding="utf-8").splitlines()
+    pending.unlink()
+    stale = fx.tmp / f"{pipeline.PENDING_NAME}.4242.1.draining"
+    stale.write_text(first + "\n", encoding="utf-8")
+    old = time.time() - pipeline.LOCK_STALE_S - 60
+    os.utime(stale, (old, old))
+    fresh = fx.tmp / f"{pipeline.PENDING_NAME}.4343.2.draining"
+    fresh.write_text(second + "\n", encoding="utf-8")
+    res = pipeline.run_maintain(fx.stores, fx.env)
+    assert res["pending_drained"] == 1 and res["pending_errors"] == 0, res
+    assert not stale.exists() and fresh.is_file(), "stale claim recovered, live claim untouched"
+    assert json.loads(first)["episode_id"] in {m["episode_id"] for m in manifests(fx.stores)}
+
+
+def test_rejoin_review_error_is_counted(root: Path) -> None:
+    """L7: a review error on the re-join path reaches ``review_errors`` (and the backstop)."""
+    fx = Fixture(root)
+    sid = str(uuid.uuid4())
+    pid, ts = fx.start(sid)
+    fx.transcript(sid, PROMPT, pid, ts)  # the Stop hook never ran for this turn
+    second = "Now add a docstring to alpha."
+    ts2 = iso(now_utc())
+    fx.start(sid, prompt=second, packet=False)
+    fx.transcript(sid, second, None, ts2, append=True, edit=False)
+    real = pipeline.review_episode
+    calls: list[str] = []
+
+    def erroring(stores: store.Stores, m: dict, *args: object, **kw: object) -> dict:
+        calls.append(m["episode_id"])
+        return {**real(stores, m, *args, **kw), "error": "synthetic review error"}  # type: ignore[arg-type]
+    try:
+        pipeline.review_episode = erroring  # type: ignore[assignment]
+        rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=0)
+    finally:
+        pipeline.review_episode = real  # type: ignore[assignment]
+    c = rec["counts"]
+    assert c["rejoined"] == 1 and c["reviewed"] == 1 and len(calls) == 1, (c, calls)
+    assert c["review_errors"] == 1 and "review_errors: 1" in rec["warnings"], rec
+
+
+def test_failed_metadata_commit_fails_the_pass(root: Path) -> None:
+    """L8: a maintenance commit the metadata repository refuses (a pre-commit hook here)
+    is a failure, not a later ``metadata_repo_clean=false``."""
+    fx = Fixture(root)
+    m = _started(fx)
+    m["started_at"] = iso(now_utc() - timedelta(hours=pipeline.REJOIN_WINDOW_H + 1))
+    store.write_manifest(fx.stores, m)
+    hook = fx.stores.meta / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\necho synthetic refusal >&2\nexit 1\n", encoding="utf-8", newline="\n")
+    hook.chmod(0o755)
+    rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=0)
+    assert rec["counts"]["rejoin_expired"] == 1 and rec["counts"]["meta_commit_failed"] is True, rec["counts"]
+    assert "metadata_commit_failed" in rec["problems"] and rec["exit"] == backstop.EXIT_FAIL, rec
+    hook.unlink()
+    rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=0)
+    assert rec["counts"]["meta_commit_failed"] is False and store.meta_clean(fx.stores), rec
+
+
+def test_maintenance_relinks_through_reconcile(root: Path) -> None:
+    """L12: maintenance re-resolves links through ``linkage.reconcile``, so a stored packet
+    that no longer matches is corrected even when the link state itself is unchanged."""
+    fx = Fixture(root)
+    sid = str(uuid.uuid4())
+    _, ts = fx.start(sid, packet=False)
+    fx.end(sid, fx.transcript(sid, PROMPT, None, ts))
+    m = fx.episode(sid)
+    assert m["link"]["state"] == "none" and m["review"]["state"] != "materialized", (m["link"], m["review"])
+    m["link"]["packet_id"] = "ep_stale_packet"
+    store.write_manifest(fx.stores, m)
+    res = pipeline.run_maintain(fx.stores, fx.env)
+    got = fx.episode(sid)
+    assert res["relinked"] == 1, res
+    assert got["link"]["state"] == "none" and got["link"]["packet_id"] is None, got["link"]
+    log = (fx.stores.meta / "capture.log").read_text(encoding="utf-8")
+    assert f"link {m['episode_id']} -> none" in log
+    assert pipeline.run_maintain(fx.stores, fx.env)["relinked"] == 0, "an unchanged link is not rewritten"
+
+
 TESTS = [test_backstop_expires_without_prompts, test_backstop_reports_failures,
          test_backstop_waits_for_maintenance_child, test_backstop_warns_on_undated_content,
-         test_checkpoint_notes_backstop, test_task_xml_is_reviewable_not_registered]
+         test_checkpoint_notes_backstop, test_task_xml_is_reviewable_not_registered,
+         test_episode_errors_fail_the_pass_and_expiry_still_runs, test_busy_episode_is_reported_not_silent,
+         test_unreadable_manifest_is_counted_everywhere, test_pending_record_kept_until_its_manifest_is_written,
+         test_orphaned_draining_file_is_recovered, test_rejoin_review_error_is_counted,
+         test_failed_metadata_commit_fails_the_pass, test_maintenance_relinks_through_reconcile]
 
 
 def main() -> int:

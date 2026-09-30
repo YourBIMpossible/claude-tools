@@ -19,10 +19,10 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from common import iso, now_utc, parse_iso
-from manifest import FINAL_LINK_STATES
+from manifest import FINAL_LINK_STATES, refresh
 from store import Stores, log_line, write_manifest
 
 PACKET_GLOB = "ep_*.json"
@@ -118,9 +118,13 @@ def resolve_link(m: dict[str, Any], packets: list[dict[str, Any]], now: str | No
 
 
 def reconcile(stores: Stores, manifests: list[dict[str, Any]], repo_root_by_episode: dict[str, Path] | None = None,
-              extra_packets: list[dict[str, Any]] | None = None) -> dict[str, int]:
-    """Re-run linkage for every non-final manifest; writes only when the link changed."""
-    counts = {"checked": 0, "linked": 0, "ambiguous": 0, "mismatch": 0, "none": 0, "final_skipped": 0}
+              extra_packets: list[dict[str, Any]] | None = None, *, now: str | None = None,
+              rules_for: Callable[[str], dict[str, Any] | None] | None = None) -> dict[str, int]:
+    """Re-run linkage for every non-final manifest; writes only when the link changed (its
+    state or its packet). A changed manifest has its exclusions and funnel recomputed first,
+    with the owner's rules from ``rules_for(episode_id)`` when given. Maintenance calls this
+    for each terminal episode, so this is the one place a link is re-resolved."""
+    counts = {"checked": 0, "linked": 0, "ambiguous": 0, "mismatch": 0, "none": 0, "final_skipped": 0, "changed": 0}
     cache: dict[str, list[dict[str, Any]]] = {}
     for m in manifests:
         if m["link"].get("state") in FINAL_LINK_STATES:
@@ -131,12 +135,12 @@ def reconcile(stores: Stores, manifests: list[dict[str, Any]], repo_root_by_epis
         key = str(root) if root else ""
         if key not in cache:
             cache[key] = load_packets(packet_dirs(root, stores)) + list(extra_packets or [])
-        new = resolve_link(m, cache[key])
+        new = resolve_link(m, cache[key], now)
         counts[new["state"]] += 1
         if new["state"] != m["link"].get("state") or new.get("packet_id") != m["link"].get("packet_id"):
             m["link"] = new
+            refresh(m, rules_for(m["episode_id"]) if rules_for else None)
             write_manifest(stores, m)
+            counts["changed"] += 1
             log_line(stores, f"link {m['episode_id']} -> {new['state']} {new.get('packet_id') or ''}")
-        else:
-            m["link"]["checked_at"] = new["checked_at"]
     return counts

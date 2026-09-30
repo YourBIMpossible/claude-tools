@@ -44,13 +44,13 @@ import manifest as mf
 from common import iso, norm_path, now_utc, parse_iso, read_json, sha256_bytes, sha256_text, write_json_atomic
 from common import episode_id as make_episode_id
 from join import join, parse_transcript, transcript_for
-from linkage import load_packets, packet_dirs, resolve_link
+from linkage import load_packets, packet_dirs, reconcile, resolve_link
 from review import ReviewInputs, decide, expire, load_capture_config, load_owner_review, review_episode
 from screen import screen
 from snapshot import take_snapshot
 from store import (CONTENT_DIRS, CONTENT_MARKERS, ENV_DISABLE, Stores, _under_sync_root, check_content_store,
                    check_meta_store, clean_tmp_orphans, commit_meta, log_line, manifest_path, read_manifest,
-                   resolve_stores, write_manifest)
+                   resolve_stores, scan_manifests, write_manifest)
 
 PKG = Path(__file__).resolve().parent
 BOUNDARY_DIRS = [PKG / "boundary"]
@@ -303,34 +303,73 @@ def failed_manifest(rec: dict[str, Any], reason: str) -> dict[str, Any]:
     return mf.refresh(m)
 
 
-def drain_pending(stores: Stores, env: dict[str, str]) -> list[str]:
-    """Turn every pending failure into a ``failed`` manifest; returns the episode ids."""
+def drain_pending(stores: Stores, env: dict[str, str]) -> dict[str, Any]:
+    """Turn every pending failure into a ``failed`` manifest.
+
+    A record leaves the pending file only once its manifest is on disk and reads back; a
+    record that cannot be turned into a manifest goes back into the pending file for the
+    next pass. A ``.draining`` file left by a drain that died between claiming the pending
+    file and finishing is taken up again once it is older than ``LOCK_STALE_S``. Returns
+    ``drained`` (episode ids), ``kept`` (records put back) and ``errors`` (one line each)."""
     src = _pending_file(env)
-    if not src.is_file():
-        return []
-    work = src.with_name(f"{src.name}.{os.getpid()}.draining")
-    try:
-        os.replace(src, work)
-        lines = work.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    done: list[str] = []
-    for line in lines:
+    out: dict[str, Any] = {"drained": [], "kept": 0, "errors": []}
+    claimed: list[Path] = []
+    for orphan in sorted(src.parent.glob(f"{src.name}.*.draining")):
         try:
-            rec = json.loads(line)
-            ep = rec["episode_id"]
-            if not manifest_path(stores, ep).exists():
-                write_manifest(stores, failed_manifest(rec, rec.get("reason") or "store_unwritable"))
-            done.append(ep)
-        except (ValueError, KeyError, TypeError, OSError) as exc:
-            log_line(stores, f"pending record unusable: {type(exc).__name__}")
-    try:
-        work.unlink()
-    except OSError:
-        pass
-    if done:
-        log_line(stores, f"pending capture failures recorded: {len(done)}")
-    return done
+            if time.time() - orphan.stat().st_mtime > LOCK_STALE_S:
+                claimed.append(orphan)
+        except OSError as exc:
+            out["errors"].append(f"pending orphan {orphan.name}: {type(exc).__name__}")
+    if src.is_file():
+        work = src.with_name(f"{src.name}.{os.getpid()}.{time.time_ns()}.draining")
+        try:
+            os.replace(src, work)
+            claimed.append(work)
+        except OSError as exc:
+            out["errors"].append(f"pending file not claimed: {type(exc).__name__}")
+    retry: list[str] = []
+    readable: list[Path] = []
+    for work in claimed:
+        try:
+            lines = work.read_text(encoding="utf-8").splitlines()
+        except (OSError, ValueError) as exc:
+            # left in place: an unread .draining file is retried once it is stale
+            out["errors"].append(f"pending file unreadable {work.name}: {type(exc).__name__}")
+            continue
+        readable.append(work)
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                ep = rec["episode_id"]
+                if not manifest_path(stores, ep).exists():
+                    write_manifest(stores, failed_manifest(rec, rec.get("reason") or "store_unwritable"))
+                    if read_manifest(stores, ep).get("episode_id") != ep:
+                        raise ValueError("manifest did not read back")
+                out["drained"].append(ep)
+            except (ValueError, KeyError, TypeError, OSError) as exc:
+                retry.append(line)
+                out["errors"].append(f"pending record not recorded: {type(exc).__name__}: {exc}"[:300])
+    if retry:
+        try:
+            with src.open("a", encoding="utf-8") as fh:
+                fh.writelines(f"{line}\n" for line in retry)
+            out["kept"] = len(retry)
+        except OSError as exc:
+            # the claimed files stay; they are retried once stale, so nothing is lost
+            out["errors"].append(f"pending records not put back: {type(exc).__name__}")
+            readable = []
+    for work in readable:
+        try:
+            work.unlink()
+        except OSError as exc:
+            out["errors"].append(f"pending file not removed {work.name}: {type(exc).__name__}")
+    for err in out["errors"]:
+        log_line(stores, err)
+    if out["drained"]:
+        log_line(stores, f"pending capture failures recorded: {len(out['drained'])}")
+    return out
 
 
 # ---------------------------------------------------------------------- boundary
@@ -780,8 +819,11 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
     now = now or iso(now_utc())
     counts: dict[str, Any] = {"action": "maintained", "killed": 0, "rejoined": 0, "rejoin_expired": 0,
                               "relinked": 0, "reviewed": 0, "review_errors": 0, "pending_drained": 0,
-                              "tmp_orphans_cleaned": 0}
+                              "pending_kept": 0, "pending_errors": 0, "tmp_orphans_cleaned": 0,
+                              "episode_errors": 0, "busy_skipped": 0, "manifests_unreadable": 0,
+                              "meta_commit_failed": False}
     touched: set[Path] = set()
+    failed_eps: list[str] = []
     try:
         check = full_store_check(stores)
         content_ok = not check["content"]
@@ -789,17 +831,20 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
             log_line(stores, f"maintain: metadata store problems: {'; '.join(check['meta'])}")
         if content_ok:
             counts["tmp_orphans_cleaned"] = len(clean_tmp_orphans(stores))
-        drained = drain_pending(stores, env)
-        counts["pending_drained"] = len(drained)
-        touched.update(manifest_path(stores, ep) for ep in drained)
+        drain = drain_pending(stores, env)
+        counts.update(pending_drained=len(drain["drained"]), pending_kept=drain["kept"],
+                      pending_errors=len(drain["errors"]))
+        touched.update(manifest_path(stores, ep) for ep in drain["drained"])
 
-        from store import iter_manifests
-        manifests = iter_manifests(stores)
+        manifests, unreadable = scan_manifests(stores)
+        for name in unreadable:
+            log_line(stores, f"maintain: manifest unreadable: {name}")
         for m0 in manifests:
             ep = m0["episode_id"]
             if (m0.get("review") or {}).get("state") == "materialized":
                 continue
             if not lock_episode(stores, ep):
+                counts["busy_skipped"] += 1  # an end hook (or a stale lock) holds it; the next pass retries
                 continue
             try:
                 m = read_manifest(stores, ep)
@@ -819,8 +864,9 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
                         changed = True
                         if inputs is not None and content_ok:
                             write_manifest(stores, m)
-                            review_episode(stores, m, inputs, now=now, commit=False)
+                            res = review_episode(stores, m, inputs, now=now, commit=False)
                             counts["reviewed"] += 1
+                            counts["review_errors"] += int(bool(res["error"]))
                             reviewed = True
                             m = read_manifest(stores, ep)
                     elif age >= REJOIN_WINDOW_H * 3600:
@@ -842,12 +888,11 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
                     if m["link"].get("state") not in mf.FINAL_LINK_STATES and m.get("ended_at"):
                         tr = find_transcript(m["session_id"], env)
                         root = resolve_repo_root(m, transcript_cwds(tr)) if tr else None
-                        new = resolve_link(m, load_packets(packet_dirs(root, stores)), now)
-                        if new["state"] != m["link"]["state"]:
-                            m["link"] = new
-                            mf.refresh(m, (load_owner_review(stores, ep) or {}).get("rules"))
+                        rc = reconcile(stores, [m], {ep: root} if root else None, now=now,
+                                       rules_for=lambda e: (load_owner_review(stores, e) or {}).get("rules"))
+                        if rc["changed"]:
                             counts["relinked"] += 1
-                            changed = True
+                            changed = False  # reconcile wrote the manifest, with every change made so far
                     if content_ok:
                         if changed:
                             write_manifest(stores, m)
@@ -860,16 +905,21 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
                     write_manifest(stores, m)
                 if m != m0:
                     touched.add(manifest_path(stores, ep))
-            except (OSError, ValueError, KeyError) as exc:
+            except Exception as exc:  # noqa: BLE001 — one bad episode must not stop the pass or expiry; counted
+                counts["episode_errors"] += 1
+                failed_eps.append(ep)
                 log_line(stores, f"maintain {ep}: {type(exc).__name__}: {exc}")
             finally:
                 _unlock(episode_lock(stores, ep))
+        counts["episode_error_ids"] = failed_eps[:20]
 
         if content_ok:
             exp = expire(stores, now=now, commit=False)
             counts.update(expired_deleted=exp["expired_deleted"], expire_errors=exp["errors"],
                           expire_undated=exp["undated"])
-        flags = failure_streaks(iter_manifests(stores))
+        after = scan_manifests(stores)
+        counts["manifests_unreadable"] = len(set(unreadable) | set(after.unreadable))
+        flags = failure_streaks(after.manifests)
         for f in flags:
             log_line(stores, f"flag: {f['consecutive_failures']} consecutive capture failures in repo "
                              f"{f['repo_sha256'][:12]} (last {f['last_episode']})")
@@ -879,7 +929,8 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
                      tmp_orphans_cleaned=int(state.get("tmp_orphans_cleaned", 0)) + counts["tmp_orphans_cleaned"],
                      store_check={"content": check["content"], "meta": check["meta"]})
         write_json_atomic(stores.meta / MAINTENANCE, state)
-        commit_meta(stores, [stores.manifests, stores.meta / "DELETIONS.log"], f"capture maintain {now}")
+        if not commit_meta(stores, [stores.manifests, stores.meta / "DELETIONS.log"], f"capture maintain {now}"):
+            counts["meta_commit_failed"] = True  # commit_meta logged the cause
     except Exception as exc:  # noqa: BLE001 — maintenance is fail-open like the hooks
         log_line(stores, f"maintain: {type(exc).__name__}: {exc}")
         counts["error"] = f"{type(exc).__name__}"
@@ -887,6 +938,36 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
         _unlock(lock)
     counts["touched"] = len(touched)
     return counts
+
+
+def maintain_findings(counts: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """The problems (failures) and warnings in one ``run_maintain`` result. The backstop and
+    ``capture.py maintain`` both judge a pass by this, so neither reports a pass whose
+    episodes, pending records, manifests or metadata commit failed as ok."""
+    problems: list[str] = []
+    warnings: list[str] = []
+    if counts.get("error"):
+        problems.append(f"maintenance_error: {counts['error']}")
+    if counts.get("episode_errors"):
+        problems.append(f"episode_errors: {counts['episode_errors']} "
+                        f"({','.join(counts.get('episode_error_ids') or [])})")
+    if counts.get("manifests_unreadable"):
+        problems.append(f"manifests_unreadable: {counts['manifests_unreadable']}")
+    if counts.get("pending_errors"):
+        problems.append(f"pending_errors: {counts['pending_errors']} (kept {counts.get('pending_kept', 0)})")
+    if counts.get("meta_commit_failed"):
+        problems.append("metadata_commit_failed")
+    if counts.get("expire_errors"):
+        problems.append(f"expiry_errors: {counts['expire_errors']}")
+    if counts.get("busy_skipped"):
+        warnings.append(f"episodes_busy: {counts['busy_skipped']}")
+    if counts.get("expire_undated"):
+        warnings.append(f"undated_content: {counts['expire_undated']}")
+    if counts.get("review_errors"):
+        warnings.append(f"review_errors: {counts['review_errors']}")
+    if counts.get("failure_streaks"):
+        warnings.append(f"capture_failure_streaks: {counts['failure_streaks']}")
+    return problems, warnings
 
 
 def rejoin_deadline(started_at: str) -> str | None:

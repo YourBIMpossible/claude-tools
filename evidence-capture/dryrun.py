@@ -33,7 +33,7 @@ from typing import Any
 import client_identity as ci
 from common import iso, now_utc, sha256_text, write_json_atomic
 from report import percentiles
-from store import Stores, init_meta_repo, init_stores, iter_manifests
+from store import Stores, init_meta_repo, init_stores, scan_manifests
 
 PKG = Path(__file__).resolve().parent
 MARKER = ".ec-capture-dry"
@@ -205,7 +205,7 @@ def run_dry(out: Path, n: int = 10) -> dict[str, Any]:
         rcs.append(rc)
         outputs.append(so.decode("utf-8", "replace"))
         walls["end"].append(int(ms))
-    ms_ = iter_manifests(stores)
+    ms_, unreadable = scan_manifests(stores)
     index_unchanged = (repo / ".git" / "index").read_bytes() == index_before  # before any git status of ours
     status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1"], capture_output=True, text=True,
                             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
@@ -218,6 +218,7 @@ def run_dry(out: Path, n: int = 10) -> dict[str, Any]:
                                  for m in ms_}),
         "link_states": sorted({m["link"]["state"] for m in ms_}),
         "boundary_trusted": sum(1 for m in ms_ if m["boundary"].get("trusted")),
+        "manifests_unreadable": unreadable,
         "index_unchanged": index_unchanged,
         "checkout_clean": status.returncode == 0 and not status.stdout.strip(),
     }

@@ -24,7 +24,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from common import iso, now_utc, read_json, sha256_file, write_json_atomic
 
@@ -252,11 +252,17 @@ def commit_meta(stores: Stores, paths: list[Path], message: str) -> bool:
     if add.returncode != 0:
         log_line(stores, f"commit_meta: git add failed: {add.stderr.strip()[:200]}")
         return False
-    staged = subprocess.run(["git", "-C", str(stores.meta), "diff", "--cached", "--quiet", "--", *rels],
-                            capture_output=True)
-    if staged.returncode == 0:
+    staged = subprocess.run(["git", "-C", str(stores.meta), "diff", "--cached", "--name-only", "-z", "--", *rels],
+                            capture_output=True, text=True)
+    if staged.returncode != 0:
+        log_line(stores, f"commit_meta: git diff failed: {staged.stderr.strip()[:200]}")
+        return False
+    # commit the staged files by name: a requested path git does not know (an empty
+    # directory, say) would make ``git commit -- <path>`` refuse the whole commit
+    changed = [p for p in staged.stdout.split("\0") if p]
+    if not changed:
         return True
-    proc = subprocess.run(["git", "-C", str(stores.meta), "commit", "-q", "-m", message, "--", *rels],
+    proc = subprocess.run(["git", "-C", str(stores.meta), "commit", "-q", "-m", message, "--", *changed],
                           capture_output=True, text=True)
     if proc.returncode != 0:
         log_line(stores, f"commit_meta: git commit failed: {proc.stderr.strip()[-300:]}")
@@ -440,13 +446,26 @@ def read_manifest(stores: Stores, episode: str) -> dict[str, Any]:
     return read_json(manifest_path(stores, episode))
 
 
-def iter_manifests(stores: Stores) -> list[dict[str, Any]]:
-    out = []
+class ManifestScan(NamedTuple):
+    """Every manifest file: the parsed ones, and the names of those that could not be read.
+    Callers count and report ``unreadable``; a manifest that cannot be read is never dropped
+    from a total without saying so."""
+    manifests: list[dict[str, Any]]
+    unreadable: list[str]
+
+
+def scan_manifests(stores: Stores) -> ManifestScan:
+    scan = ManifestScan([], [])
     if not stores.manifests.is_dir():
-        return out
+        return scan
     for p in sorted(stores.manifests.glob("cap_*.json")):
         try:
-            out.append(read_json(p))
+            m = read_json(p)
         except (OSError, ValueError):
+            scan.unreadable.append(p.name)
             continue
-    return out
+        if not isinstance(m, dict) or not isinstance(m.get("episode_id"), str):
+            scan.unreadable.append(p.name)
+            continue
+        scan.manifests.append(m)
+    return scan

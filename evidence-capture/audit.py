@@ -33,7 +33,7 @@ from typing import Any
 import manifest as mf
 from common import iso, now_utc, read_json, sha256_file, write_json_atomic
 from review import load_owner_review, verify_payload
-from store import Stores, commit_meta, iter_manifests, log_line, read_manifest
+from store import Stores, commit_meta, log_line, read_manifest, scan_manifests
 
 SAMPLE = 20
 CATEGORIES = (*mf.DEP_CATEGORIES, "prior_context")
@@ -128,7 +128,11 @@ def build_sheet(stores: Stores, *, now: str | None = None, commit: bool = True) 
     covered: set[str] = set()
     for k in done:
         covered.update(e["episode_id"] for e in read_json(screen_path(stores, k))["episodes"])
-    cands = sorted((m for m in iter_manifests(stores)
+    scan = scan_manifests(stores)
+    if scan.unreadable:
+        # a sample drawn without them is not a sample of the candidates
+        raise AuditError(f"{len(scan.unreadable)} manifest(s) unreadable: {', '.join(scan.unreadable[:5])}")
+    cands = sorted((m for m in scan.manifests
                     if mf.provisional_candidate(m["funnel"]) and m["episode_id"] not in covered),
                    key=lambda m: m["started_at"])[:SAMPLE]
     if not cands:

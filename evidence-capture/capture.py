@@ -2,7 +2,8 @@
 """Evidence capture command line (plan §11 step 4).
 
   init                 create the stores named by the environment or the user config
-  maintain [--quiet]   run maintenance now (the start hook launches it detached)
+  maintain [--quiet]   run maintenance now (the start hook launches it detached);
+                       exit 0 ok, 3 warn, 4 fail, judged as the backstop judges it
   report               write the next §12 checkpoint (JSON and markdown) and commit it
   fn-audit sheet       write the next blind FN-audit sheet (plan §5.3)
   fn-audit score K     score sealed sheet K
@@ -104,9 +105,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "maintain":
         res = pipeline.run_maintain(st, env)
+        problems, warnings = pipeline.maintain_findings(res)
+        res.update(status="fail" if problems else "warn" if warnings else "ok", problems=problems, warnings=warnings)
         if not args.quiet:
             _print(res)
-        return 0
+        import backstop
+        return backstop.EXIT_FAIL if problems else backstop.EXIT_WARN if warnings else backstop.EXIT_OK
     if args.cmd == "report":
         commit, _ = pipeline.tool_identity()
         import backstop

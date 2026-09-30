@@ -14,11 +14,13 @@ no prompt, no hook, no model. Each run
      store's ``capture.log`` when that is writable, standard error, and the exit code
      the scheduler shows as the task's last result.
 
-Exit codes: 0 ok, 3 warnings (review errors, undated content, capture-failure streaks),
-4 failure (stores unconfigured or unusable, lock never released, maintenance error,
-expiry error, overdue content left). ``health`` turns an old last success into a
-failure, so a scheduler that silently stopped running the backstop shows up in the
-checkpoint report.
+Exit codes: 0 ok, 3 warnings (review errors, episodes skipped because another process
+held their lock, undated content, capture-failure streaks), 4 failure (stores unconfigured
+or unusable, lock never released, maintenance error, an episode, pending record or
+manifest maintenance could not handle, a failed metadata commit, expiry error, overdue
+content left); ``pipeline.maintain_findings`` judges the maintenance pass itself.
+``health`` turns an old last success into a failure, so a scheduler that silently stopped
+running the backstop shows up in the checkpoint report.
 """
 from __future__ import annotations
 
@@ -64,21 +66,14 @@ def _evaluate(stores: Stores, env: dict[str, str], now: str, lock_wait_s: float,
         time.sleep(LOCK_POLL_S)
     if counts.get("action") == "skipped":
         problems.append("maintenance_lock_held")
-    if counts.get("error"):
-        problems.append(f"maintenance_error: {counts['error']}")
-    if counts.get("expire_errors"):
-        problems.append(f"expiry_errors: {counts['expire_errors']}")
+    found, warned = pipeline.maintain_findings(counts)
+    problems.extend(found)
+    warnings.extend(warned)
     if stores.content.is_dir():
         left = overdue(stores, now=now)
         if left:
             problems.append(f"overdue_remaining: {len(left)}")
             counts["overdue"] = left[:20]
-    if counts.get("expire_undated"):
-        warnings.append(f"undated_content: {counts['expire_undated']}")
-    if counts.get("review_errors"):
-        warnings.append(f"review_errors: {counts['review_errors']}")
-    if counts.get("failure_streaks"):
-        warnings.append(f"capture_failure_streaks: {counts['failure_streaks']}")
     return counts
 
 

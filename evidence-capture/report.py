@@ -21,7 +21,7 @@ from typing import Any
 import manifest as mf
 from common import canonical, iso, now_utc, parse_iso, read_json, sha256_bytes, sha256_file, write_json_atomic
 from review import load_owner_review, verify_payload
-from store import Stores, check_content_store, commit_meta, iter_manifests, meta_clean, read_deletions
+from store import Stores, check_content_store, commit_meta, meta_clean, read_deletions, scan_manifests
 
 EPISODES_TARGET = 50
 ORIGIN_BUCKETS = ("human", "task_notification", "hook", "other")
@@ -111,13 +111,17 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
                      maintenance: dict[str, Any] | None = None,
                      backstop: dict[str, Any] | None = None) -> dict[str, Any]:
     now = now or iso(now_utc())
-    ms = sorted(iter_manifests(stores), key=lambda m: m["started_at"])
+    scan = scan_manifests(stores)
+    ms = sorted(scan.manifests, key=lambda m: m["started_at"])
     owners = {m["episode_id"]: load_owner_review(stores, m["episode_id"]) for m in ms}
     maint = maintenance or {}
     notes: list[str] = []
     if backstop is not None and backstop.get("state") != "ok":
         notes.append(f"maintenance backstop {backstop.get('state')}: last success {backstop.get('last_ok')}, "
                      f"{backstop.get('consecutive_failures', 0)} consecutive failure(s)")
+    if scan.unreadable:
+        notes.append(f"{len(scan.unreadable)} manifest(s) unreadable and outside every count below: "
+                     + ", ".join(scan.unreadable[:20]))
 
     # window
     ended = [m["ended_at"] for m in ms if m.get("ended_at")]
@@ -275,7 +279,7 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
         "window": {"first_started_at": first, "last_ended_at": last,
                    "days": round((b - a).total_seconds() / 86400, 2) if a and b else None,
                    "repos": [{"main_root_sha256": k, "episodes": v} for k, v in sorted(repos.items())]},
-        "denominator": {"episodes_total": len(ms), "by_origin": by_origin,
+        "denominator": {"episodes_total": len(ms), "manifests_unreadable": len(scan.unreadable), "by_origin": by_origin,
                         "by_capture_status": {k: by_status.get(k, 0) for k in ("complete", "partial", "failed")}},
         "funnel": funnel,
         "exclusions": {"per_rule": per_rule, "first_failing_rule": dict(sorted(first_failing.items())),

@@ -35,6 +35,13 @@ REPORT: dict[str, object] = {}
 PROMPT = dryrun.PROMPT
 
 
+def manifests(stores: store.Stores) -> list[dict]:
+    """Every manifest; a fixture store never holds an unreadable one."""
+    scan = store.scan_manifests(stores)
+    assert scan.unreadable == [], scan.unreadable
+    return scan.manifests
+
+
 class Fixture:
     """A fixture repository, stores, transcript directory and an isolated hook env."""
 
@@ -78,7 +85,7 @@ class Fixture:
         assert rc == 0 and out == b"", (rc, out)
 
     def episode(self, sid: str) -> dict:
-        found = [m for m in store.iter_manifests(self.stores) if m["session_id"] == sid]
+        found = [m for m in manifests(self.stores) if m["session_id"] == sid]
         assert len(found) == 1, f"{len(found)} manifests for session"
         return found[0]
 
@@ -150,19 +157,19 @@ def test_capture_disabled_in_twin(root: Path) -> None:
     for var in ("EVIDENCE_CAPTURE", "EVIDENCE_HOOK"):
         sid = str(uuid.uuid4())
         fx.start(sid, env={**fx.env, var: "0"})
-        assert not [m for m in store.iter_manifests(fx.stores) if m["session_id"] == sid], var
+        assert not [m for m in manifests(fx.stores) if m["session_id"] == sid], var
     # a repository without .evidence-compiler/ is never captured
     plain = fx.root / "plain"
     plain.mkdir()
     subprocess.run(["git", "init", "-q", str(plain)], check=True, capture_output=True)
     sid = str(uuid.uuid4())
     fx.start(sid, packet=False, cwd=plain)
-    assert not [m for m in store.iter_manifests(fx.stores) if m["session_id"] == sid]
+    assert not [m for m in manifests(fx.stores) if m["session_id"] == sid]
     # capture: false in the repository's config
     (fx.repo / ".evidence-compiler" / "config.yaml").write_text("capture: false\n", encoding="utf-8")
     sid = str(uuid.uuid4())
     fx.start(sid, packet=False)
-    assert not [m for m in store.iter_manifests(fx.stores) if m["session_id"] == sid]
+    assert not [m for m in manifests(fx.stores) if m["session_id"] == sid]
     # the Twin's child environment disables capture
     sys.path.insert(0, str(PKG.parent / "evidence-twin"))
     import twin  # noqa: E402
@@ -202,7 +209,7 @@ def test_capture_failures_in_denominator(root: Path) -> None:
     res = pipeline.run_maintain(fx.stores, fx.env)
     assert res["action"] == "maintained" and "error" not in res, res
     assert res["pending_drained"] == 3 and res["killed"] == 1 and res["rejoin_expired"] == 1, res
-    ms = store.iter_manifests(fx.stores)
+    ms = manifests(fx.stores)
     by_status = {s: sum(1 for m in ms if m["capture"]["status"] == s) for s in ("complete", "partial", "failed")}
     assert by_status == {"complete": 1, "partial": 1, "failed": 4}, by_status
     killed = fx.episode(sid_k)
@@ -233,13 +240,13 @@ def test_rejoin_by_maintenance(root: Path) -> None:
     fx.transcript(sid, second, None, ts2, append=True, edit=False)
     res = pipeline.run_maintain(fx.stores, fx.env)
     assert res["rejoined"] >= 1, res
-    first = [m for m in store.iter_manifests(fx.stores) if m["session_id"] == sid and m["started_at"] < ts2]
+    first = [m for m in manifests(fx.stores) if m["session_id"] == sid and m["started_at"] < ts2]
     assert len(first) == 1
     m = first[0]
     assert m["capture"]["join"]["by"] == "maintain" and m["ended_by"] == "prompt", m["capture"]["join"]
     assert m["link"]["state"] == "linked" and m["review"]["state"] == "materialized", (m["link"], m["review"])
     # the later episode stays open for its own Stop hook
-    later = [x for x in store.iter_manifests(fx.stores) if x["session_id"] == sid and x["started_at"] >= ts2][0]
+    later = [x for x in manifests(fx.stores) if x["session_id"] == sid and x["started_at"] >= ts2][0]
     assert later["capture"]["phase"] == "started"
 
 

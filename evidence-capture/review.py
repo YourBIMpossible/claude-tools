@@ -50,7 +50,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
 import manifest as mf
 from common import iso, norm_path, now_utc, parse_iso, plus_days, read_json, sha256_bytes, sha256_file, sha256_text
@@ -532,40 +532,6 @@ def _adopt_payload(stores: Stores, ep: str, retention: dict[str, Any]) -> tuple[
                      extended_until=None, deleted_at=None)
     log_line(stores, f"review {ep}: interrupted payload adopted")
     return "materialized", "payload_recovered"
-
-
-def review_pending(stores: Stores, inputs_for: Callable[[dict[str, Any]], ReviewInputs | None] | None = None, *,
-                   now: str | None = None, commit: bool = True) -> dict[str, int]:
-    """Re-run review for every manifest not yet materialized (the next-start pass)."""
-    counts = {s: 0 for s in (*REVIEW_STATES, "changed", "errors")}
-    for m in _iter_manifests(stores):
-        if (m.get("review") or {}).get("state") == "materialized":
-            counts["materialized"] += 1
-            continue
-        if (m.get("review") or {}).get("state") == "excluded" and not (stores.snapshots / m["episode_id"]).exists():
-            counts["excluded"] += 1
-            continue
-        try:
-            res = review_episode(stores, m, inputs_for(m) if inputs_for else None, now=now, commit=commit)
-        except (OSError, ValueError, KeyError) as exc:
-            counts["errors"] += 1
-            log_line(stores, f"review {m.get('episode_id')}: {type(exc).__name__}: {exc}")
-            continue
-        counts[res["state"] if res["state"] in REVIEW_STATES else "held"] += 1
-        counts["changed"] += int(res["changed"])
-        counts["errors"] += int(bool(res["error"]))
-    return counts
-
-
-def _iter_manifests(stores: Stores) -> list[dict[str, Any]]:
-    out = []
-    if stores.manifests.is_dir():
-        for p in sorted(stores.manifests.glob("cap_*.json")):
-            try:
-                out.append(read_json(p))
-            except (OSError, ValueError):
-                log_line(stores, f"manifest unreadable: {p.name}")
-    return out
 
 
 # ---------------------------------------------------------------------- seals and expiry

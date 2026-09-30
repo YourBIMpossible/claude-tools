@@ -58,7 +58,7 @@ PKG = Path(__file__).resolve().parent
 sys.path.insert(0, str(PKG))
 import client_identity as ci  # noqa: E402
 from dryrun import DryError, build_stores, check_out_dir  # noqa: E402
-from store import Stores, iter_manifests  # noqa: E402
+from store import Stores, scan_manifests  # noqa: E402
 
 RELIED_UPON = ("a_hooks_finish_before_first_tool", "a_hooks_finish_before_first_output",
                "c_turn_waits_for_hook_within_timeout", "g_client_identity_observed")
@@ -357,8 +357,11 @@ def analyse_turns(turns: list[list[dict[str, Any]]]) -> dict[str, Any]:
 
 
 def episodes(stores: Stores) -> list[dict[str, Any]]:
-    out = []
-    for m in iter_manifests(stores):
+    scan = scan_manifests(stores)
+    out: list[dict[str, Any]] = [{"episode_id": None, "prompt_sha256": None, "manifest": name,
+                                  "status": "unreadable"}
+                                 for name in scan.unreadable]
+    for m in scan.manifests:
         cap = m.get("capture") or {}
         out.append({"episode_id": m.get("episode_id"), "prompt_sha256": (m.get("prompt") or {}).get("sha256"),
                     "status": cap.get("status"), "errors": cap.get("errors"), "join": cap.get("join"),
