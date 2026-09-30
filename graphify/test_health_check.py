@@ -184,6 +184,18 @@ def case_config_failure(label, body, task_result="1"):
         raise
 
 
+def healthy_record():
+    """What Refresh-Graphs.ps1 writes after a clean run of the single test target."""
+    sha = "a" * 40
+    return {"updated_at": RECENT, "installed_version": FAKE_VERSION, "drift_threshold_pct": 15,
+            "last_success_at": RECENT,
+            "last_run": {"started_at": RECENT, "ended_at": RECENT, "exit_code": 0, "targets": [
+                {"name": "backend", "scan": "scans/backend", "started_at": RECENT, "ended_at": RECENT,
+                 "ok": True, "exit_code": 0, "nodes": 10, "edges": 5, "communities": 2, "prev_nodes": 10,
+                 "node_drift_pct": 0.0, "drift_warning": False, "built_at_commit": sha, "repo_head": sha,
+                 "head_match": True, "code_only": True, "force": False, "pythonhashseed": "0"}]}}
+
+
 def main():
     # -- placeholder target: settings (python, relative dashboard dir) still resolve
     e, doc = case_config_failure("placeholder", valid_config(targets=[{"name": "x", "scan": "<path-to-backend>"}]))
@@ -332,6 +344,76 @@ def main():
             check("healthy: no commit SHAs published", sha not in text)
         local = e.alerts()
         check("healthy: local alerts.json keeps the scan path", local["targets"][0]["scan"].startswith(DRIVE))
+    finally:
+        e.close()
+
+    # -- unknown keys are config errors, never a silent fallback to defaults
+    for label, body, needle in (
+            ("unknown-key", valid_config(pythonexe="tools/fake-python.ps1"), "unknown key 'pythonexe'"),
+            ("unknown-target-key", valid_config(targets=[{"name": "backend", "scan": "scans/backend", "scna": "x"}]),
+             "unknown key 'scna'")):
+        e, doc = case_config_failure(label, body)
+        detail = next(a for a in e.alerts()["alerts"] if a["code"] == "config-invalid")["detail"]
+        check(f"{label}: local detail names the unknown key", needle in detail, detail[:300])
+        e.close()
+
+    # -- a config path .NET rejects is a config error, never an uncaught throw
+    e = Env("bad-config-path")
+    try:
+        e.write_health(healthy_record())
+        p = e.run(task_result="0", extra_env={"GRAPHIFY_CONFIG": str(e.cfg_dir / 'a|b"c.json')})
+        check("bad-config-path: exits 1", p.returncode == 1, f"rc={p.returncode} err={p.stderr.strip()[:300]}")
+        codes = error_alerts(e.alerts())
+        check("bad-config-path: config-invalid alert written", "config-invalid" in codes, f"codes={codes}")
+    finally:
+        e.close()
+
+    # -- a missing dashboard dir is an error; the others still publish it
+    e = Env("dash-missing")
+    try:
+        (e.cfg_dir / "scans" / "backend").mkdir(parents=True)
+        e.write_config(valid_config(dashboard_dirs=["dash", "gone"]))
+        e.write_health(healthy_record())
+        p = e.run(task_result="0")
+        check("dash-missing: exits 1", p.returncode == 1, f"rc={p.returncode} err={p.stderr.strip()[:300]}")
+        local = e.alerts()
+        check("dash-missing: alerts.json status error with dashboard-dir-missing",
+              local["status"] == "error" and error_alerts(local) == ["dashboard-dir-missing"], f"{local['status']} {error_alerts(local)}")
+        text, doc = e.public()
+        assert_public_clean("dash-missing", e, text, doc)
+        check("dash-missing: live dir shows the error", bool(doc) and doc["status"] == "error", doc and doc.get("status"))
+    finally:
+        e.close()
+
+    # -- a dashboard write failure after publish still reaches alerts.json and the exit code
+    e = Env("dash-write-fail")
+    try:
+        (e.cfg_dir / "scans" / "backend").mkdir(parents=True)
+        e.write_config(valid_config())
+        e.write_health(healthy_record())
+        e.js.unlink()
+        e.js.mkdir()                     # graphify-health.js is a folder: Set-Content must fail
+        p = e.run(task_result="0")
+        check("dash-write-fail: exits 1", p.returncode == 1, f"rc={p.returncode} err={p.stderr.strip()[:300]}")
+        local = e.alerts()
+        check("dash-write-fail: alerts.json agrees with the exit code",
+              local["status"] == "error" and error_alerts(local) == ["dashboard-write-failed"],
+              f"{local['status']} {error_alerts(local)}")
+    finally:
+        e.close()
+
+    # -- a corrupt last-known-good file is reported, not swallowed
+    e = Env("lkg-corrupt")
+    try:
+        e.write_config("{ not json " + PARSER_SENTINEL)
+        e.write_health(config_abort_health())
+        (e.state / "publish-settings.lkg.json").write_text("{ corrupt", encoding="utf-8")
+        e.run()
+        local = e.alerts()
+        warns = [a["code"] for a in local["alerts"] if a["severity"] == "warn"]
+        check("lkg-corrupt: lkg-unreadable warning in alerts.json", "lkg-unreadable" in warns, f"{local['alerts']}")
+        logs = "".join(f.read_text(encoding="utf-8-sig", errors="replace") for f in e.state.glob("*.txt"))
+        check("lkg-corrupt: logged", "last-known-good settings unreadable" in logs, logs[-300:])
     finally:
         e.close()
 

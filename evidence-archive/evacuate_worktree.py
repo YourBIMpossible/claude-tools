@@ -15,9 +15,14 @@ Archive layout:
     packets/<packet_id>.json                       one byte-exact copy per packet id
     quarantine/<worktree>/<sha12>__<filename>      files that are not valid packets, byte-exact
     receipts/<utc>__<worktree>.json                one receipt per --apply run
+    staging/                                       in-flight copies (a killed run leaves an inert .part)
+
+A copy is written and hash-verified under staging/, then hard-linked into place, so an
+archived path only ever holds a complete, verified copy: a run killed mid-write leaves
+nothing under packets/ or quarantine/, and the next run copies the file again.
 
 Guarantees: it never deletes or modifies source files, never removes worktrees, never
-overwrites an archived file, never touches transcripts, and never talks to a network or
+overwrites an archived file, deletes nothing but its own staging/ copies, never touches transcripts, and never talks to a network or
 git remote. It refuses an archive inside the worktree, or inside a git repo that has a
 remote. Only an --apply run whose every file is archived and verified reports
 `safe_to_remove: true`; a dry run never does.
@@ -29,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import secrets
 import json
 import os
 import re
@@ -155,29 +161,50 @@ def _write_exclusive(target: Path, data: bytes) -> None:
         os.fsync(fh.fileno())
 
 
+def _discard_staged(part: Path, staging: Path) -> None:
+    """Delete one of this run's own staging copies; the helper's only deletion."""
+    if part.parent != staging:
+        raise ValueError(f"refusing to delete outside staging: {part}")
+    os.unlink(part)
+
+
+def _match_existing(target: Path, digest: str, result: FileResult) -> None:
+    """Record whether an already-archived target holds exactly this content."""
+    if sha256_bytes(target.read_bytes()) == digest:
+        result.action = DUPLICATE if result.action != QUARANTINED else QUARANTINED
+        result.detail = (result.detail + "; " if result.detail else "") + "already archived, identical"
+        result.verified = True
+    else:
+        result.action = CONFLICT
+        result.detail = "archive already holds different content for this id; not overwritten"
+
+
 def _archive_one(src: Path, raw: bytes, digest: str, target: Path, apply: bool,
-                 result: FileResult) -> None:
+                 result: FileResult, staging: Path) -> None:
     """Copy (or plan to copy) raw to target, deduplicating against an existing copy."""
     result.archive_path = target.as_posix()
     if target.exists():
-        existing = sha256_bytes(target.read_bytes())
-        if existing == digest:
-            result.action = DUPLICATE if result.action != QUARANTINED else QUARANTINED
-            result.detail = (result.detail + "; " if result.detail else "") + "already archived, identical"
-            result.verified = True
-        else:
-            result.action = CONFLICT
-            result.detail = "archive already holds different content for this id; not overwritten"
+        _match_existing(target, digest, result)
         return
     if not apply:
         return
+    part = staging / f"{target.name}.{os.getpid()}-{secrets.token_hex(4)}.part"
     try:
-        _write_exclusive(target, raw)
+        _write_exclusive(part, raw)
+        if sha256_bytes(part.read_bytes()) != digest:
+            _discard_staged(part, staging)
+            result.action, result.detail = ERROR, "archived copy does not match source hash"
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(part, target)  # atomic, and fails rather than overwrite
+        except FileExistsError:
+            _discard_staged(part, staging)
+            _match_existing(target, digest, result)  # a concurrent run archived it first
+            return
+        _discard_staged(part, staging)
     except OSError as exc:
         result.action, result.detail = ERROR, f"copy failed: {type(exc).__name__}: {exc}"
-        return
-    if sha256_bytes(target.read_bytes()) != digest:
-        result.action, result.detail = ERROR, "archived copy does not match source hash"
         return
     if sha256_bytes(src.read_bytes()) != digest:
         result.action, result.detail = ERROR, "source changed during evacuation"
@@ -189,6 +216,7 @@ def evacuate(worktree: Path, archive: Path, apply: bool) -> Report:
     worktree, archive = worktree.resolve(), archive.resolve()
     check_preconditions(worktree, archive)
     packets_dir = worktree / PACKETS_REL
+    staging = archive / "staging"
     now = datetime.now(timezone.utc)
     report = Report(TOOL_VERSION, "apply" if apply else "dry-run",
                     now.isoformat(timespec="seconds"), worktree.as_posix(),
@@ -233,7 +261,7 @@ def evacuate(worktree: Path, archive: Path, apply: bool) -> Report:
                     continue
                 seen[pid] = digest
                 target = archive / "packets" / f"{pid}.json"
-            _archive_one(src, raw, digest, target, apply, res)
+            _archive_one(src, raw, digest, target, apply, res, staging)
             if not apply and not target.exists() and res.action in (COPIED, QUARANTINED):
                 res.action = WOULD_COPY if res.action == COPIED else WOULD_QUARANTINE
             report.files.append(res)

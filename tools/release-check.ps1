@@ -6,7 +6,7 @@
 # Gates:
 #   1. Gitleaks secret scan (bin/gitleaks.exe — fetch per bin/README.md)
 #   2. Public-boundary check (tools/pre_publish_check.py) + its tests
-#   3. Unit tests (ctxcheck, ctxdex gate)
+#   3. Every test suite the CI `gates` job runs (keep the two lists identical)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Push-Location $root
@@ -47,7 +47,10 @@ Step "ctxdex secret-gate tests" { python ctxdex/test_ctxdex_gate.py }
 Step "local-audit census-only guard" { python local-audit/test_local_audit.py }
 Step "slop_prepass self-test" { python local-audit/slop_prepass.py --self-test }
 Step "graphify refresh failure-accounting tests" { python graphify/test_refresh_graphs.py }
+Step "graphify health-check boundary tests" { python graphify/test_health_check.py }
+Step "graphify adoption-funnel tests" { python graphify/test_graphify_funnel.py }
 Step "evidence-relevance tests" { python evidence-relevance/test_measure_relevance.py }
+Step "evidence-archive evacuation tests" { python evidence-archive/test_evacuate_worktree.py }
 
 Pop-Location
 if ($fail -gt 0) { Write-Host "`n$fail gate(s) FAILED." -ForegroundColor Red; exit 1 }

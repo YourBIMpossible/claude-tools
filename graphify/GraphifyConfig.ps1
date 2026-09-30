@@ -33,6 +33,9 @@
 $script:GraphifyTargetNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 # A template placeholder anywhere in a value, e.g. "<path-to-backend>" or "repos/<name>".
 $script:GraphifyPlaceholderPattern = '<[^<>]*>'
+# Every key a config may hold; skill_scripts / query_log / funnel are read by graphify_funnel.py.
+$script:GraphifyConfigKeys = @('_comment', 'targets', 'graphify_exe', 'python_exe', 'dashboard_dirs', 'skill_scripts', 'query_log', 'funnel')
+$script:GraphifyTargetKeys = @('name', 'scan', 'repo')
 
 function Get-GraphifyConfigPath {
     if ($env:GRAPHIFY_CONFIG) { return $env:GRAPHIFY_CONFIG }
@@ -124,6 +127,9 @@ function Test-GraphifyConfigTargets {
         $t = $list[$i]; $f = "targets[$i]"
         if ($t -isnot [System.Management.Automation.PSCustomObject]) { $errors += "$f must be an object."; continue }
         $bad = $false
+        foreach ($p in $t.PSObject.Properties) {
+            if ($script:GraphifyTargetKeys -notcontains $p.Name) { $errors += "$f has unknown key '$($p.Name)' (known: $($script:GraphifyTargetKeys -join ', '))."; $bad = $true }
+        }
         foreach ($k in 'name', 'scan') {
             if ($t.$k -isnot [string] -or -not $t.$k) { $errors += "$f.$k must be a non-empty string."; $bad = $true }
         }
@@ -159,16 +165,28 @@ function Test-GraphifyConfigTargets {
 # if targets are invalid; an invalid setting falls back to its default.
 function Get-GraphifyConfig {
     $path = Get-GraphifyConfigPath
-    $full = [IO.Path]::GetFullPath($path)
-    $base = Split-Path -Parent $full
     $errors = @()
-    $loaded = Import-GraphifyConfigJson -Path $full
+    # .NET Framework (PS 5.1) throws on '|', '"' etc.: report it, never throw.
+    try {
+        $full = [IO.Path]::GetFullPath($path)
+        $base = Split-Path -Parent $full
+        $loaded = Import-GraphifyConfigJson -Path $full
+    } catch {
+        $full = $path; $base = $null
+        $loaded = @{ Raw = $null; Status = 'invalid'; Error = "graphify config path '$path' is not a valid path: $($_.Exception.Message)" }
+    }
     $raw = $loaded.Raw
     if ($loaded.Error) { $errors += $loaded.Error }
 
     $graphify = 'graphify'; $python = 'python'; $dash = @(); $targets = @()
     $pythonFailed = $false; $dashFailed = $false
     if ($raw) {
+        # A misspelt key would otherwise fall back to a default with status 'ok'.
+        foreach ($p in $raw.PSObject.Properties) {
+            if ($script:GraphifyConfigKeys -notcontains $p.Name) {
+                $errors += "graphify config '$full': unknown key '$($p.Name)' (known: $($script:GraphifyConfigKeys -join ', '))."
+            }
+        }
         foreach ($pair in @(@('graphify_exe', 'graphify'), @('python_exe', 'python'))) {
             $key = $pair[0]
             if ($null -eq $raw.PSObject.Properties[$key]) { continue }

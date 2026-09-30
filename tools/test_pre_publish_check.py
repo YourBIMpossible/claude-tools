@@ -8,6 +8,7 @@ Violating literals are assembled at runtime so this file itself stays clean.
 """
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import subprocess
@@ -40,7 +41,26 @@ def sha(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def run_repo(files: dict[str, str], *, identifiers: list[str] | None = None,
+def git(root: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+def write(root: Path, rel: str, content: str | bytes) -> None:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, bytes):
+        p.write_bytes(content)
+    else:
+        p.write_text(content, encoding="utf-8")
+
+
+def run_checker(root: Path) -> tuple[int, str]:
+    r = subprocess.run([sys.executable, str(CHECKER)], cwd=root,
+                       capture_output=True, text=True, encoding="utf-8")
+    return r.returncode, r.stdout + r.stderr
+
+
+def run_repo(files: dict[str, str | bytes], *, identifiers: list[str] | None = None,
              exceptions: list[dict] | None = None) -> tuple[int, str]:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -50,14 +70,28 @@ def run_repo(files: dict[str, str], *, identifiers: list[str] | None = None,
                      "".join(sha(i) + "\n" for i in identifiers)}
         if exceptions is not None:
             files = {**files, "tools/public-boundary-exceptions.json": json.dumps(exceptions)}
-        for rel, text in files.items():
-            p = root / rel
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(text, encoding="utf-8")
-        subprocess.run(["git", "-C", str(root), "add", "--", *files], check=True)
-        r = subprocess.run([sys.executable, str(CHECKER)], cwd=root,
-                           capture_output=True, text=True, encoding="utf-8")
-        return r.returncode, r.stdout + r.stderr
+        for rel, content in files.items():
+            write(root, rel, content)
+        git(root, "add", "--", *files)
+        return run_checker(root)
+
+
+def run_committed(committed: dict[str, str], edits: dict[str, str], *,
+                  stage_edits: bool) -> tuple[int, str]:
+    """Commit `committed`, then overwrite files in the working copy (optionally staged)."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        for rel, text in committed.items():
+            write(root, rel, text)
+        git(root, "add", "--", *committed)
+        git(root, "-c", "user.name=t", "-c", "user.email=t@example.com",
+            "commit", "-q", "-m", "c")
+        for rel, text in edits.items():
+            write(root, rel, text)
+        if stage_edits:
+            git(root, "add", "--", *edits)
+        return run_checker(root)
 
 
 def findings(out: str, rule: str) -> list[str]:
@@ -136,6 +170,51 @@ def main() -> int:
     check("stale exception fails", code == 1 and "STALE" in out, out)
     code, out = run_repo({"doc.md": "clean\n"}, exceptions=[{**exc, "reason": " "}])
     check("exception without a reason is rejected", code == 1 and "CONFIG ERROR" in out, out)
+
+    marker = f"see {DRIVE}{BS}Private{BS}notes.txt\n"
+    for name, data in (("utf-16-le", marker.encode("utf-16")),   # PS 5.1 Out-File default
+                       ("utf-16-be", codecs.BOM_UTF16_BE + marker.encode("utf-16-be")),
+                       ("utf-32", marker.encode("utf-32")),
+                       ("utf-8-sig", marker.encode("utf-8-sig"))):
+        code, out = run_repo({"doc.md": data})
+        check(f"{name} content (BOM) is decoded and scanned",
+              code == 1 and len(findings(out, "windows-drive-path")) == 1, out)
+    code, out = run_repo({"doc.md": marker.encode("utf-16-le")})
+    check("BOM-less UTF-16 is an undecodable-content finding, not a skip",
+          code == 1 and len(findings(out, "undecodable-content")) == 1, out)
+    code, out = run_repo({"doc.md": b"ok\n\xff\xfe\xfd not utf-8\n"})
+    check("invalid UTF-8 is an undecodable-content finding",
+          code == 1 and len(findings(out, "undecodable-content")) == 1
+          and "unscannable" in out, out)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        git(root, "update-index", "--add", "--info-only", "--cacheinfo",
+            "100644," + "ab" * 20 + ",ghost.md")
+        code, out = run_checker(root)
+    check("an index blob git cannot produce is an unreadable-blob finding",
+          code == 1 and len(findings(out, "unreadable-blob")) == 1, out)
+    code, out = run_committed({"doc.md": marker}, {"doc.md": "clean\n"}, stage_edits=False)
+    check("unstaged clean working copy does not hide a committed marker",
+          code == 1 and any(h.strip().startswith("- doc.md:1") for h in
+                            findings(out, "windows-drive-path")), out)
+    code, out = run_committed({"doc.md": marker}, {"doc.md": "clean\n"}, stage_edits=True)
+    check("staged clean edit still reports the committed marker as path@HEAD",
+          code == 1 and any(h.strip().startswith("- doc.md@HEAD:1") for h in
+                            findings(out, "windows-drive-path")), out)
+    code, out = run_committed({"doc.md": "clean\n"}, {"doc.md": marker}, stage_edits=False)
+    check("unstaged working-copy text is not the published tree", code == 0, out)
+    code, out = run_committed({"doc.md": "clean\n"}, {"doc.md": marker}, stage_edits=True)
+    check("staged marker is caught before commit", code == 1, out)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        write(root, "doc.md", marker)
+        write(root, "tools/public-boundary-exceptions.json", json.dumps([exc]))
+        git(root, "add", "--", "doc.md")
+        code, out = run_checker(root)
+    check("untracked exceptions file is a config error, never silently applied",
+          code == 1 and "CONFIG ERROR" in out, out)
 
     code, out = run_repo({"state/queue.yaml": "x: 1\n"})
     check("forbidden file class fails", code == 1 and "FORBIDDEN" in out, out)
