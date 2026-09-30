@@ -205,6 +205,11 @@ def _archive_one(src: Path, raw: bytes, digest: str, target: Path, apply: bool,
         _discard_staged(part, staging)
     except OSError as exc:
         result.action, result.detail = ERROR, f"copy failed: {type(exc).__name__}: {exc}"
+        try:
+            if part.exists():
+                _discard_staged(part, staging)  # a failed write leaves no partial copy
+        except OSError as cleanup:
+            result.detail += f"; staged copy left in staging/: {type(cleanup).__name__}"
         return
     if sha256_bytes(src.read_bytes()) != digest:
         result.action, result.detail = ERROR, "source changed during evacuation"

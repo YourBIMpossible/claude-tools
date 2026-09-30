@@ -286,6 +286,32 @@ def test_concurrent_publish_is_a_duplicate() -> None:
         check(not list((archive / "staging").iterdir()), "the losing staging copy is discarded")
 
 
+def test_failed_write_leaves_no_part() -> None:
+    print("failed write")
+    real_write = ev._write_exclusive
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt = make_worktree(tmp)
+        put(wt, f"a_{PA}.json", packet(PA))
+        archive = tmp / "arch"
+
+        def disk_full(target: Path, data: bytes) -> None:
+            if target.name.startswith("ep_"):
+                real_write(target, data[: len(data) // 2])
+                raise OSError(28, "No space left on device")
+            real_write(target, data)
+
+        ev._write_exclusive = disk_full
+        try:
+            r = ev.evacuate(wt, archive, apply=True)
+        finally:
+            ev._write_exclusive = real_write
+        check(not r.safe_to_remove and r.files[0].action == "error"
+              and "copy failed" in r.files[0].detail, "a failed write is a blocking error")
+        check(not list((archive / "staging").iterdir()), "a failed write leaves no partial copy in staging/")
+        check(not (archive / "packets" / f"{PA}.json").exists(), "a failed write publishes nothing")
+
+
 def test_refusals() -> None:
     print("refusals")
     with tempfile.TemporaryDirectory() as t:
@@ -336,7 +362,8 @@ def main() -> int:
     for test in (test_dry_run_writes_nothing, test_new_packets_copied_and_source_untouched,
                  test_duplicates, test_conflicting_ids_block, test_malformed_quarantined,
                  test_verify_pass_and_tamper, test_failure_paths_block, test_interrupted_write_is_retried,
-                 test_concurrent_publish_is_a_duplicate, test_refusals,
+                 test_concurrent_publish_is_a_duplicate, test_failed_write_leaves_no_part,
+                 test_refusals,
                  test_no_store, test_scope_guards):
         test()
     print(f"\n{PASSED} passed, {FAILED} failed")
