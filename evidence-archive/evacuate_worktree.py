@@ -195,7 +195,7 @@ def _match_existing(target: Path, digest: str, result: FileResult) -> None:
         result.verified = True
     else:
         result.action = CONFLICT
-        result.detail = "archive already holds different content for this id; not overwritten"
+        _note(result, "archive already holds different content for this id; not overwritten")
 
 
 def _archive_one(src: Path, raw: bytes, digest: str, target: Path, apply: bool,
@@ -211,8 +211,9 @@ def _archive_one(src: Path, raw: bytes, digest: str, target: Path, apply: bool,
     try:
         _write_exclusive(part, raw)
         if sha256_bytes(part.read_bytes()) != digest:
-            _discard_staged(part, staging)
-            result.action, result.detail = ERROR, "archived copy does not match source hash"
+            result.action = ERROR
+            _note(result, "archived copy does not match source hash")
+            _cleanup_staged(part, staging, result)
             return
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -235,7 +236,8 @@ def _archive_one(src: Path, raw: bytes, digest: str, target: Path, apply: bool,
                       f"{type(exc).__name__}: {exc}")
         return
     if source_now != digest:
-        result.action, result.detail = ERROR, "source changed during evacuation"
+        result.action = ERROR
+        _note(result, "source changed during evacuation")
         return
     result.verified = True
 

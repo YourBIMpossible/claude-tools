@@ -313,9 +313,9 @@ def test_failed_write_leaves_no_part() -> None:
         check(r.files[0].staging_left is None, "a failed write reports no leftover staged copy")
 
 
-def _publish_with(archive: Path, wt: Path, *, reread_fails: bool) -> ev.Report:
-    """Run the real evacuate() with the post-publish staging unlink failing, and
-    optionally the post-publish source re-read failing."""
+def _publish_with(archive: Path, wt: Path, *, reread_fails: bool, run=None):
+    """Run the real evacuate() (or `run`, e.g. the CLI) with the post-publish staging
+    unlink failing, and optionally the post-publish source re-read failing."""
     real_discard, real_read = ev._discard_staged, Path.read_bytes
     src = (wt / ev.PACKETS_REL / f"a_{PA}.json").resolve()
     reads = {"n": 0}
@@ -334,7 +334,7 @@ def _publish_with(archive: Path, wt: Path, *, reread_fails: bool) -> ev.Report:
     if reread_fails:
         Path.read_bytes = flaky_read  # type: ignore[method-assign]
     try:
-        return ev.evacuate(wt, archive, apply=True)
+        return run() if run else ev.evacuate(wt, archive, apply=True)
     finally:
         ev._discard_staged = real_discard
         Path.read_bytes = real_read  # type: ignore[method-assign]
@@ -387,6 +387,41 @@ def test_unverified_publish_is_incomplete() -> None:
         code, out = run_cli("evacuate", str(wt), "--archive", str(archive), "--apply")
         check(code == 0 and "duplicate" in out and "safe_to_remove: true" in out,
               "a retry verifies the published copy")
+        cli_archive = tmp / "arch-cli"
+        code, out = _publish_with(cli_archive, wt, reread_fails=True, run=lambda: run_cli(
+            "evacuate", str(wt), "--archive", str(cli_archive), "--apply"))
+        check(code == 1 and "incomplete" in out and "safe_to_remove: false" in out
+              and "copy failed" not in out and "staged copy left" in out,
+              "the CLI exits 1 and prints the incomplete result and the leftover staged copy")
+
+
+def test_mismatch_with_cleanup_failure_keeps_cause() -> None:
+    print("staged hash mismatch with cleanup failure")
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt = make_worktree(tmp)
+        put(wt, f"a_{PA}.json", packet(PA))
+        archive = tmp / "arch"
+        real_write, real_discard = ev._write_exclusive, ev._discard_staged
+
+        def corrupt(target: Path, data: bytes) -> None:
+            real_write(target, data[:-1] + b"X")
+
+        def locked(part: Path, staging: Path) -> None:
+            raise PermissionError(13, "file in use", str(part))
+
+        ev._write_exclusive, ev._discard_staged = corrupt, locked
+        try:
+            r = ev.evacuate(wt, archive, apply=True)
+        finally:
+            ev._write_exclusive, ev._discard_staged = real_write, real_discard
+        f = r.files[0]
+        check(f.action == "error" and not r.safe_to_remove
+              and "archived copy does not match source hash" in f.detail
+              and "copy failed" not in f.detail, "a staged mismatch keeps its cause")
+        check(f.detail.count("staged copy left") == 1 and f.staging_left is not None,
+              "the leftover staged copy is noted once")
+        check(not (archive / "packets" / f"{PA}.json").exists(), "a staged mismatch publishes nothing")
 
 
 def test_refusals() -> None:
@@ -442,6 +477,7 @@ def main() -> int:
                  test_concurrent_publish_is_a_duplicate, test_failed_write_leaves_no_part,
                  test_cleanup_failure_after_publish_is_verified_copy,
                  test_unverified_publish_is_incomplete,
+                 test_mismatch_with_cleanup_failure_keeps_cause,
                  test_refusals,
                  test_no_store, test_scope_guards):
         test()
