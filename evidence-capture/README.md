@@ -163,6 +163,7 @@ python capture.py admit EPISODE
 python capture.py expire
 python capture.py dry --out DIR [-n N]
 python capture.py backstop [--health | --task-xml PATH]
+python isolation.py --targets FILE --watch DIR [--watch DIR ...] --repo DIR [--repo DIR ...] \n    [--probe-prefix CMD] --out META/isolation/NAME.json
 python desktop_boundary_test.py --cli EXE --out DIR [--runs N] [--turns N] [--cleanup-transcripts]
 ```
 
@@ -172,6 +173,11 @@ a disposable repository. It makes small model calls, so it is not free. It write
 results and an unaccepted candidate record only to `--out`, and refuses an `--out` inside
 this package or any repository. Accepting a client identity stays the owner's decision.
 `boundary_test.py` (print mode) writes version-only records, which are never trusted.
+
+`isolation.py` needs at least one `--watch` store and one `--repo`; a store or repository
+it cannot read fails the check. Records written to `META/isolation/` are what the
+checkpoint counts; an unreadable record counts as failed, and no record reads as not
+verified.
 
 `dry` refuses a directory inside a git repository, any path with a `scratchpad`
 segment, and a non-empty directory it did not create.

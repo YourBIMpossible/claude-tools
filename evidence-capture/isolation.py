@@ -14,7 +14,9 @@ replay agent will run as, attempts each forbidden access:
 Every attempt must end in an access error. A success, a missing target (nothing was
 proven) or any other error fails the check. Around the probe the parent records, per
 watched store, a stat walk (paths, sizes, mtimes) and ``git status`` of every watched
-repository; any change fails the check. The record keeps the identity the child
+repository; any change fails the check. At least one watched store and one watched
+repository are required, and a store or repository that cannot be read (missing path,
+unreadable entry, git failure) fails the check: an unobserved state is never "unchanged". The record keeps the identity the child
 reported, each target's ``icacls`` dump, exit codes and per-attempt outcomes.
 
 The child runs as the current identity unless ``probe_prefix`` wraps it in something
@@ -98,31 +100,38 @@ def probe_main(spec: str) -> int:
 
 # ---------------------------------------------------------------------- parent
 
+class StateUnreadable(RuntimeError):
+    """A watched store or repository could not be observed; its state is unknown."""
+
+
 def stat_walk(root: Path) -> list[tuple[str, int, int]]:
-    """Every path under ``root`` with size and mtime (ns), for before/after comparison."""
+    """Every path under the directory ``root`` with size and mtime (ns), for before/after
+    comparison. Raises ``OSError`` when ``root`` or any entry under it cannot be read."""
+
+    def fail(exc: OSError) -> None:
+        raise exc
+
+    if not root.is_dir():
+        raise FileNotFoundError(f"watched store is not a directory: {root}")
     rows = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=fail):
         dirnames.sort()
         for name in sorted(filenames) + dirnames:
             p = Path(dirpath) / name
-            try:
-                st = os.lstat(p)
-            except OSError:
-                continue
+            st = os.lstat(p)
             rows.append((str(p.relative_to(root)).replace("\\", "/"), st.st_size, st.st_mtime_ns))
-    try:
-        st = os.lstat(root)
-        rows.append((".", 0, st.st_mtime_ns))
-    except OSError:
-        rows.append((".", -1, -1))
+    rows.append((".", 0, os.lstat(root).st_mtime_ns))
     return rows
 
 
 def git_status(repo: Path) -> str:
+    """``git status`` of ``repo``; raises ``StateUnreadable`` when git fails."""
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     proc = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v2", "--untracked-files=all"],
                           capture_output=True, text=True, env=env, timeout=120)
-    return proc.stdout if proc.returncode == 0 else f"<git status rc={proc.returncode}>"
+    if proc.returncode != 0:
+        raise StateUnreadable(f"git status rc={proc.returncode}: {proc.stderr.strip()[:200]}")
+    return proc.stdout
 
 
 def icacls(path: Path) -> str:
@@ -137,8 +146,21 @@ def icacls(path: Path) -> str:
     return "<icacls failed on the path and every ancestor>"
 
 
-def state(watch: list[Path], repos: list[Path]) -> dict[str, Any]:
-    return {"walk": {str(p): stat_walk(p) for p in watch}, "status": {str(r): git_status(r) for r in repos}}
+def state(watch: list[Path], repos: list[Path]) -> tuple[dict[str, Any], list[str]]:
+    """The observed state and, for every store or repository that could not be read, an error."""
+    out: dict[str, Any] = {"walk": {}, "status": {}}
+    errors: list[str] = []
+    for p in watch:
+        try:
+            out["walk"][str(p)] = stat_walk(p)
+        except OSError as exc:
+            errors.append(f"walk:{p}: {type(exc).__name__}: {exc}"[:300])
+    for r in repos:
+        try:
+            out["status"][str(r)] = git_status(r)
+        except (OSError, StateUnreadable, subprocess.SubprocessError) as exc:
+            errors.append(f"status:{r}: {type(exc).__name__}: {exc}"[:300])
+    return out, errors
 
 
 def check_isolation(targets: list[dict[str, str]], *, watch: list[Path], repos: list[Path],
@@ -147,13 +169,20 @@ def check_isolation(targets: list[dict[str, str]], *, watch: list[Path], repos: 
 
     ``acl_window`` (tests only) is a context manager entered just around the icacls dumps
     and the probe: after the before-state is taken, and left before the after-state.
+
+    Raises ``ValueError`` when ``targets``, ``watch`` or ``repos`` is empty: nothing would be
+    checked, and a check of nothing must not read as a pass.
     """
+    empty = [name for name, v in (("targets", targets), ("watch", watch), ("repos", repos)) if not v]
+    if empty:
+        raise ValueError(f"nothing to check: no {', '.join(empty)}")
     for t in targets:
         if t["kind"] not in KINDS:
             raise ValueError(f"unknown kind {t['kind']!r}")
     record: dict[str, Any] = {"targets": targets, "icacls": {}, "identity": None, "attempts": [],
-                              "probe_rc": None, "state_changed": [], "passed": False, "failures": []}
-    before = state(watch, repos)
+                              "probe_rc": None, "state_changed": [], "state_unreadable": [], "passed": False,
+                              "failures": []}
+    before, before_errors = state(watch, repos)
     cmd = [*(probe_prefix or []), sys.executable, str(Path(__file__).resolve()), "--probe", json.dumps(targets)]
 
     def run_probe() -> subprocess.CompletedProcess[str]:
@@ -165,7 +194,8 @@ def check_isolation(targets: list[dict[str, str]], *, watch: list[Path], repos: 
             proc = run_probe()
     else:
         proc = run_probe()
-    after = state(watch, repos)
+    after, after_errors = state(watch, repos)
+    record["state_unreadable"] = [f"before:{e}" for e in before_errors] + [f"after:{e}" for e in after_errors]
     record["probe_rc"] = proc.returncode
     try:
         child = json.loads(proc.stdout.strip().splitlines()[-1])
@@ -173,11 +203,12 @@ def check_isolation(targets: list[dict[str, str]], *, watch: list[Path], repos: 
     except (ValueError, IndexError, KeyError):
         record["failures"].append("probe produced no result")
     for key in ("walk", "status"):
-        for name in before[key]:
+        for name in [n for n in before[key] if n in after[key]]:  # an unread side is in state_unreadable
             if before[key][name] != after[key][name]:
                 record["state_changed"].append(f"{key}:{name}")
     record["failures"] += [f"{a['name']}:{a['outcome']}" for a in record["attempts"] if a["outcome"] != "denied"]
     record["failures"] += record["state_changed"]
+    record["failures"] += record["state_unreadable"]
     if proc.returncode != 0:
         record["failures"].append(f"probe rc={proc.returncode}")
     record["passed"] = bool(record["attempts"]) and not record["failures"] and \
@@ -185,25 +216,14 @@ def check_isolation(targets: list[dict[str, str]], *, watch: list[Path], repos: 
     return record
 
 
-def standard_targets(*, source_file: Path, source_git_objects: Path, meta_repo: Path, content_sentinel: Path,
-                     content_tmp: Path, sibling_worktree: Path) -> list[dict[str, str]]:
-    """The six attempts plan §8 names, in its order."""
-    return [
-        {"name": "source_file", "kind": "read", "path": str(source_file)},
-        {"name": "metadata_repo", "kind": "list", "path": str(meta_repo)},
-        {"name": "content_sentinel", "kind": "read", "path": str(content_sentinel)},
-        {"name": "content_tmp", "kind": "write", "path": str(content_tmp)},
-        {"name": "source_git_objects", "kind": "open_dir", "path": str(source_git_objects)},
-        {"name": "sibling_worktree", "kind": "resolve", "path": str(sibling_worktree)},
-    ]
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--probe", help=argparse.SUPPRESS)
     ap.add_argument("--targets", type=Path, help="JSON list of {name, kind, path}")
-    ap.add_argument("--watch", type=Path, action="append", default=[])
-    ap.add_argument("--repo", type=Path, action="append", default=[])
+    ap.add_argument("--watch", type=Path, action="append", default=[],
+                    help="store directory whose stat walk must not change (repeat; at least one)")
+    ap.add_argument("--repo", type=Path, action="append", default=[],
+                    help="repository whose git status must not change (repeat; at least one)")
     ap.add_argument("--probe-prefix", default="", help="command prefix that runs the probe as the replay identity")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args(argv)
@@ -212,8 +232,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.targets:
         ap.error("--targets is required")
     targets = json.loads(args.targets.read_text(encoding="utf-8"))
-    rec = check_isolation(targets, watch=args.watch, repos=args.repo,
-                          probe_prefix=args.probe_prefix.split() if args.probe_prefix else None)
+    try:
+        rec = check_isolation(targets, watch=args.watch, repos=args.repo,
+                              probe_prefix=args.probe_prefix.split() if args.probe_prefix else None)
+    except ValueError as exc:
+        ap.error(str(exc))
     text = json.dumps(rec, indent=1, sort_keys=True)
     if args.out:
         args.out.write_text(text + "\n", encoding="utf-8")

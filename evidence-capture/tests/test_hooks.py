@@ -23,6 +23,7 @@ PKG = HERE.parent
 sys.path.insert(0, str(PKG))
 import audit  # noqa: E402
 import dryrun  # noqa: E402
+import isolation  # noqa: E402
 import manifest as mf  # noqa: E402
 import pipeline  # noqa: E402
 import report  # noqa: E402
@@ -389,6 +390,33 @@ def test_checkpoint_schema(root: Path) -> None:
     assert PROMPT not in blob and str(fx.repo) not in blob, "checkpoint holds content or a path"
     for k in ("start", "end"):
         assert ck["capture_failures"]["hook_latency_ms"][k]["p50"] is not None
+
+
+def test_checkpoint_isolation_records(root: Path) -> None:
+    """Slop audit L10: the checkpoint counts the records the isolation CLI writes into
+    ``<meta>/isolation/``; an unreadable or verdict-less record is counted as failed, and no
+    record at all renders as not verified, never as 0 failed."""
+    fx = Fixture(root)
+    _, ck = report.write_checkpoint(fx.stores, n=1, tool_commit="0" * 40, commit=False)
+    assert ck["isolation"]["deterministic_checks_run"] == 0
+    md = (fx.stores.meta / "checkpoints" / "ckpt-1.md").read_text(encoding="utf-8")
+    assert "Isolation: no check recorded (not verified)." in md, md
+    target = root / "target.txt"
+    target.write_text("synthetic\n", encoding="utf-8")
+    spec = root / "targets.json"
+    spec.write_text(json.dumps([{"name": "t", "kind": "read", "path": str(target)}]), encoding="utf-8")
+    rec_dir = fx.stores.meta / "isolation"
+    rc = isolation.main(["--targets", str(spec), "--watch", str(fx.stores.content), "--repo", str(fx.stores.meta),
+                         "--out", str(rec_dir / "batch-1.json")])
+    assert rc == 1, "the target is readable, so the recorded check fails"
+    (rec_dir / "corrupt.json").write_text("{not json", encoding="utf-8")
+    (rec_dir / "no-verdict.json").write_text(json.dumps({"passed": "yes"}), encoding="utf-8")
+    _, ck = report.write_checkpoint(fx.stores, n=2, tool_commit="0" * 40, commit=False)
+    iso_ = ck["isolation"]
+    assert (iso_["deterministic_checks_run"], iso_["passed"], iso_["failed"], iso_["unreadable"]) == (3, 0, 3, 2), iso_
+    assert iso_["identity"] is not None and iso_["acl_dump_sha256"]
+    md = (fx.stores.meta / "checkpoints" / "ckpt-2.md").read_text(encoding="utf-8")
+    assert "Isolation: 0 passed / 3 failed (2 unreadable record(s) counted as failed)." in md, md
 
 
 def test_store_check_stamp(root: Path) -> None:

@@ -263,6 +263,48 @@ def test_real(tmp: Path) -> None:
     check(no_payload[0]["prepare"]["payload"] is None, "no payload directory, no start state")
 
 
+def test_bench_blind(tmp: Path) -> None:
+    """bench_blind is true only on a failed positive control, null when unscored, false when all pass."""
+    tasks = [{"task_id": "pos_x", "kind": "lab", "family": "positive"},
+             {"task_id": "neg_x", "kind": "lab", "family": "negative"}]
+    plan = twin.plan(tasks, 2, 5)
+    tasks_f, plan_f = tmp / "bb-tasks.json", tmp / "bb-plan.json"
+    twin.write_json(tasks_f, tasks)
+    twin.write_json(plan_f, plan)
+
+    def run_report(name: str, reached_a: bool, only: set[str] | None = None) -> dict:
+        archive = tmp / f"bb-{name}"
+        archive.mkdir()
+        for r in plan["runs"]:
+            if only is not None and r["run_id"] not in only:
+                continue
+            reached = reached_a if r["arm"] == "A" else False
+            twin.write_json(archive / r["run_id"] / "meta.json",
+                            {**r, "reached": reached, "tokens_to_target": 1000 if reached else None,
+                             "killed": False, "tokens_total": 1000})
+        out = tmp / f"bb-{name}.json"
+        rc = twin.main(["report", "--tasks", str(tasks_f), "--plan", str(plan_f), "--archive", str(archive),
+                        "--cap", "100000", "--seed", "3", "--out", str(out)])
+        check(rc == 0, f"report CLI exits 0 ({name})")
+        return twin.read_json(out)
+
+    empty = run_report("empty", True, only=set())
+    check(empty["bench_blind"] is None and empty["positive_controls_incomplete"] == ["pos_x"],
+          "an empty archive leaves bench_blind unknown")
+    one_pos = {r["run_id"] for r in plan["runs"] if r["task_id"] == "pos_x"}
+    partial = run_report("partial", True, only=one_pos - {sorted(one_pos)[0]})
+    check(partial["bench_blind"] is None and partial["positive_controls_incomplete"] == ["pos_x"],
+          "a positive control missing a planned run leaves bench_blind unknown")
+    good = run_report("pass", True)
+    check(good["bench_blind"] is False and good["positive_controls_incomplete"] == [],
+          "a complete passing positive control gives bench_blind false")
+    bad = run_report("fail", False)
+    check(bad["bench_blind"] is True, "a failing positive control gives bench_blind true")
+    no_pos = [t for t in tasks if t["family"] != "positive"]
+    check(twin.bench_blind(no_pos, twin.plan(no_pos, 1, 5), {}, [])[1] is None,
+          "no planned positive control leaves bench_blind unknown")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -272,6 +314,7 @@ def main() -> int:
         test_hook(tmp)
         test_batch(tmp, tasks)
         test_real(tmp)
+        test_bench_blind(tmp)
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")
     return 1 if FAILED else 0
 
