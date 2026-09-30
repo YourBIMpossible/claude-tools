@@ -93,7 +93,14 @@ if ($cfg.Status -eq 'ok') {
     $needDash   = -not $env:GRAPHIFY_DASHBOARD_DIRS -and (-not $cfg.Parsed -or $cfg.DashboardDirsFailed)
     if ($needPython -or $needDash) {
         $lkg = $null
-        try { $lkg = Get-Content -LiteralPath $lkgPath -Raw -ErrorAction Stop | ConvertFrom-Json } catch {}
+        if (Test-Path -LiteralPath $lkgPath -PathType Leaf) {
+            try { $lkg = Get-Content -LiteralPath $lkgPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+            catch {
+                Log "last-known-good settings unreadable: $($_.Exception.Message)"
+                Add-Alert 'warn' 'lkg-unreadable' 'Saved last-known-good graphify settings could not be read.' `
+                    'Fix graphify.local.json; the next fully valid run rewrites the saved settings.' $_.Exception.Message | Out-Null
+            }
+        }
         if ($lkg) {
             if ($needPython -and $lkg.python_exe -is [string] -and $lkg.python_exe) { $python = $lkg.python_exe }
             if ($needDash) {
@@ -217,6 +224,15 @@ if ($latest -and $installed -and $latest -ne $installed) {
 
 # -- 4. emit ------------------------------------------------------------------
 
+# A configured dashboard folder that is gone would freeze the panel silently.
+$liveDashDirs = @()
+foreach ($dir in $dashDirs) {
+    if (Test-Path -LiteralPath $dir -PathType Container) { $liveDashDirs += $dir; continue }
+    Log "dashboard dir missing, graphify-health.js not written: $dir"
+    Add-Alert 'error' 'dashboard-dir-missing' 'A configured dashboard folder does not exist; its graphify panel is not updated.' `
+        'Fix dashboard_dirs in graphify.local.json or recreate the folder.' $dir | Out-Null
+}
+
 $errCount  = @($alerts | Where-Object { $_.severity -eq 'error' }).Count
 $warnCount = @($alerts | Where-Object { $_.severity -eq 'warn'  }).Count
 $status    = if ($errCount) { 'error' } elseif ($warnCount) { 'warn' } else { 'ok' }
@@ -236,31 +252,38 @@ $doc = [ordered]@{
     targets           = @(if ($h) { $h.last_run.targets })
 }
 
-# alerts.json: LOCAL, full detail (alert detail, target scan paths).
-ConvertTo-Json $doc -Depth 6 | Set-Content -Path $alertsOut -Encoding utf8
-
 # graphify-health.js: PUBLIC. Allowlist projection + independent leak guard;
 # a guard hit publishes an error stub instead (never leaves the stale file).
 # Written into each folder in dashboard_dirs (config) /
-# $env:GRAPHIFY_DASHBOARD_DIRS; empty = skip.
-if ($dashDirs.Count -gt 0) {
+# $env:GRAPHIFY_DASHBOARD_DIRS; empty = skip. Failures here are alerts too, so
+# alerts.json (written after) and the exit code agree.
+if ($liveDashDirs.Count -gt 0) {
     $pubJson = ConvertTo-Json (ConvertTo-GraphifyPublicHealth -Doc $doc) -Depth 6 -Compress
     $leaks = @(Test-GraphifyPublicSafe -Json $pubJson)
     if ($leaks.Count) {
         Log "public projection rejected ($($leaks -join ', ')); publishing error stub"
         $pubJson = ConvertTo-Json (New-GraphifyPublicRejectedStub -CheckedAt $doc.checked_at) -Depth 6 -Compress
-        $errCount++
+        Add-Alert 'error' 'public-rejected' 'The public health projection failed the leak guard; an error stub was published.' `
+            'Inspect alerts.json for the value that tripped the guard.' ($leaks -join ', ') | Out-Null
     }
     $js = 'window.GRAPHIFY_HEALTH = ' + $pubJson + ';'
-    foreach ($dir in $dashDirs) {
-        if (Test-Path -LiteralPath $dir -PathType Container) {
-            try { Set-Content -LiteralPath (Join-Path $dir 'graphify-health.js') -Value $js -Encoding utf8 }
-            catch { Log "could not write graphify-health.js to ${dir}: $($_.Exception.Message)"; $errCount++ }
-        } else {
-            Log "dashboard dir missing, graphify-health.js not written: $dir"
+    foreach ($dir in $liveDashDirs) {
+        try { Set-Content -LiteralPath (Join-Path $dir 'graphify-health.js') -Value $js -Encoding utf8 -ErrorAction Stop }
+        catch {
+            Log "could not write graphify-health.js to ${dir}: $($_.Exception.Message)"
+            Add-Alert 'error' 'dashboard-write-failed' 'graphify-health.js could not be written to a dashboard folder.' `
+                'Check folder permissions.' "${dir}: $($_.Exception.Message)" | Out-Null
         }
     }
+    $errCount  = @($alerts | Where-Object { $_.severity -eq 'error' }).Count
+    $warnCount = @($alerts | Where-Object { $_.severity -eq 'warn'  }).Count
+    $status    = if ($errCount) { 'error' } elseif ($warnCount) { 'warn' } else { 'ok' }
+    $doc.status = $status
+    $doc.alerts = $alerts
 }
+
+# alerts.json: LOCAL, full detail (alert detail, target scan paths).
+ConvertTo-Json $doc -Depth 6 | Set-Content -Path $alertsOut -Encoding utf8
 
 Log "status=$status errors=$errCount warns=$warnCount installed=$installed latest=$latest ($verSource)"
 
