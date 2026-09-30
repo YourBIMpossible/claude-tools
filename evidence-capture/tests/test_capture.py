@@ -149,7 +149,7 @@ def test_snapshot_clean_and_dirty(root: Path) -> None:
     fields, snap = snapshot.take_snapshot(repo, "cap_clean", st)
     assert snap["state"] == "complete", snap
     assert snap["dirty"] is False and fields["head"] == head(repo) and fields["branch"] == "main"
-    assert snapshot.snapshot_ok(st, "cap_clean")
+    assert not store.verify_sums(st.snapshots / "cap_clean")
     assert not (st.snapshots / "cap_clean" / "INCOMPLETE").exists()
     # dirty: staged + unstaged in one file, untracked, ignored
     (repo / "src" / "alpha.py").write_text("def alpha(x: int) -> int:\n    return x * 3 + 2\n", encoding="utf-8")
@@ -285,12 +285,12 @@ def test_snapshot_failed_is_final(root: Path) -> None:
         mf.refresh(m, owner={"X6": {"state": "no", "basis": "trust me"}, "X7": {"state": "no", "basis": "x"}})
         assert rule(m, "X6") == "yes" and not m["funnel"]["start_snapshot_complete"]
     # a later run with a clean tree does not repair: the same episode is never re-snapshotted
-    assert not snapshot.snapshot_ok(st, "cap_cap") and not snapshot.snapshot_ok(st, "cap_to")
+    assert not (st.snapshots / "cap_cap").exists() and not (st.snapshots / "cap_to").exists()
     _, ok = snapshot.take_snapshot(repo, "cap_ok", st)
     assert ok["state"] == "complete"
     _, again = snapshot.take_snapshot(repo, "cap_ok", st)
     assert again["state"] == "failed" and again["reason"] == "write_error", again  # never overwritten
-    assert snapshot.snapshot_ok(st, "cap_ok")
+    assert not store.verify_sums(st.snapshots / "cap_ok")
 
 
 def test_snapshot_atomic(root: Path) -> None:
@@ -302,7 +302,7 @@ def test_snapshot_atomic(root: Path) -> None:
     (d / "status.v2z").write_bytes(b"")
     (d / "INCOMPLETE").write_bytes(b"")
     store.write_sums(d)
-    assert not snapshot.snapshot_ok(st, "cap_killed")
+    assert store.verify_sums(d) == ["INCOMPLETE"]
     orphan = store.new_tmp_dir(st, "cap_orphan")
     (orphan / "INCOMPLETE").write_bytes(b"")
     old = time.time() - 7200
@@ -313,7 +313,7 @@ def test_snapshot_atomic(root: Path) -> None:
     _, ok = snapshot.take_snapshot(repo, "cap_v", st)
     assert ok["state"] == "complete"
     (st.snapshots / "cap_v" / "status.v2z").unlink()
-    assert not snapshot.snapshot_ok(st, "cap_v")
+    assert store.verify_sums(st.snapshots / "cap_v") == ["status.v2z"]
 
 
 def test_capture_without_ec_packet(root: Path) -> None:

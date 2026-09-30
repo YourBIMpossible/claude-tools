@@ -87,8 +87,12 @@ runs but is no longer planned. `pos_region` asked for a per-tenant change the re
 make per region, and `mis_old_copy` named the target file in its prompt; both were
 superseded after their first round.
 
-If either positive control fails, `report.json` sets `bench_blind`: the bench cannot
-see a brief that should help, and no real-prompt result is interpretable.
+If either positive control fails, `report.json` sets `bench_blind` to `true`: the bench
+cannot see a brief that should help, and no real-prompt result is interpretable. It is
+`false` only when every planned positive control ran all its repeats and passed. When no
+positive control failed but one is missing runs (listed in
+`positive_controls_incomplete`), or none is planned, it is `null`: unknown, which is not
+a pass.
 
 For real prompts the report gives, per prompt, the mean log ratio of A to B tokens to
 target, and over prompts the median ratio with a seeded bootstrap 95% interval.

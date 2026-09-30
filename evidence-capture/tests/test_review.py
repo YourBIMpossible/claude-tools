@@ -208,7 +208,7 @@ def test_round_trip_snapshot_payload_clone(root: Path) -> None:
     assert review.review_episode(st, m, inputs)["state"] == "materialized"
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "after the episode")
-    rec = clone_builder.clone_start_only(repo, start, root / "replay", review.payload_snapshot(st, m["episode_id"]))
+    rec = clone_builder.clone_start_only(repo, start, root / "replay", st.payloads / m["episode_id"] / "snapshot")
     assert rec["start_state_reconstructed"] is True, (rec["failed"], rec["error"])
     assert (root / "replay" / "todo.txt").read_text(encoding="utf-8") == "untracked at the start\n"
     assert (root / "replay" / "README.md").read_text(encoding="utf-8") == "# edited after staging\n"
@@ -230,7 +230,7 @@ def test_payload_never_overwritten(root: Path) -> None:
     res = review.review_episode(st, m, inputs)
     assert res["state"] == "held" and res["reason"] == "payload_conflict", res
     assert (squatter / "keep.txt").read_text(encoding="utf-8") == "pre-existing\n"
-    assert snapshot.snapshot_ok(st, ep), "the snapshot is untouched"
+    assert not store.verify_sums(st.snapshots / ep), "the snapshot is untouched"
     assert not reread(st, m)["funnel"]["payload_materialized"]
 
 

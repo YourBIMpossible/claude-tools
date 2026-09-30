@@ -89,21 +89,27 @@ def _latest_audit(stores: Stores) -> dict[str, Any] | None:
 
 
 def _isolation(stores: Stores) -> dict[str, Any]:
-    recs = []
+    """Records ``isolation.py --out <meta>/isolation/<name>.json`` wrote. A record that cannot
+    be read or holds no boolean ``passed`` is counted as unreadable, and as failed."""
+    recs, unreadable = [], 0
     for p in sorted((stores.meta / "isolation").glob("*.json")):
         try:
             rec = read_json(p)
         except (OSError, ValueError):
+            unreadable += 1
             continue
-        if isinstance(rec, dict) and "passed" in rec:
+        if isinstance(rec, dict) and isinstance(rec.get("passed"), bool):
             recs.append((p.name, rec))
-    out: dict[str, Any] = {"deterministic_checks_run": len(recs), "passed": sum(1 for _, r in recs if r["passed"]),
-                           "failed": sum(1 for _, r in recs if not r["passed"]), "identity": None,
-                           "acl_dump_sha256": None}
+        else:
+            unreadable += 1
+    out: dict[str, Any] = {"deterministic_checks_run": len(recs) + unreadable,
+                           "passed": sum(1 for _, r in recs if r["passed"]),
+                           "failed": sum(1 for _, r in recs if not r["passed"]) + unreadable,
+                           "unreadable": unreadable, "identity": None, "acl_dump_sha256": None}
     if recs:
         last = recs[-1][1]
         out["identity"] = last.get("identity")
-        out["acl_dump_sha256"] = sha256_bytes(canonical(last.get("icacls") or {}))
+        out["acl_dump_sha256"] = sha256_bytes(canonical(last.get("icacls") or {}).encode("utf-8"))
     return out
 
 
@@ -308,6 +314,13 @@ def _meta_head(stores: Stores) -> str | None:
         return None
 
 
+def _isolation_line(iso_: dict[str, Any]) -> str:
+    if not iso_["deterministic_checks_run"]:
+        return "Isolation: no check recorded (not verified)."
+    return (f"Isolation: {iso_['passed']} passed / {iso_['failed']} failed "
+            f"({iso_['unreadable']} unreadable record(s) counted as failed).")
+
+
 def render_markdown(ck: dict[str, Any]) -> str:
     c, d, f = ck["checkpoint"], ck["denominator"], ck["funnel"]
     lines = [f"# Capture checkpoint {c['n']}", "",
@@ -331,7 +344,7 @@ def render_markdown(ck: dict[str, Any]) -> str:
               f"FN audit: n={fa['n']}, misses {fa['misses_total']}, 95% interval {fa['interval_95']}, "
               f"sealed {fa['labels_sealed']}; case-by-case reviews recorded {fa['case_by_case_reviews_recorded']}.", "",
               f"Content store: {ck['content_store']}.", f"Integrity: {ck['integrity']}.",
-              f"Isolation: {ck['isolation']['passed']} passed / {ck['isolation']['failed']} failed.", "",
+              _isolation_line(ck["isolation"]), "",
               "Twin: 0 paid replays, 0 tokens. Model probes: not authorized, 0 runs.", ""]
     for note in ck.get("notes", []):
         lines.append(f"- {note}")

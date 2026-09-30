@@ -10,6 +10,7 @@ Synthetic example — contains no private repository data or production findings
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -328,9 +329,14 @@ def test_fs_isolation_deterministic(root: Path) -> None:
     (st.content / "SENTINEL").write_bytes(b"content-store sentinel\n")
     tmp = st.content / "tmp"
     tmp.mkdir(exist_ok=True)
-    targets = isolation.standard_targets(
-        source_file=src / "src" / "a.py", source_git_objects=src / ".git" / "objects", meta_repo=st.meta,
-        content_sentinel=st.content / "SENTINEL", content_tmp=tmp, sibling_worktree=root / "repos" / "sibling")
+    targets = [  # the six attempts plan §8 names, in its order
+        {"name": "source_file", "kind": "read", "path": str(src / "src" / "a.py")},
+        {"name": "metadata_repo", "kind": "list", "path": str(st.meta)},
+        {"name": "content_sentinel", "kind": "read", "path": str(st.content / "SENTINEL")},
+        {"name": "content_tmp", "kind": "write", "path": str(tmp)},
+        {"name": "source_git_objects", "kind": "open_dir", "path": str(src / ".git" / "objects")},
+        {"name": "sibling_worktree", "kind": "resolve", "path": str(root / "repos" / "sibling")},
+    ]
     watch = [src, root / "repos" / "sibling", st.meta, st.content]
     repos = [src, root / "repos" / "sibling", st.meta]
 
@@ -356,6 +362,96 @@ def test_fs_isolation_deterministic(root: Path) -> None:
     # the deny ACE is gone afterwards
     assert (src / "src" / "a.py").read_bytes() == b"x = 1\n"
     assert os.listdir(st.meta)
+
+
+def test_isolation_cli_unobserved_state_fails(root: Path) -> None:
+    """Slop audit M7: an empty watch set is an error, and a store or repository the check
+    cannot read (missing path, git failure) fails it instead of comparing equal to itself."""
+    src = root / "source"
+    src.mkdir()
+    git(src, "init", "-q", "-b", "main")
+    (src / "a.py").write_bytes(b"x = 1\n")
+    git(src, "add", "-A")
+    git(src, "commit", "-q", "-m", "one")
+    plain = root / "not-a-repo"
+    plain.mkdir()
+    spec = root / "targets.json"
+    spec.write_text(json.dumps([{"name": "source_file", "kind": "read", "path": str(src / "a.py")}]),
+                    encoding="utf-8")
+    out = root / "record.json"
+    base = ["--targets", str(spec), "--out", str(out)]
+
+    for extra in ([], ["--watch", str(src)], ["--repo", str(src)]):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                isolation.main(base + extra)
+                raise AssertionError(f"an empty watch set was accepted: {extra}")
+            except SystemExit as exc:
+                assert exc.code == 2, exc.code
+        assert "nothing to check" in err.getvalue(), err.getvalue()
+
+    def run(*extra: str) -> tuple[int, dict]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = isolation.main(base + list(extra))
+        return rc, json.loads(out.read_text(encoding="utf-8"))
+
+    # readable watch and repository: observed on both sides (the target read still fails the check)
+    rc, rec = run("--watch", str(src), "--repo", str(src))
+    assert rc == 1 and rec["state_unreadable"] == [] and rec["failures"] == ["source_file:succeeded"], rec["failures"]
+    # a mistyped store path is unobserved, not unchanged
+    rc, rec = run("--watch", str(root / "nope"), "--repo", str(src))
+    assert rc == 1 and rec["passed"] is False
+    assert [f.split(":", 2)[:2] for f in rec["state_unreadable"]] == [["before", "walk"], ["after", "walk"]], rec
+    assert set(rec["state_unreadable"]) <= set(rec["failures"])
+    # git status failing on a repository is unobserved, not unchanged
+    rc, rec = run("--watch", str(src), "--repo", str(plain))
+    assert rc == 1 and rec["passed"] is False
+    assert [f.split(":", 2)[:2] for f in rec["state_unreadable"]] == [["before", "status"], ["after", "status"]], rec
+    assert "rc=128" in rec["state_unreadable"][0], rec["state_unreadable"]
+
+
+# (git subcommand words, the proof whose command it is): each proof command, made to fail
+INJECTED_GIT_FAILURES = {
+    ("stash", "list"): "P2", ("symbolic-ref", "-q"): "P2", ("reflog", "show"): "P3",
+    ("config", "--local", "--list"): "P4", ("rev-parse", "-q", "--verify"): "P5",
+    ("grep", "-c"): "P6", ("log", "--all", "--reflog", "--format=%H"): "P6",
+    ("config", "--list", "--show-origin"): "P7",
+}
+
+
+@contextlib.contextmanager
+def _git_fails(words: tuple[str, ...]):
+    """Every git call whose arguments after ``-C <dir>`` start with ``words`` exits 128 with no output."""
+    real = subprocess.run
+
+    def fake(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if isinstance(cmd, list) and cmd[:1] == ["git"]:
+            rest = cmd[3:] if cmd[1:2] == ["-C"] else cmd[1:]
+            if tuple(rest[:len(words)]) == words:
+                return subprocess.CompletedProcess(cmd, 128, b"", b"fatal: injected failure")
+        return real(cmd, *args, **kwargs)
+
+    subprocess.run = fake  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        subprocess.run = real  # type: ignore[assignment]
+
+
+def test_clone_proof_git_failure_fails(root: Path) -> None:
+    """Slop audit L9: a proof whose git command fails (empty output) must not read as clean."""
+    at = snap_at_start(root, dirty_mixed)
+    src, start, sentinels = build_source(root, at, post_commits=3)
+    observed = {}
+    for i, (words, proof) in enumerate(sorted(INJECTED_GIT_FAILURES.items())):
+        with _git_fails(words):
+            rec = cb.clone_start_only(src, start, root / f"f{i}" / "repo", at.snapshot, sentinels)
+        observed[" ".join(words)] = (rec["start_state_reconstructed"], rec["error"] or "")
+        assert rec["start_state_reconstructed"] is False, (words, proof)
+        assert "CloneError" in (rec["error"] or "") and "rc=128" in rec["error"], (words, rec["error"])
+        assert proof in rec["failed"], (words, rec["failed"])
+    clean = cb.clone_start_only(src, start, root / "clean" / "repo", at.snapshot, sentinels)
+    assert clean["start_state_reconstructed"] is True, (clean["failed"], clean["error"])
 
 
 def _can_symlink(root: Path) -> bool:

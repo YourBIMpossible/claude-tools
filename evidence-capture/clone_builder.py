@@ -78,14 +78,17 @@ def _env() -> dict[str, str]:
 
 
 def _run(cwd: Path | None, *args: str, input_: bytes | None = None, check: bool = True,
-         log: list[dict[str, Any]] | None = None) -> subprocess.CompletedProcess[bytes]:
+         ok: tuple[int, ...] = (0,), log: list[dict[str, Any]] | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run git. With ``check`` any exit code outside ``ok`` raises ``CloneError``; ``ok`` names
+    the codes a command uses for an answer (``symbolic-ref -q``: 1 = detached), never for a
+    failure. ``check=False`` is for callers that branch on the code themselves."""
     cmd = ["git", *(("-C", str(cwd)) if cwd else ()), *args]
     proc = subprocess.run(cmd, input=input_, capture_output=True, timeout=GIT_TIMEOUT_S, env=_env())
     if log is not None:
         log.append({"cmd": ["git", *args], "rc": proc.returncode,
                     "stderr": proc.stderr.decode("utf-8", "replace").strip()[-300:]})
-    if check and proc.returncode != 0:
-        raise CloneError(f"git {' '.join(args[:3])} failed: {proc.stderr.decode('utf-8', 'replace').strip()[:300]}")
+    if check and proc.returncode not in ok:
+        raise CloneError(f"git {' '.join(args[:3])} failed rc={proc.returncode}: {proc.stderr.decode('utf-8', 'replace').strip()[:300]}")
     return proc
 
 
@@ -143,7 +146,7 @@ def build_clone(source: Path, start_sha: str, dest: Path, *, core_config: dict[s
         _run(dest, "config", "core.logAllRefUpdates", "false", log=log)
         for key, value in (core_config or {}).items():
             if value is None:
-                _run(dest, "config", "--local", "--unset-all", key, check=False, log=log)
+                _run(dest, "config", "--local", "--unset-all", key, ok=(0, 5), log=log)  # 5: key was not set
             else:
                 _run(dest, "config", "--local", key, value, log=log)
         if "leave_remote" not in sab:
@@ -244,8 +247,8 @@ def p1(dest: Path, start_objects: set[str], start_commits: set[str]) -> dict[str
 def p2(dest: Path, start_sha: str) -> dict[str, Any]:
     refs = _lines(_out(dest, "for-each-ref"))
     tags = _lines(_out(dest, "tag", "-l"))
-    stash = _lines(_run(dest, "stash", "list", check=False).stdout)
-    symbolic = _run(dest, "symbolic-ref", "-q", "HEAD", check=False).returncode == 0
+    stash = _lines(_out(dest, "stash", "list"))
+    symbolic = _run(dest, "symbolic-ref", "-q", "HEAD", ok=(0, 1)).returncode == 0
     head = _out(dest, "rev-parse", "HEAD").decode().strip()
     packed = (dest / ".git" / "packed-refs")
     packed_refs = [ln for ln in packed.read_text(encoding="utf-8").splitlines()
@@ -256,7 +259,7 @@ def p2(dest: Path, start_sha: str) -> dict[str, Any]:
 
 
 def p3(dest: Path) -> dict[str, Any]:
-    shown = _lines(_run(dest, "reflog", "show", "--all", check=False).stdout)
+    shown = _lines(_out(dest, "reflog", "show", "--all"))
     logs = dest / ".git" / "logs"
     nonempty = [str(p.relative_to(logs)).replace("\\", "/") for p in logs.rglob("*")
                 if p.is_file() and p.stat().st_size > 0] if logs.exists() else []
@@ -268,7 +271,7 @@ def p4(dest: Path) -> dict[str, Any]:
     alternates = (gitdir / "objects" / "info" / "alternates").exists() or \
         (gitdir / "objects" / "info" / "http-alternates").exists()
     worktrees = (gitdir / "worktrees").exists()
-    local = _lines(_run(dest, "config", "--local", "--list", check=False).stdout)
+    local = _lines(_out(dest, "config", "--local", "--list"))
     shared = [ln for ln in local if ln.lower().startswith(("core.sharedrepository", "gc."))]
     count = _lines(_out(dest, "count-objects", "-v"))
     alt_line = [ln for ln in count if ln.startswith("alternate:")]
@@ -288,7 +291,7 @@ def p5(dest: Path, post: set[str], post_commits: set[str]) -> dict[str, Any]:
         present = [ln.split(" ", 1)[0] for ln in _lines(out) if not ln.endswith(" missing")]
 
     def resolves(sha: str) -> bool:
-        return _run(dest, "rev-parse", "-q", "--verify", f"{sha}^{{object}}", check=False).returncode == 0
+        return _run(dest, "rev-parse", "-q", "--verify", f"{sha}^{{object}}", ok=(0, 1)).returncode == 0
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         resolved = [sha for sha, ok in zip(sorted(post_commits), pool.map(resolves, sorted(post_commits))) if ok]
@@ -315,11 +318,10 @@ def p6(dest: Path, sentinels: list[str]) -> dict[str, Any]:
     commits = _lines(_out(dest, "rev-list", "--all", "--reflog", "HEAD"))
     grep_hits, log_hits = [], []
     for s in sentinels:
-        g = _run(dest, "grep", "-c", "-F", s, *commits, check=False) if commits else None
+        g = _run(dest, "grep", "-c", "-F", s, *commits, ok=(0, 1)) if commits else None
         if g is not None and g.returncode == 0 and g.stdout.strip():
             grep_hits.append(s)
-        lg = _run(dest, "log", "--all", "--reflog", "--format=%H", f"-S{s}", check=False)
-        if lg.stdout.strip():
+        if _out(dest, "log", "--all", "--reflog", "--format=%H", f"-S{s}").strip():
             log_hits.append(s)
     wt = _worktree_hits(dest, raw)
     return _proof(bool(sentinels) and not (in_objects or grep_hits or log_hits or wt), sentinels=len(sentinels),
@@ -328,9 +330,9 @@ def p6(dest: Path, sentinels: list[str]) -> dict[str, Any]:
 
 
 def p7(dest: Path) -> dict[str, Any]:
-    local = _lines(_run(dest, "config", "--local", "--list", check=False).stdout)
+    local = _lines(_out(dest, "config", "--local", "--list"))
     bad = [ln for ln in local if P7_FORBIDDEN.match(ln)]
-    everything = _lines(_run(dest, "config", "--list", "--show-origin", check=False).stdout)
+    everything = _lines(_out(dest, "config", "--list", "--show-origin"))
     machine = [ln for ln in everything if P7_FORBIDDEN.match(ln.split("\t", 1)[-1]) and "file:.git/config" not in ln]
     return _proof(not bad, local_forbidden=bad, machine_level_recorded=machine)
 
@@ -471,7 +473,7 @@ def reconstruct(dest: Path, snapshot: Path) -> dict[str, Any]:
     readable = _run(dest, "ls-files", "--stage", "-z", check=False)
     if readable.returncode == 0:
         info["index_install"] = "index.bin"
-        _run(dest, "update-index", "--no-untracked-cache", "--no-fsmonitor", check=False)
+        _run(dest, "update-index", "--no-untracked-cache", "--no-fsmonitor")
     else:
         index.unlink()
         _run(dest, "read-tree", "--empty")
@@ -496,7 +498,9 @@ def reconstruct(dest: Path, snapshot: Path) -> dict[str, Any]:
         _write_entry(dest, entry, snapshot / "untracked", symlinks)
         info["untracked"] += 1
     _prune_empty_dirs(dest)
-    _run(dest, "update-index", "-q", "--refresh", check=False)
+    # rc 1 answers "entries still need a merge or update" (a captured conflict); P9 compares
+    # the resulting status, so only a failure beyond that answer raises.
+    _run(dest, "update-index", "-q", "--refresh", ok=(0, 1))
     return info
 
 
@@ -558,7 +562,7 @@ def clone_start_only(source: Path, start_sha: str, dest: Path, snapshot: Path | 
         record["commands"] = build_clone(source, start_sha, dest, core_config=cfg, sabotage=sabotage)
         record["proofs"] = prove_clone(source, start_sha, dest, sentinels)
         if cfg is not None:
-            effective = {k: (_run(dest, "config", "--get", k, check=False).stdout.decode().strip() or None)
+            effective = {k: (_run(dest, "config", "--get", k, ok=(0, 1)).stdout.decode().strip() or None)
                          for k in cfg}
             record["core_config_effective"] = effective
         if snapshot is None:

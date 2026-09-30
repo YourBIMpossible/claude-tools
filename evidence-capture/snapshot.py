@@ -439,9 +439,3 @@ def take_snapshot(repo: Path, episode: str, stores: Stores, *, budget_s: float =
             rmtree(tmp)
         snap["elapsed_ms"] = dl.elapsed_ms()
     return repo_fields, snap
-
-
-def snapshot_ok(stores: Stores, episode: str) -> bool:
-    """A snapshot directory that is present, complete and byte-verified."""
-    d = stores.snapshots / episode
-    return d.is_dir() and not (d / "INCOMPLETE").exists() and not verify_sums(d)

@@ -360,11 +360,6 @@ def decide(stores: Stores, m: dict[str, Any], inputs: ReviewInputs | None) -> tu
 
 # ---------------------------------------------------------------------- payload
 
-def payload_snapshot(stores: Stores, episode: str) -> Path:
-    """The snapshot inside a materialized payload (what the clone builder reads)."""
-    return stores.payloads / episode / "snapshot"
-
-
 def materialize_payload(stores: Stores, m: dict[str, Any], inputs: ReviewInputs, privacy: dict[str, Any],
                         now: str) -> dict[str, Any]:
     """Stage the payload in ``tmp/``, moving the snapshot in, then rename into place.

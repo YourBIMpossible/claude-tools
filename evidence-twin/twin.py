@@ -577,6 +577,22 @@ def init_drift(metas: dict[tuple[str, str], list[dict]]) -> dict[str, list[str]]
     return dict(sorted(sets.items())) if len({tuple(v) for v in sets.values()}) > 1 else {}
 
 
+def bench_blind(tasks: list[dict], plan_obj: dict, lab: dict, missing: list[str]) -> tuple[list[str], bool | None]:
+    """Positive controls without every planned run, and the verdict: True when a scored
+    positive control failed, None (unknown) when none failed but one is not fully scored
+    or none is planned, False only when every planned positive control ran and passed."""
+    missing_tasks = {r["task_id"] for r in plan_obj["runs"] if r["run_id"] in missing}
+    planned = {r["task_id"] for r in plan_obj["runs"]}
+    positives = sorted(t["task_id"] for t in tasks
+                       if t["kind"] == "lab" and t["family"] == "positive" and t["task_id"] in planned)
+    incomplete = [tid for tid in positives if tid not in lab or tid in missing_tasks]
+    if any(lab[tid]["pass"] is False for tid in positives if tid in lab):
+        return incomplete, True
+    if incomplete or not positives:
+        return incomplete, None
+    return incomplete, False
+
+
 def report(tasks: list[dict], plan_obj: dict, archive: Path, cap: int, seed: int) -> dict:
     metas: dict[tuple[str, str], list[dict]] = {}
     missing = []
@@ -608,8 +624,7 @@ def report(tasks: list[dict], plan_obj: dict, archive: Path, cap: int, seed: int
                                   "tokens_total_B": [m["tokens_total"] for m in b]}
     summary: dict[str, Any] = {"cap": cap, "missing_runs": missing, "lab": lab, "real": real,
                                "guardrail": guard, "init_drift": init_drift(metas)}
-    positives = [v for v in lab.values() if v["family"] == "positive"]
-    summary["bench_blind"] = bool(positives) and not all(v["pass"] for v in positives)
+    summary["positive_controls_incomplete"], summary["bench_blind"] = bench_blind(tasks, plan_obj, lab, missing)
     logs = [v["mean_log_ratio"] for v in real.values()]
     if logs:
         lo, hi = bootstrap_median_ci(logs, seed) if len(logs) > 1 else (logs[0], logs[0])
