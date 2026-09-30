@@ -198,7 +198,7 @@ def test_failure_paths_block() -> None:
         put(wt, f"b_{PB}.json", packet(PB))
 
         def fail_packets(target: Path, data: bytes) -> None:
-            if target.parent.name == "packets":
+            if target.name.startswith("ep_"):  # staged packet copies
                 raise OSError("disk full (injected)")
             real_write(target, data)
 
@@ -213,7 +213,7 @@ def test_failure_paths_block() -> None:
               "failure receipt records the errors")
 
         def corrupt(target: Path, data: bytes) -> None:
-            real_write(target, data[:-1] if target.parent.name == "packets" else data)
+            real_write(target, data[:-1] if target.name.startswith("ep_") else data)
 
         ev._write_exclusive = corrupt
         try:
@@ -222,11 +222,68 @@ def test_failure_paths_block() -> None:
             ev._write_exclusive = real_write
         check(not r.safe_to_remove and all("does not match" in f.detail for f in r.files),
               "post-copy hash mismatch -> not safe")
+        check(not list((tmp / "a2" / "packets").glob("*.json")),
+              "a copy that fails verification never appears under packets/")
+        check(not list((tmp / "a2" / "staging").iterdir()), "failed staging copies are discarded")
+        r = ev.evacuate(wt, tmp / "a2", apply=True)
+        check(r.safe_to_remove and r.counts().get("copied") == 2,
+              "the next run re-copies what the failed run could not verify")
 
         (wt / ev.PACKETS_REL / "nested").mkdir()
         r = ev.evacuate(wt, tmp / "a3", apply=True)
         check(not r.safe_to_remove and r.counts().get("unsupported") == 1,
               "unexpected subdirectory blocks safe_to_remove")
+
+
+def test_interrupted_write_is_retried() -> None:
+    print("interrupted write")
+    real_write = ev._write_exclusive
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt = make_worktree(tmp)
+        put(wt, f"a_{PA}.json", packet(PA))
+
+        def killed(target: Path, data: bytes) -> None:
+            real_write(target, data[: len(data) // 2])
+            raise KeyboardInterrupt  # stands in for the process being killed mid-write
+
+        ev._write_exclusive = killed
+        try:
+            ev.evacuate(wt, tmp / "arch", apply=True)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            ev._write_exclusive = real_write
+        check(not (tmp / "arch" / "packets" / f"{PA}.json").exists(),
+              "a killed write leaves no archived path behind")
+        code, out = run_cli("evacuate", str(wt), "--archive", str(tmp / "arch"), "--apply")
+        check(code == 0 and "safe_to_remove: true" in out, "the next run copies it and is safe")
+        check(len(list((tmp / "arch" / "staging").glob("ep_*.part"))) == 1,
+              "the killed run's partial copy stays inert under staging/")
+
+
+def test_concurrent_publish_is_a_duplicate() -> None:
+    print("concurrent publish")
+    real_write = ev._write_exclusive
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt = make_worktree(tmp)
+        put(wt, f"a_{PA}.json", packet(PA))
+        archive = tmp / "arch"
+
+        def racing(target: Path, data: bytes) -> None:
+            real_write(target, data)
+            if target.name.startswith("ep_"):  # another run wins the packet publish race
+                real_write(archive / "packets" / f"{PA}.json", data)
+
+        ev._write_exclusive = racing
+        try:
+            r = ev.evacuate(wt, archive, apply=True)
+        finally:
+            ev._write_exclusive = real_write
+        check(r.safe_to_remove and r.files[0].action == "duplicate",
+              "losing the publish race to an identical copy is a verified duplicate")
+        check(not list((archive / "staging").iterdir()), "the losing staging copy is discarded")
 
 
 def test_refusals() -> None:
@@ -265,6 +322,12 @@ def test_no_store() -> None:
 def test_scope_guards() -> None:
     print("scope guards")
     src = Path(ev.__file__).read_text(encoding="utf-8")
+    # The one permitted deletion: _discard_staged, which refuses anything outside staging/.
+    start = src.index("def _discard_staged(")
+    end = src.index("\ndef ", start + 1)
+    discard, src = src[start:end], src[:start] + src[end:]
+    check("part.parent != staging" in discard and discard.count("os.unlink(") == 1,
+          "the only deletion is a guarded staging discard")
     for banned in ("unlink(", "rmtree", "os.remove", "worktree remove", "push", ".jsonl", "urlopen"):
         check(banned not in src, f"helper source never uses {banned!r}")
 
@@ -272,7 +335,8 @@ def test_scope_guards() -> None:
 def main() -> int:
     for test in (test_dry_run_writes_nothing, test_new_packets_copied_and_source_untouched,
                  test_duplicates, test_conflicting_ids_block, test_malformed_quarantined,
-                 test_verify_pass_and_tamper, test_failure_paths_block, test_refusals,
+                 test_verify_pass_and_tamper, test_failure_paths_block, test_interrupted_write_is_retried,
+                 test_concurrent_publish_is_a_duplicate, test_refusals,
                  test_no_store, test_scope_guards):
         test()
     print(f"\n{PASSED} passed, {FAILED} failed")
