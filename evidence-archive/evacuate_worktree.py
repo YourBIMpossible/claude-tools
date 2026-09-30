@@ -19,7 +19,9 @@ Archive layout:
 
 A copy is written and hash-verified under staging/, then hard-linked into place, so an
 archived path only ever holds a complete, verified copy: a run killed mid-write leaves
-nothing under packets/ or quarantine/, and the next run copies the file again.
+nothing under packets/ or quarantine/, and the next run copies the file again. A staged
+copy that cannot be removed after publishing is counted in the report notes; it does not
+turn a published, verified copy into a failure.
 
 Guarantees: it never deletes or modifies source files, never removes worktrees, never
 overwrites an archived file, deletes nothing but its own staging/ copies, never touches transcripts, and never talks to a network or
@@ -52,7 +54,8 @@ PACKET_ID_RE = re.compile(r"^ep_[0-9a-f]{8,64}$")
 COPIED, DUPLICATE, QUARANTINED = "copied", "duplicate", "quarantined"
 WOULD_COPY, WOULD_QUARANTINE = "would_copy", "would_quarantine"  # dry run only
 CONFLICT, ERROR, UNSUPPORTED = "conflict", "error", "unsupported"
-BLOCKING = {CONFLICT, ERROR, UNSUPPORTED}
+INCOMPLETE = "incomplete"  # published under the archive, but the source re-check did not finish
+BLOCKING = {CONFLICT, ERROR, UNSUPPORTED, INCOMPLETE}
 
 
 class Refusal(Exception):
@@ -69,6 +72,7 @@ class FileResult:
     archive_path: str | None = None
     verified: bool = False
     detail: str = ""
+    staging_left: str | None = None  # this run's staged copy that could not be removed
 
 
 @dataclass
@@ -168,11 +172,26 @@ def _discard_staged(part: Path, staging: Path) -> None:
     os.unlink(part)
 
 
+def _note(result: FileResult, text: str) -> None:
+    result.detail = f"{result.detail}; {text}" if result.detail else text
+
+
+def _cleanup_staged(part: Path, staging: Path, result: FileResult) -> None:
+    """Remove this run's staged copy if it exists; a failure is recorded on the result."""
+    try:
+        _discard_staged(part, staging)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        result.staging_left = part.as_posix()
+        _note(result, f"staged copy left in staging/: {type(exc).__name__}")
+
+
 def _match_existing(target: Path, digest: str, result: FileResult) -> None:
     """Record whether an already-archived target holds exactly this content."""
     if sha256_bytes(target.read_bytes()) == digest:
         result.action = DUPLICATE if result.action != QUARANTINED else QUARANTINED
-        result.detail = (result.detail + "; " if result.detail else "") + "already archived, identical"
+        _note(result, "already archived, identical")
         result.verified = True
     else:
         result.action = CONFLICT
@@ -199,19 +218,23 @@ def _archive_one(src: Path, raw: bytes, digest: str, target: Path, apply: bool,
         try:
             os.link(part, target)  # atomic, and fails rather than overwrite
         except FileExistsError:
-            _discard_staged(part, staging)
+            _cleanup_staged(part, staging, result)
             _match_existing(target, digest, result)  # a concurrent run archived it first
             return
-        _discard_staged(part, staging)
-    except OSError as exc:
+    except OSError as exc:  # nothing was published under target
         result.action, result.detail = ERROR, f"copy failed: {type(exc).__name__}: {exc}"
-        try:
-            if part.exists():
-                _discard_staged(part, staging)  # a failed write leaves no partial copy
-        except OSError as cleanup:
-            result.detail += f"; staged copy left in staging/: {type(cleanup).__name__}"
+        _cleanup_staged(part, staging, result)  # a failed write leaves no partial copy
         return
-    if sha256_bytes(src.read_bytes()) != digest:
+    # Published: target holds the verified staged bytes whatever happens below.
+    _cleanup_staged(part, staging, result)
+    try:
+        source_now = sha256_bytes(src.read_bytes())
+    except OSError as exc:
+        result.action = INCOMPLETE
+        _note(result, f"published, but the source could not be re-read to verify it: "
+                      f"{type(exc).__name__}: {exc}")
+        return
+    if source_now != digest:
         result.action, result.detail = ERROR, "source changed during evacuation"
         return
     result.verified = True
@@ -270,6 +293,10 @@ def evacuate(worktree: Path, archive: Path, apply: bool) -> Report:
             if not apply and not target.exists() and res.action in (COPIED, QUARANTINED):
                 res.action = WOULD_COPY if res.action == COPIED else WOULD_QUARANTINE
             report.files.append(res)
+        left = [f for f in report.files if f.staging_left]
+        if left:
+            report.reasons.append(f"{len(left)} staged copy(ies) could not be removed from staging/; "
+                                  f"archived copies are unaffected: {[f.staging_left for f in left]}")
         after = sorted(p.name for p in packets_dir.iterdir())
         if after != before:
             report.reasons.append("packet store changed during the run; re-run before removing")
@@ -324,7 +351,7 @@ def _print_report(report: Report) -> None:
     print(f"  archive: {report.archive}")
     print(f"  files: {len(report.files)} {report.counts()}")
     for f in report.files:
-        if f.action in BLOCKING or f.action in (QUARANTINED, WOULD_QUARANTINE):
+        if f.action in BLOCKING or f.action in (QUARANTINED, WOULD_QUARANTINE) or f.staging_left:
             print(f"  {f.action}: {f.source} ({f.detail})")
     for r in report.reasons:
         print(f"  note: {r}")
