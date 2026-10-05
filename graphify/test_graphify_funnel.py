@@ -5,12 +5,17 @@ Run: python test_graphify_funnel.py
 """
 from __future__ import annotations
 
+import io
 import json
+import math
+import os
 import tempfile
 import textwrap
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import graphify_funnel as gf
 
@@ -123,7 +128,7 @@ class FunnelCase(unittest.TestCase):
         self.projects = self.root / "projects"
         self.log = self.root / "queries.log"
         self.log.write_text("", encoding="utf-8")
-        self.cfg: dict = {"targets": [{"repo": str(self.repo)}],
+        self.cfg: dict = {"skill_scripts": str(self.root), "targets": [{"repo": str(self.repo)}],
                           # fixtures live in the temp dir, so keep that rule off here
                           "funnel": {"exclude_sessions": {}, "exclude_temp_cwd": False}}
 
@@ -139,10 +144,17 @@ class FunnelCase(unittest.TestCase):
         with self.log.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
 
-    def run_funnel(self) -> dict:
-        sessions = gf.discover_sessions(self.projects, SINCE, UNTIL)
-        records = gf.load_log(self.log, SINCE, UNTIL)
-        return gf.analyse(sessions, records, self.resolver, self.cfg, SINCE, UNTIL)
+    def run_funnel(self, log: Path | None = None) -> dict:
+        scan = gf.discover_sessions(self.projects, SINCE, UNTIL)
+        records = gf.load_log(self.log if log is None else log, SINCE, UNTIL)
+        cfg = gf.parse_config(self.cfg, self.root)
+        return gf.analyse(scan, records, self.resolver, cfg, SINCE, UNTIL)
+
+    def write_cfg(self, cfg: dict, folder: Path | None = None) -> Path:
+        path = (folder or self.root) / "graphify.local.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        return path
 
 
 class Routing(FunnelCase):
@@ -364,7 +376,278 @@ class Cli(FunnelCase):
     def test_missing_skill_scripts_is_a_clean_error(self):
         cfg_path = self.root / "graphify.local.json"
         cfg_path.write_text("{}", encoding="utf-8")
-        self.assertEqual(gf.main(["--config", str(cfg_path), "--projects", str(self.projects)]), 2)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(gf.main(["--config", str(cfg_path), "--projects", str(self.projects)]), 2)
+        self.assertIn("skill_scripts is missing", err.getvalue())
+
+
+class UntimedLatency(FunnelCase):
+    """M1: a reranked record without a numeric, finite duration_ms is untimed, never 0 ms."""
+
+    UNTIMED = {"absent": ..., "null": None, "string": "9000", "true": True, "false": False,
+               "nan": math.nan, "inf": math.inf, "negative": -5}
+
+    def _raw(self, question: str, at: datetime, duration) -> None:
+        rec = {"ts": at.isoformat(), "kind": "query", "question": question, "nodes_returned": 5,
+               "rerank": True, "via": "wrapper"}
+        if duration is not ...:
+            rec["duration_ms"] = duration
+        with self.log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")      # NaN/Infinity tokens: json.loads accepts them
+
+    def _session(self, timed: int, timed_ms: float, untimed: list) -> dict:
+        t = Transcript(self.repo)
+        for i in range(timed):
+            t.query(f"t{i}")
+            self._raw(f"t{i}", t.t, timed_ms)
+        for i, d in enumerate(untimed):
+            t.query(f"u{i}")
+            self._raw(f"u{i}", t.t, d)
+        t.write(self.projects, "p", "s-lat")
+        return self.run_funnel()["measurement"]
+
+    def test_each_untimed_form_is_insufficient(self):
+        for label, d in self.UNTIMED.items():
+            with self.subTest(duration=label):
+                self.log.write_text("", encoding="utf-8")
+                m = self._session(0, 0, [d] * gf.MIN_RERANKED)
+                self.assertEqual(m["verdict"], gf.INSUFFICIENT)
+                self.assertEqual((m["reranked"]["n"], m["reranked"]["timed"], m["reranked"]["untimed"]),
+                                 (gf.MIN_RERANKED, 0, gf.MIN_RERANKED))
+                self.assertIsNone(m["reranked"]["median_ms"])
+
+    def test_untimed_records_do_not_fill_the_sample(self):
+        m = self._session(gf.MIN_RERANKED - 1, 800, list(self.UNTIMED.values()))
+        self.assertEqual(m["verdict"], gf.INSUFFICIENT)
+        self.assertEqual(m["reranked"]["timed"], gf.MIN_RERANKED - 1)
+
+    def test_untimed_records_do_not_pull_latency_down(self):
+        m = self._session(gf.MIN_RERANKED, 3500, [None] * (3 * gf.MIN_RERANKED))
+        self.assertEqual(m["verdict"], gf.FAIL)
+        self.assertEqual(m["reranked"]["median_ms"], 3500)
+
+    def test_incomplete_log_is_insufficient_even_with_timed_records(self):
+        t = Transcript(self.repo)
+        for i in range(gf.MIN_RERANKED):
+            t.query(f"t{i}")
+            self._raw(f"t{i}", t.t, 800)
+        t.write(self.projects, "p", "s-lat")
+        real_iter = gf.iter_json_lines
+
+        def cut_short(path, stats):
+            # Every record is read, then the read fails: a partial log is still no evidence.
+            yield from real_iter(path, stats)
+            if path == self.log:
+                stats.error = "OSError: read interrupted"
+        with mock.patch.object(gf, "iter_json_lines", side_effect=cut_short):
+            out = self.run_funnel()
+        m = out["measurement"]
+        self.assertEqual(m["reranked"]["timed"], gf.MIN_RERANKED)
+        self.assertEqual((m["verdict"], m["log_status"]), (gf.INSUFFICIENT, "unreadable"))
+        self.assertIn("read interrupted", out["inputs"]["query_log"]["error"])
+        self.assertIn("query log unreadable", gf.render(out))
+
+    def test_unopenable_log_is_reported(self):
+        real_open = Path.open
+
+        def denied(path, *a, **k):
+            if path == self.log:
+                raise PermissionError(13, "denied")
+            return real_open(path, *a, **k)
+        with mock.patch.object(Path, "open", autospec=True, side_effect=denied):
+            out = self.run_funnel()
+        self.assertEqual(out["inputs"]["query_log"]["status"], "unreadable")
+        self.assertIn("PermissionError", out["inputs"]["query_log"]["error"])
+
+
+class ConfigPaths(FunnelCase):
+    """M2: config paths resolve against the config folder; scan-only targets count."""
+
+    def test_relative_paths_resolve_against_config_folder(self):
+        Transcript(self.other).greps(1).write(self.projects, "p", "s-other")
+        cfg = dict(self.cfg, skill_scripts="..", query_log="../queries.log",
+                   targets=[{"repo": "../repo"}, {"repo": "../other"}])
+        cfg_path = self.write_cfg(cfg, self.root / "conf")
+        out_json = self.root / "r.json"
+        self.assertNotEqual(Path.cwd().resolve(), self.root / "conf")
+        rc = gf.main(["--config", str(cfg_path), "--projects", str(self.projects),
+                      "--until", iso(UNTIL), "--days", "8", "--out", str(self.root / "r.md"),
+                      "--json", str(out_json)])
+        self.assertEqual(rc, 0)
+        out = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(out["availability"]["verdict"], gf.FAIL)
+        self.assertEqual(len(out["availability"]["expected_graph_missing"]), 1)
+        self.assertEqual(out["inputs"]["query_log"]["status"], "ok")
+        self.assertEqual(Path(out["inputs"]["query_log"]["path"]), self.log)
+
+    def test_scan_only_target_names_an_expected_repo(self):
+        (self.other / "src").mkdir()
+        Transcript(self.other).greps(1).write(self.projects, "p", "s-other")
+        for scan in (str(self.other / "src"), "other/src"):
+            with self.subTest(scan=scan):
+                self.cfg["targets"] = [{"repo": str(self.repo)}, {"scan": scan}]
+                av = self.run_funnel()["availability"]
+                self.assertEqual(av["verdict"], gf.FAIL)
+                self.assertEqual(len(av["expected_graph_missing"]), 1)
+
+    def test_empty_repo_falls_back_to_scan(self):
+        self.cfg["targets"] = [{"scan": "other", "repo": ""}]
+        self.assertEqual(gf.parse_config(self.cfg, self.root).targets, (str(self.other),))
+
+
+class ConfigValidation(FunnelCase):
+    """L2: every key the funnel reads is validated before any analysis."""
+
+    def errors(self, cfg: object = None, **overrides) -> list[str]:
+        with self.assertRaises(gf.ConfigError) as ctx:
+            gf.parse_config(dict(self.cfg, **overrides) if cfg is None else cfg, self.root)
+        return ctx.exception.errors
+
+    def test_bad_values_are_all_reported(self):
+        errs = self.errors(query_log=5, targets=[{"repo": "<path-to-repo>"}, "x", {}],
+                           funnel={"hint_live_since": "2026-13-01", "exclude_temp_cwd": "yes",
+                                   "exclude_sessions": "s-1", "hint_since": "2026-01-01"})
+        text = "\n".join(errs)
+        for needle in ("query_log must be a non-empty string", "targets[0].repo still holds a template",
+                       "targets[1] must be a JSON object", "targets[2] needs a scan or repo",
+                       "funnel.hint_live_since must be an ISO-8601", "funnel.exclude_temp_cwd must be true",
+                       "funnel.exclude_sessions must be an object", "funnel.hint_since is not a known key"):
+            self.assertIn(needle, text)
+        self.assertEqual(len(errs), 8)
+
+    def test_exclude_session_entries_are_checked(self):
+        self.assertIn("non-empty string reason", self.errors(funnel={"exclude_sessions": {"s-1": ""}})[0])
+        self.assertIn("non-string or empty session id", self.errors(funnel={"exclude_sessions": [1]})[0])
+
+    def test_shape_errors(self):
+        no_scripts = {k: v for k, v in self.cfg.items() if k != "skill_scripts"}
+        self.assertIn("skill_scripts is missing", self.errors(no_scripts)[0])
+        self.assertIn("funnel must be a JSON object", self.errors(funnel=[])[0])
+        self.assertIn("targets must be a JSON array", self.errors(targets={})[0])
+        self.assertIn("config must be a JSON object", self.errors([])[0])
+
+    @unittest.skipUnless(os.name == "nt", "drive- and root-relative paths are Windows forms")
+    def test_drive_and_root_relative_paths_rejected(self):
+        for bad in ("C:repo", "\\repo"):
+            with self.subTest(path=bad):
+                self.assertIn("drive- or root-relative", self.errors(targets=[{"repo": bad}])[0])
+
+    def test_list_form_of_exclude_sessions(self):
+        self.cfg["funnel"]["exclude_sessions"] = ["s-smoke"]
+        Transcript(self.repo).greps(1).write(self.projects, "p", "s-smoke")
+        out = self.run_funnel()
+        self.assertEqual(out["sessions"]["excluded"],
+                         [{"session": "s-smoke", "reason": "listed in funnel.exclude_sessions"}])
+
+    def test_cli_rejects_invalid_config_before_analysis(self):
+        cfg_path = self.write_cfg(dict(self.cfg, funnel={"exclude_temp_cwd": 1, "bogus": True}))
+        err = io.StringIO()
+        with redirect_stderr(err), mock.patch.object(gf, "discover_sessions") as discover:
+            rc = gf.main(["--config", str(cfg_path), "--projects", str(self.projects)])
+        self.assertEqual(rc, 2)
+        discover.assert_not_called()
+        for needle in ("config invalid", "funnel.bogus is not a known key",
+                       "funnel.exclude_temp_cwd must be true or false"):
+            self.assertIn(needle, err.getvalue())
+
+
+class InputVisibility(FunnelCase):
+    """L1/L3/L4: inputs that could not be read are counted and shown, never silent."""
+
+    def assert_problem(self, out: dict, needle: str) -> None:
+        self.assertTrue(any(needle in p for p in out["inputs"]["problems"]), out["inputs"]["problems"])
+        report = gf.render(out)
+        self.assertIn("Input problems", report)
+        self.assertIn(needle, report)
+
+    def test_clean_inputs_report_no_problems(self):
+        Transcript(self.repo).greps(1).write(self.projects, "p", "s-ok")
+        out = self.run_funnel()
+        self.assertEqual(out["inputs"]["problems"], [])
+        self.assertNotIn("Input problems", gf.render(out))
+
+    def test_missing_unconfigured_and_non_file_log(self):
+        out = self.run_funnel(log=self.root / "nope.log")
+        self.assertEqual(out["inputs"]["query_log"]["status"], "missing")
+        self.assert_problem(out, "query log missing")
+        scan = gf.discover_sessions(self.projects, SINCE, UNTIL)
+        out = gf.analyse(scan, gf.load_log(None, SINCE, UNTIL), self.resolver,
+                         gf.parse_config(self.cfg, self.root), SINCE, UNTIL)
+        self.assert_problem(out, "query log not configured")
+        self.assertEqual(self.run_funnel(log=self.root)["inputs"]["query_log"]["status"], "not-a-file")
+
+    def test_corrupt_log_lines_are_counted(self):
+        t = Transcript(self.repo).query("q0")
+        self.log_record("q0", t.t)
+        with self.log.open("a", encoding="utf-8") as fh:
+            fh.write("{not json\n[1, 2]\n\n")
+        t.write(self.projects, "p", "s-q")
+        out = self.run_funnel()
+        self.assertEqual(out["inputs"]["query_log"]["corrupt_lines"], 2)
+        self.assertEqual(out["inputs"]["query_log"]["records_in_window"], 1)
+        self.assert_problem(out, "query log has 2 corrupt line(s)")
+
+    def test_missing_projects_folder(self):
+        out = self.run_funnel()
+        self.assertTrue(out["inputs"]["projects_dir_missing"])
+        self.assert_problem(out, "transcript projects folder missing")
+
+    def test_corrupt_undated_and_unreadable_transcripts(self):
+        path = Transcript(self.repo).greps(1).write(self.projects, "p", "s-ok")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write("{garbage\n")
+        (self.projects / "p" / "s-undated.jsonl").write_text(json.dumps({"type": "user"}) + "\n",
+                                                            encoding="utf-8")
+        Transcript(self.repo).greps(1).write(self.projects, "p", "s-locked")
+        real_open = Path.open
+
+        def locked(p, *a, **k):
+            if p.name == "s-locked.jsonl":
+                raise PermissionError(13, "denied")
+            return real_open(p, *a, **k)
+        with mock.patch.object(Path, "open", autospec=True, side_effect=locked):
+            out = self.run_funnel()
+        inp = out["inputs"]
+        self.assertEqual(inp["transcript_corrupt_lines"], 1)
+        self.assertEqual(len(inp["transcripts_undated"]), 2)      # no timestamp, and unreadable
+        self.assertEqual(len(inp["transcripts_unreadable"]), 1)
+        self.assertIn("PermissionError", inp["transcripts_unreadable"][0])
+        self.assertEqual(out["sessions"]["total"], 1)
+        for needle in ("1 corrupt transcript line(s)", "1 transcript file(s) could not be read",
+                       "2 transcript(s) had no timestamped record"):
+            self.assert_problem(out, needle)
+
+    def test_unstatable_transcript(self):
+        Transcript(self.repo).greps(1).write(self.projects, "p", "s-gone")
+        real_stat = Path.stat
+
+        def gone(p, *a, **k):
+            if p.name == "s-gone.jsonl":
+                raise FileNotFoundError(2, "vanished")
+            return real_stat(p, *a, **k)
+        with mock.patch.object(Path, "stat", autospec=True, side_effect=gone):
+            out = self.run_funnel()
+        self.assertEqual(len(out["inputs"]["transcripts_unstatable"]), 1)
+        self.assert_problem(out, "1 transcript(s) could not be stat'ed")
+
+    def test_subagent_metadata_problems(self):
+        t = Transcript(self.repo)
+        for agent in ("missing", "badjson", "notype", "fine"):
+            t.subagent(agent, "Explore", Transcript(self.repo).greps(1))
+        t.write(self.projects, "p", "s-meta")
+        sub = self.projects / "p" / "s-meta" / "subagents"
+        (sub / "agent-missing.meta.json").unlink()
+        (sub / "agent-badjson.meta.json").write_text("{nope", encoding="utf-8")
+        (sub / "agent-notype.meta.json").write_text("{}", encoding="utf-8")
+        out = self.run_funnel()
+        meta = "\n".join(out["inputs"]["subagent_metadata_problems"])
+        for needle in ("agent-missing.jsonl: metadata missing",
+                       "agent-badjson.jsonl: metadata is not valid JSON",
+                       "agent-notype.jsonl: metadata has no agentType"):
+            self.assertIn(needle, meta)
+        self.assertEqual(len(out["inputs"]["subagent_metadata_problems"]), 3)
+        self.assert_problem(out, "3 subagent(s) without readable metadata")
 
 
 if __name__ == "__main__":
