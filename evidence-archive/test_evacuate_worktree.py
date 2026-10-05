@@ -9,6 +9,7 @@ touches a real packet store, archive, or transcript.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -313,6 +314,51 @@ def test_failed_write_leaves_no_part() -> None:
         check(r.files[0].staging_left is None, "a failed write reports no leftover staged copy")
 
 
+def test_link_failure_leaves_no_part() -> None:
+    """os.link failing with an OSError other than FileExistsError (no hard links on the
+    archive volume, a cross-device staging dir, a denied link) must not leave a .part."""
+    print("link failure")
+    errors = (PermissionError(13, "Permission denied"),
+              OSError(errno.EXDEV, "Invalid cross-device link"),
+              OSError(errno.EINVAL, "hard links not supported"))
+    real_link, real_discard = ev.os.link, ev._discard_staged
+    for exc in errors:
+        name = type(exc).__name__ if type(exc) is not OSError else f"OSError({errno.errorcode[exc.errno]})"
+        for cleanup_fails in (False, True):
+            with tempfile.TemporaryDirectory() as t:
+                tmp = Path(t)
+                wt = make_worktree(tmp)
+                put(wt, f"a_{PA}.json", packet(PA))
+                archive = tmp / "arch"
+
+                def failing_link(src, dst, *a, _exc=exc, **kw):
+                    raise _exc
+
+                def locked(part: Path, staging: Path) -> None:
+                    raise PermissionError(13, "file in use", str(part))
+
+                ev.os.link = failing_link
+                if cleanup_fails:
+                    ev._discard_staged = locked
+                try:
+                    r = ev.evacuate(wt, archive, apply=True)
+                finally:
+                    ev.os.link, ev._discard_staged = real_link, real_discard
+                f = r.files[0]
+                label = f"{name}{' + cleanup failure' if cleanup_fails else ''}"
+                check(f.action == "error" and not r.safe_to_remove and "copy failed" in f.detail,
+                      f"{label}: a failed link is a blocking error")
+                check(not (archive / "packets" / f"{PA}.json").exists(), f"{label}: nothing is published")
+                left = list((archive / "staging").glob("*.part"))
+                if cleanup_fails:
+                    check(len(left) == 1 and f.staging_left == left[0].as_posix()
+                          and "staged copy left in staging/: PermissionError" in f.detail
+                          and any("could not be removed from staging/" in n for n in r.reasons),
+                          f"{label}: the leftover staged copy is reported, not swallowed")
+                else:
+                    check(not left and f.staging_left is None, f"{label}: the staged .part is removed")
+
+
 def _publish_with(archive: Path, wt: Path, *, reread_fails: bool, run=None):
     """Run the real evacuate() (or `run`, e.g. the CLI) with the post-publish staging
     unlink failing, and optionally the post-publish source re-read failing."""
@@ -475,6 +521,7 @@ def main() -> int:
                  test_duplicates, test_conflicting_ids_block, test_malformed_quarantined,
                  test_verify_pass_and_tamper, test_failure_paths_block, test_interrupted_write_is_retried,
                  test_concurrent_publish_is_a_duplicate, test_failed_write_leaves_no_part,
+                 test_link_failure_leaves_no_part,
                  test_cleanup_failure_after_publish_is_verified_copy,
                  test_unverified_publish_is_incomplete,
                  test_mismatch_with_cleanup_failure_keeps_cause,
