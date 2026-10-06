@@ -156,6 +156,15 @@ LITERAL_RE = re.compile(r"(['\"])([^'\"\n]{2,200})\1")
 REDIRECT_RE = re.compile(r"^(\d|\*)?(>>?|<)(&\d)?(.*)$")
 SUB = "__SUB__"
 BODY = "__BODY__"
+BLOCK = "__BLOCK__"
+# ``$name = rhs`` (also ``+=`` etc. and the glued ``$name='x'`` form); ``==`` is not PowerShell.
+ASSIGN_RE = re.compile(r"^\s*\$[A-Za-z_][\w:.]*\s*[+*/-]?=(?!=)\s*(.*)$", re.S)
+# A right-hand side that is a value or expression rather than a command.
+VALUE_START_RE = re.compile(r"^(?:['\"$@\[(\d-]|__SUB__|__BLOCK__|\{|true\b|false\b|null\b)", re.I)
+# A PowerShell loop header ``$item in <expr>`` (the inside of ``foreach (...)``).
+FOREACH_HEADER_RE = re.compile(r"^\s*\$[A-Za-z_]\w*\s+in\s+(.*)$", re.I | re.S)
+# Control keywords whose header or body was replaced by SUB/BLOCK with no space between.
+CONTROL = {"foreach", "for", "while", "if", "elseif", "switch", "catch", "until"}
 
 
 @dataclass
@@ -285,6 +294,46 @@ def extract_subs(text: str) -> tuple[str, list[str]]:
     return "".join(out), inner
 
 
+def extract_blocks(text: str) -> tuple[str, list[str], bool]:
+    """Replace unquoted ``{ ... }`` script blocks with BLOCK; return their inner commands.
+
+    Only a brace that opens a token is a block: ``${var}``, ``@{...}`` hashtables, brace
+    expansion (``f{1,2}``) and ``find -exec {}`` are left as text. Unbalanced braces leave
+    the text unchanged and report ``balanced=False`` so the caller records a miss."""
+    out: list[str] = []
+    inner: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch, quoted in _scan(text):
+        if not ch:
+            break
+        if quoted:
+            if depth == 0:
+                out.append(ch)
+            continue
+        if ch == "{":
+            if depth:
+                depth += 1
+                continue
+            prev = text[i - 1] if i else ""
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if (not prev or prev.isspace() or prev in ");|&_") and nxt != "}":
+                depth = 1
+                start = i + 1
+                continue
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                inner.append(text[start:i])
+                out.append(f" {BLOCK} ")
+            continue
+        if depth == 0:
+            out.append(ch)
+    if depth:
+        return text, [], False
+    return "".join(out), inner, True
+
+
 def split_segments(text: str) -> tuple[list[str], bool]:
     """Split on unquoted separators. Returns (segments, quotes balanced)."""
     segs: list[str] = []
@@ -404,6 +453,8 @@ def _clean_arg(a: str) -> str | None:
     a = a.strip().rstrip(",;")
     if not a or a in {"-", ".", "..", "/", "~", "*"} or SUB in a or BODY in a:
         return None
+    if BLOCK in a:
+        return None
     if a.startswith("$") and "/" not in a:
         return None
     if a.startswith(("{", "[", "@")) or "://" in a:
@@ -414,6 +465,20 @@ def _clean_arg(a: str) -> str | None:
 def parse_segment(seg: str) -> Segment:
     if seg.lstrip().startswith("#"):
         return Segment(seg, None, "comment")
+    m = ASSIGN_RE.match(seg)
+    if m:
+        rhs = m.group(1).strip()
+        if not rhs or VALUE_START_RE.match(rhs):
+            # a value or expression: a named string, not a touch (substitutions parse separately)
+            return Segment(seg, None, "assign", has_pathlike=any(is_pathlike(t) for t in (tokenize(rhs) or [])))
+        inner = parse_segment(rhs)  # ``$x = <command>``: the command's own roles apply
+        inner.text = seg
+        return inner
+    h = FOREACH_HEADER_RE.match(seg)
+    if h:
+        inner = parse_segment(h.group(1))
+        inner.text = seg
+        return inner
     toks = tokenize(seg)
     if toks is None:
         return Segment(seg, None, "miss", miss_reason="unbalanced_quote",
@@ -447,6 +512,9 @@ def parse_segment(seg: str) -> Segment:
     if not words:
         return Segment(seg, None, "empty", paths=redirects, has_pathlike=bool(redirects))
     verb = _verb_name(words[0])
+    glued = re.sub(r"(?:__sub__|__block__)+$", "", verb)
+    if glued != verb and glued in CONTROL:
+        verb = glued
     args = words[1:]
     has_path = bool(redirects) or any(is_pathlike(a) for a in words)
     s = Segment(seg, verb, "nonfile", has_pathlike=has_path)
@@ -462,7 +530,7 @@ def parse_segment(seg: str) -> Segment:
             if c:
                 s.paths.append(PathUse(c, role, verb))
 
-    if verb.startswith((SUB, BODY)):
+    if verb.startswith((SUB.lower(), BODY.lower(), BLOCK.lower())):
         s.kind = "nonfile"
         return s
     if verb in READ:
@@ -553,6 +621,10 @@ def parse_command(text: str) -> tuple[list[Segment], list[PathUse]]:
         chunk = queue.pop(0)
         flat, inner = extract_subs(chunk)
         queue.extend(inner)
+        flat, blocks, blocks_ok = extract_blocks(flat)
+        queue.extend(blocks)
+        if not blocks_ok:
+            out.append(Segment(flat, None, "miss", miss_reason="unbalanced_block", has_pathlike=True))
         segs, balanced = split_segments(flat)
         parsed = [parse_segment(s) for s in segs]
         if not balanced and parsed and parsed[-1].kind != "miss":

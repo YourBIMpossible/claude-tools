@@ -215,8 +215,32 @@ def test_footprints(tmp: Path) -> None:
           "--no-git: dependency check unknown, never eligible")
 
 
+def test_powershell_assignment_and_foreach() -> None:
+    check(kinds("$r='F:/Repo/notes.md'") == ["assign"] and paths("$r='F:/Repo/notes.md'") == [],
+          "ps: glued $x='literal' is an assignment, not a touch")
+    check(kinds("$p = 'F:/a/b.txt' -replace 'a','b'") == ["assign"],
+          "ps: literal followed by an operator is an assignment")
+    check(paths("$c = Get-Content 'src/a.txt'") == [("read", "src/a.txt")],
+          "ps: $x = <command> keeps the command's role")
+    check(kinds("$x = Invoke-Frob 'src/a.txt'") == ["miss"],
+          "ps: $x = <unknown command with a path> stays a miss")
+    cmd = "foreach ($f in Get-ChildItem src -Filter *.md) { Get-Content -Raw $f.FullName; Remove-Item 'out/x.txt' }"
+    check("miss" not in kinds(cmd) and ("search", "src") in paths(cmd) and ("write", "out/x.txt") in paths(cmd),
+          "ps: foreach header and body parse with their own roles")
+    check("miss" not in kinds("foreach($f in $files){ Get-Content $f }"),
+          "ps: foreach glued to its header and body is control, not an unknown verb")
+    check("miss" in kinds('foreach($f in $files){ Frobnicate "a/b.txt" }'),
+          "ps: an unknown command inside a foreach body stays a miss")
+    check("miss" in kinds("foreach ($f in $x) { Get-Content a.txt"),
+          "ps: an unbalanced block is a miss, never dependency-free")
+    check(kinds("echo ${HOME}/x") == ["nonfile"], "bash: ${var} is not a block")
+    check("miss" not in kinds("Get-ChildItem src | ForEach-Object { Get-Content $_.FullName }"),
+          "ps: ForEach-Object script block parses")
+
+
 def main() -> int:
     test_shell_paths()
+    test_powershell_assignment_and_foreach()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
