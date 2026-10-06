@@ -220,6 +220,9 @@ def _shell_observations(cmd: str, idx: RepoIndex, cwd: str | None, markers: list
 GIT_MUTATING = {"add", "commit", "apply", "am", "cherry-pick", "merge", "rebase", "reset", "checkout", "restore",
                 "switch", "mv", "rm", "stash", "revert", "pull", "update-index", "clean"}
 NAV_VERBS = {"cd", "set-location", "sl", "pushd", "push-location", "chdir"}
+# A PowerShell segment that starts with a variable is an expression (``$i++``, ``$_.Line``), not
+# a program run; ``& $exe`` and ``. $script`` keep their call operator and stay executions.
+PS_EXPRESSION_RE = re.compile(r"^\s*\$")
 INLINE_CODE_RE = re.compile(r"^\s*(?:python[\d.]*|py|node|pwsh|powershell)(?:\.exe)?\s+(?:-c\b|-e\b|-Command\b|-\s*(?:<<|__BODY__|$))", re.I)
 ASSIGN_RE = re.compile(r"(?:^|[;&|\n]\s*|\s)\$?([A-Za-z_]\w*)\s?=\s?(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
 VAR_REF_RE = re.compile(r"\$(?:env:)?\{?([A-Za-z_]\w*)\}?")
@@ -328,7 +331,7 @@ def _shell_repo_mutations(cmd: str, idx: RepoIndex, cwd: str | None, markers: li
         if INLINE_CODE_RE.match(seg.text):
             if where(cur if cur_known else None) != "outside":
                 out.append(f"unresolved_effect:inline:{verb}")
-        elif seg.kind == "exec":
+        elif seg.kind == "exec" and not PS_EXPRESSION_RE.match(seg.text):
             # A script or runner may write anywhere; it counts when it runs from the repository,
             # from an unresolved directory, or names a repository file to execute.
             in_repo = where(cur if cur_known else None) != "outside" or any(
