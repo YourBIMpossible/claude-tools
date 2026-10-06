@@ -135,6 +135,24 @@ def norm(raw: str, roots: Iterable[str]) -> str | None:
     return p if p and p not in {".", ".."} and not p.startswith("../") else None
 
 
+def resolve(raw: str, base: str | None, cwd: str | None) -> str:
+    """A shell path argument made absolute against the directory the command ran in.
+
+    Relative arguments resolve against an explicit command base (git -C) and then the call's
+    recorded cwd, so a relative name under another repository is never read as this
+    repository's file. Absolute arguments, and relative ones with no known directory, are
+    returned unchanged (the latter keep the historical repo-relative reading).
+    """
+    if sp._is_absolute(raw):
+        return raw
+    d = base
+    if d is not None and not sp._is_absolute(d):
+        d = f"{cwd.rstrip(chr(92) + '/')}/{d}" if cwd else None
+    if d is None:
+        d = cwd
+    return f"{d.replace(chr(92), '/').rstrip('/')}/{raw}" if d else raw
+
+
 def ref_path(ref: str) -> str:
     m = REF_RE.match(ref.replace("\\", "/"))
     return m.group(1) if m else ref
@@ -223,7 +241,8 @@ class Footprint:
                     self.queries.append((idx, seg.text))
                 for use in seg.paths:
                     edit = use.role == "write" and use.verb != "git"
-                    self._touch(idx, use.path, use.role, edit=edit, native=False)
+                    self._touch(idx, resolve(use.path, use.base, call.get("cwd")), use.role,
+                                edit=edit, native=False)
             for use in script:
                 self._touch(idx, use.path, "script", native=False)
 
