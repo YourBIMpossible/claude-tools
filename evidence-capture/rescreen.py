@@ -25,8 +25,8 @@ from typing import Any
 import manifest as mf
 from common import iso, now_utc, write_json_atomic
 from join import join
-from pipeline import (MAINTAIN_LOCK, _try_lock, _unlock, _untracked_paths, episode_lock, find_transcript,
-                      resolve_repo_root, tool_identity, transcript_cwds)
+from pipeline import (MAINTAIN_LOCK, _try_lock, _unlock, _untracked_paths, captured_root_gone, episode_lock,
+                      find_transcript, resolve_repo_root, tool_identity, transcript_cwds)
 from review import load_owner_review
 from screen import screen
 from store import Stores, commit_meta, manifest_path, scan_manifests, write_manifest
@@ -83,15 +83,18 @@ def rescreen_one(stores: Stores, m: dict[str, Any], env: dict[str, str]) -> str:
     if obs is None:
         invalidate(m, "rescreen_prompt_ambiguous" if "prompt_ambiguous" in misses else "rescreen_prompt_not_found")
         return "invalidated_prompt_not_found"
+    # The prompt's own classification does not depend on the checkout: keep it even
+    # when the screen below cannot run.
+    for k in PROMPT_FIELDS:
+        m["prompt"][k] = probe["prompt"].get(k)
     cwds = transcript_cwds(tr)
     root = resolve_repo_root(m, cwds)
     if root is None:
-        invalidate(m, "rescreen_root_unresolved")
-        return "invalidated_root_unresolved"
+        gone = captured_root_gone(m, cwds)
+        invalidate(m, "rescreen_root_gone" if gone else "rescreen_root_unresolved")
+        return "invalidated_root_gone" if gone else "invalidated_root_unresolved"
     screen(probe, obs, root, cwd=cwds[-1] if cwds else str(root),
            untracked_paths=_untracked_paths(stores, m["episode_id"]), complete=True)
-    for k in PROMPT_FIELDS:
-        m["prompt"][k] = probe["prompt"].get(k)
     for k in ("prior_context", "deps", "edited_files", "observation"):
         m[k] = probe[k]
     m["task_class"]["mechanical"] = probe["task_class"].get("mechanical")

@@ -469,13 +469,34 @@ def transcript_cwds(path: Path) -> list[str]:
 
 
 def resolve_repo_root(m: dict[str, Any], cwds: list[str]) -> Path | None:
-    """The checkout the start hook captured: the first candidate whose root hash matches."""
+    """The checkout the start hook captured: the first ancestor of a transcript cwd whose
+    path hash matches and that still has a ``.git`` entry. The ``.evidence-compiler/``
+    marker was checked at capture; a later checkout of that worktree need not carry it."""
     want = m["repo"].get("root_sha256")
-    for cwd in cwds:
-        root = find_repo_root(cwd)
-        if root is not None and root_sha256(root) == want:
-            return root
+    for d in _root_candidates(want, cwds):
+        if (d / ".git").exists():
+            return d
     return None
+
+
+def captured_root_gone(m: dict[str, Any], cwds: list[str]) -> bool:
+    """True when the captured root is identified among the cwd ancestors but no longer
+    exists as a checkout (a removed worktree)."""
+    return any(not (d / ".git").exists() for d in _root_candidates(m["repo"].get("root_sha256"), cwds))
+
+
+def _root_candidates(want: str | None, cwds: list[str]) -> list[Path]:
+    out: list[Path] = []
+    if not want:
+        return out
+    for cwd in cwds:
+        if not cwd:
+            continue
+        start = Path(cwd)
+        for d in (start, *start.parents):
+            if d not in out and root_sha256(d) == want:
+                out.append(d)
+    return out
 
 
 def session_roots(cwds: list[str]) -> list[Path]:
