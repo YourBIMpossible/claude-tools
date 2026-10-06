@@ -621,9 +621,10 @@ def parse_segment(seg: str) -> Segment:
         git_base: str | None = None
         while j < len(args) and args[j].startswith("-"):
             if args[j] == "-C" and j + 1 < len(args):
-                d = _clean_arg(args[j + 1])
-                if d:  # successive -C options compose, as in git itself
-                    git_base = d if git_base is None or _is_absolute(d) else f"{git_base}/{d}"
+                # An argument the parser cannot evaluate (a variable) is kept as "$", unresolved.
+                d = _clean_arg(args[j + 1]) or "$"
+                # Successive -C options compose, as in git itself.
+                git_base = d if git_base is None or _is_absolute(d) else f"{git_base}/{d}"
             j += 2 if args[j] in {"-C", "-c", "--git-dir", "--work-tree"} else 1
         sub = args[j].lower() if j < len(args) else ""
         rest = args[j + 1:]
