@@ -261,7 +261,9 @@ def full_store_check(stores: Stores) -> dict[str, Any]:
 def store_problems(stores: Stores) -> dict[str, list[str]]:
     """``{"content": [...], "meta": [...]}`` for the hot path: the cheap checks plus the
     last full check. A missing stamp, or one for other stores, runs the full check here;
-    an old one is only refreshed by maintenance."""
+    an old clean one is only refreshed by maintenance. A stamp that records problems is
+    re-checked here, so one transient failure cannot refuse every start until the next
+    maintenance pass; a problem that persists still refuses."""
     quick = _quick_problems(stores)
     stamp = None
     p = stores.meta / STORE_CHECK
@@ -270,7 +272,8 @@ def store_problems(stores: Stores) -> dict[str, list[str]]:
             stamp = read_json(p)
         except (OSError, ValueError):
             stamp = None
-    if not isinstance(stamp, dict) or stamp.get("stores") != _stores_key(stores):
+    if (not isinstance(stamp, dict) or stamp.get("stores") != _stores_key(stores)
+            or stamp.get("content") or stamp.get("meta")):
         if quick and ("metadata store missing" in quick or "content store missing" in quick):
             stamp = {"content": [], "meta": []}
         else:
@@ -827,6 +830,7 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
     try:
         check = full_store_check(stores)
         content_ok = not check["content"]
+        counts["store_problems"] = check["content"] + check["meta"]
         if check["meta"]:
             log_line(stores, f"maintain: metadata store problems: {'; '.join(check['meta'])}")
         if content_ok:
@@ -948,6 +952,9 @@ def maintain_findings(counts: dict[str, Any]) -> tuple[list[str], list[str]]:
     warnings: list[str] = []
     if counts.get("error"):
         problems.append(f"maintenance_error: {counts['error']}")
+    if counts.get("store_problems"):
+        # the hot path refuses captures while these stand; a pass that saw them is not ok
+        problems.append("store_problems: " + "; ".join(counts["store_problems"]))
     if counts.get("episode_errors"):
         problems.append(f"episode_errors: {counts['episode_errors']} "
                         f"({','.join(counts.get('episode_error_ids') or [])})")

@@ -428,9 +428,16 @@ def test_store_check_stamp(root: Path) -> None:
     rec = read_json(stamp)
     rec["content"] = ["content store has cloud attributes: P"]
     write_json_atomic(stamp, rec)
-    assert pipeline.store_problems(fx.stores)["content"], "a recorded full-check failure blocks the hot path"
-    pipeline.full_store_check(fx.stores)
-    assert pipeline.store_problems(fx.stores)["content"] == []
+    assert pipeline.store_problems(fx.stores)["content"] == [], "a stale failure is re-checked, not trusted"
+    assert read_json(stamp)["content"] == [], "the re-check rewrites the stamp"
+    exclude = fx.stores.meta / ".git" / "info" / "exclude"
+    kept = exclude.read_text(encoding="utf-8")
+    exclude.write_text("", encoding="utf-8")
+    pipeline.full_store_check(fx.stores)  # maintenance records the real problem
+    assert pipeline.store_problems(fx.stores)["meta"] == ["metadata .git/info/exclude lacks the content exclusions"]
+    assert pipeline.store_problems(fx.stores)["meta"], "a persistent failure still blocks the hot path"
+    exclude.write_text(kept, encoding="utf-8")
+    assert pipeline.store_problems(fx.stores) == {"content": [], "meta": []}, "repair heals without maintenance"
     gi = (fx.stores.meta / ".gitignore").read_text(encoding="utf-8")
     for local in ("store-check.json", "maintenance.json", "maintain.lock", "open/", "locks/", "capture.log"):
         assert local in gi, local
@@ -471,7 +478,15 @@ def test_tool_identity_without_git(root: Path) -> None:
     assert commit == head, (commit, head)
 
 
+def test_maintain_store_problems_are_findings(root: Path) -> None:
+    """2026-10-05: maintenance saw a store problem, logged it, and the backstop still said ok."""
+    problems, _ = pipeline.maintain_findings({"action": "maintained", "store_problems": ["metadata x"]})
+    assert problems == ["store_problems: metadata x"]
+    assert pipeline.maintain_findings({"action": "maintained", "store_problems": []}) == ([], [])
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+
 
 
 def main() -> int:
@@ -498,3 +513,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

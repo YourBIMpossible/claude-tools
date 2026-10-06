@@ -182,9 +182,13 @@ def check_meta_store(stores: Stores) -> list[str]:
         problems.append("metadata .gitignore lacks the content exclusions")
     exclude = _meta_exclude_file(stores)
     wanted = _meta_exclude_lines(stores)
-    have = set(exclude.read_text(encoding="utf-8").splitlines()) if exclude and exclude.is_file() else set()
-    if not set(wanted) <= have:
-        problems.append("metadata .git/info/exclude lacks the content exclusions")
+    if exclude is None:
+        # distinct from a missing pattern: git could not name the file (2026-10-05 outage)
+        problems.append("metadata .git/info/exclude path unresolved (git rev-parse failed)")
+    else:
+        have = set(exclude.read_text(encoding="utf-8").splitlines()) if exclude.is_file() else set()
+        if not set(wanted) <= have:
+            problems.append("metadata .git/info/exclude lacks the content exclusions")
     return problems
 
 
