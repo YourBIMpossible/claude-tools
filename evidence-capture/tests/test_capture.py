@@ -994,6 +994,33 @@ def test_invalidate_replaces_prior_rescreen_cause(root: Path) -> None:
     assert all(m["deps"][c]["required"] == "unknown" for c in mf.DEP_CATEGORIES)
 
 
+def test_shell_repo_mutation_blocks_x2_yes(root: Path) -> None:
+    """A shell write or git mutation inside the repository is not 'no repository edit' (X2)."""
+    repo = make_repo(root)
+    other = make_repo(root, "other")
+    msys = "/" + str(repo)[0].lower() + str(repo)[2:].replace("\\", "/")
+    cases = {
+        "commit via shell": (f"cd '{repo}' && D=docs && cat >> \"$D/NOTES.md\" <<'X'\nline\nX\ngit add -A && git commit -qm n",
+                             {"write:cat", "git add", "git commit"}),
+        "msys cd then redirect": (f"cd {msys}; echo x > out.txt", {"write:echo"}),
+        "unknown cd then commit": ("cd \"$SOMEWHERE\" && git commit -qm n", {"unresolved:git commit"}),
+        "inline interpreter in repo": ("python - <<'PY'\nprint(1)\nPY", {"unresolved:inline:python"}),
+    }
+    for label, (cmd, want) in cases.items():
+        turns = [{"prompt": f"task {label}", "tools": [{"name": "Bash", "input": {"command": cmd}}]}]
+        m = joined(root, repo, turns, 0)
+        got = set(m["observation"]["shell_repo_mutations"])
+        assert want <= got, (label, got)
+        assert rule(m, "X2") == "unknown", (label, m["exclusions"])
+        assert m["edited_files"] == []  # the file set is not invented from a shell command
+    # mutations in another repository, temp files and plain reads leave X2 = yes
+    for cmd in (f"cd '{other}' && git add -A && git commit -qm n", "git status && git log -3 > /dev/null",
+                "echo x > /tmp/scratch.txt", f"git -C '{other}' switch main", "python -m pytest tests"):
+        m = joined(root, repo, [{"prompt": "look only", "tools": [{"name": "Bash", "input": {"command": cmd}}]}], 0)
+        assert m["observation"]["shell_repo_mutations"] == [], (cmd, m["observation"])
+        assert rule(m, "X2") == "yes", (cmd, m["exclusions"], m["observation"])
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

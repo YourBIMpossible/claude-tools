@@ -208,6 +208,86 @@ def _shell_observations(cmd: str, idx: RepoIndex, cwd: str | None, markers: list
     return obs, clean
 
 
+GIT_MUTATING = {"add", "commit", "apply", "am", "cherry-pick", "merge", "rebase", "reset", "checkout", "restore",
+                "switch", "mv", "rm", "stash", "revert", "pull", "update-index", "clean"}
+NAV_VERBS = {"cd", "set-location", "sl", "pushd", "push-location", "chdir"}
+INLINE_CODE_RE = re.compile(r"^\s*(?:python[\d.]*|py|node|pwsh|powershell)(?:\.exe)?\s+(?:-c\b|-e\b|-Command\b|-\s*(?:<<|__BODY__|$))", re.I)
+ASSIGN_RE = re.compile(r"(?:^|[;&|\n]\s*|\s)\$?([A-Za-z_]\w*)\s?=\s?(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
+VAR_REF_RE = re.compile(r"\$(?:env:)?\{?([A-Za-z_]\w*)\}?")
+MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(?=/|$)")
+ABS_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/)")
+
+
+def _shell_path(path: str) -> str | None:
+    """A shell path argument with MSYS drives mapped, or None while it holds an unexpanded variable."""
+    p = MSYS_DRIVE_RE.sub(lambda mt: f"{mt.group(1).upper()}:", path.strip().strip("'\""))
+    return None if ("$" in p or "%" in p) else p
+
+
+def _expand_assignments(cmd: str) -> str:
+    """Expand ``VAR=literal`` / ``$VAR = 'literal'`` assignments made in the same command."""
+    env: dict[str, str] = {}
+    for _ in range(3):
+        for k, v in ASSIGN_RE.findall(cmd):
+            v = v.strip("'\"")
+            if "$" not in v:
+                env[k] = v
+        cmd = VAR_REF_RE.sub(lambda mt: env.get(mt.group(1), mt.group(0)), cmd)
+    return cmd
+
+
+def _shell_repo_mutations(cmd: str, idx: RepoIndex, cwd: str | None, markers: list[str]) -> list[str]:
+    """Mutations of the repository working tree or index made by one shell command.
+
+    Follows ``cd``/``Set-Location`` within the command. An entry starting ``unresolved:`` is a
+    mutation (or inline interpreter code) whose target directory could not be resolved.
+    """
+    out: list[str] = []
+    segments, _ = parse_command(_expand_assignments(cmd))
+    cur: str | None = cwd
+    cur_known = True
+
+    def where(path: str | None) -> str:
+        if path is None or (not cur_known and not ABS_RE.match(path)):
+            return "unresolved"
+        return "repo" if classify_path(path, idx, cur, markers) is None else "outside"
+
+    for seg in segments:
+        verb = (seg.verb or "").lower()
+        if seg.kind == "miss":
+            continue  # already a shell_path_miss cause, which makes the observation insufficient
+        if verb in NAV_VERBS:
+            arg = next((u.path for u in seg.paths if u.role == "nav"), None) \
+                or (re.sub(r"^\s*\S+\s*", "", seg.text).strip() or None)
+            if arg:
+                p = _shell_path(arg)
+                if p is None or (not cur_known and not ABS_RE.match(p)):
+                    cur_known = False
+                else:
+                    cur = p if ABS_RE.match(p) or cur is None else f"{cur}/{p}"
+                    cur_known = True
+            continue
+        if verb == "git":
+            mt = re.match(r"\s*git\s+((?:-C\s+(?:\"[^\"]+\"|'[^']+'|\S+)\s+|-c\s+\S+\s+|--\S+\s+)*)(\S+)", seg.text)
+            if mt and mt.group(2).lower() in GIT_MUTATING:
+                gc = re.search(r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", mt.group(1))
+                w = where(_shell_path(gc.group(1)) if gc else (cur if cur_known else None))
+                if w != "outside":
+                    out.append(f"{'' if w == 'repo' else 'unresolved:'}git {mt.group(2).lower()}")
+            continue
+        for use in seg.paths:
+            if use.role == "write":
+                tgt = use.path.strip().strip("'\"")
+                if tgt.lower() in ("/dev/null", "nul", "$null") or tgt.startswith("/tmp/"):
+                    continue
+                w = where(_shell_path(tgt))
+                if w != "outside":
+                    out.append(f"{'' if w == 'repo' else 'unresolved:'}write:{verb}")
+        if INLINE_CODE_RE.match(seg.text) and where(cur if cur_known else None) != "outside":
+            out.append(f"unresolved:inline:{verb}")
+    return out
+
+
 def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | None = None,
            untracked_paths: Iterable[str] = (), complete: bool = True) -> dict[str, Any]:
     """Fill deps, edited_files, prior_context and observation in ``m`` from ``obs`` (join output)."""
@@ -224,6 +304,7 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
     if not complete:
         causes.append("transcript_partial")
     first_edit_seen = False
+    shell_mutations: list[str] = []
 
     for call in obs["tool_calls"]:
         name, inp = call["name"], call["input"]
@@ -241,6 +322,7 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
                     cats_here.append(c)
             if re.search(r"\b(?:git\s+(?:add|commit|apply|checkout|restore|mv|rm)|>\s*\S|tee\s|sed\s+-i|Set-Content|Out-File)\b", cmd):
                 first_edit_seen = True
+            shell_mutations.extend(_shell_repo_mutations(cmd, idx, call_cwd, markers))
         elif name in EDIT_TOOLS or name in READ_TOOLS:
             p = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
             if isinstance(p, str):
@@ -333,7 +415,8 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
     m["deps"]["prior_conversation"] = {"observed": 1 if index else 0, "required": pc_required,
                                        "evidence": pc_ev, "observation_sufficient": sufficient}
     m["edited_files"] = [{"path_sha256": path_sha256(p)} for p in edited]
-    m["observation"] = {"sufficient": sufficient, "causes": sorted(set(causes))}
+    m["observation"] = {"sufficient": sufficient, "causes": sorted(set(causes)),
+                        "shell_repo_mutations": sorted(set(shell_mutations))}
     m["task_class"]["mechanical"] = _task_class(edited, obs["tool_calls"])
     return m
 
