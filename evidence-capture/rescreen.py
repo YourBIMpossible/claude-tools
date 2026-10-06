@@ -54,7 +54,8 @@ def _delegated(m: dict[str, Any]) -> bool:
 
 def invalidate(m: dict[str, Any], cause: str) -> None:
     """Withdraw every judgement that rested on a sufficient observation."""
-    causes = set(m["observation"].get("causes") or [])
+    # A cause from an earlier rescreen is superseded by this one, never accumulated.
+    causes = {c for c in m["observation"].get("causes") or [] if not c.startswith("rescreen_")}
     causes.add(cause)
     m["observation"] = {"sufficient": False, "causes": sorted(causes)}
     for c in mf.DEP_CATEGORIES:

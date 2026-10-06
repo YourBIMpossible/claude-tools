@@ -967,6 +967,16 @@ def test_root_resolution_without_marker_and_gone(root: Path) -> None:
     assert not pipeline.captured_root_gone(m, [str(live)])
 
 
+def test_invalidate_replaces_prior_rescreen_cause(root: Path) -> None:
+    import rescreen
+    m = {"observation": {"sufficient": True, "causes": ["rescreen_root_unresolved", "no_response"]},
+         "deps": {c: {"required": "no", "evidence": []} for c in mf.DEP_CATEGORIES},
+         "prior_context": {}}
+    rescreen.invalidate(m, "rescreen_root_gone")
+    assert m["observation"]["causes"] == ["no_response", "rescreen_root_gone"]
+    assert all(m["deps"][c]["required"] == "unknown" for c in mf.DEP_CATEGORIES)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
