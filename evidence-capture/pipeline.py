@@ -65,7 +65,7 @@ STORE_CHECK_TTL_S = 24 * 3600
 LOCK_STALE_S = 600
 MAINTAIN_MIN_INTERVAL_S = 60
 FAILURE_STREAK = 3
-STREAK_SNAPSHOT_REASONS = ("timeout", "write_error")
+STREAK_SNAPSHOT_REASONS = ("timeout", "write_error", "store_unusable", "stores_not_configured")
 ENV_TRANSCRIPTS = "EC_CAPTURE_TRANSCRIPTS"
 ENV_MAINTAIN = "EC_CAPTURE_MAINTAIN"  # "0": the start hook does not launch maintenance
 PENDING_NAME = "ec-capture-pending.jsonl"
@@ -300,7 +300,7 @@ def failed_manifest(rec: dict[str, Any], reason: str) -> dict[str, Any]:
                         prompt_sha256=rec["prompt_sha256"], prompt_len=int(rec.get("prompt_len") or 0),
                         tool_commit=commit, tool_sha256=tsha, cwd_sha256=rec.get("cwd_sha256") or "")
     m["repo"]["root_sha256"] = rec.get("root_sha256")
-    m["start_snapshot"] = {"state": "failed", "reason": "write_error", "detail": reason[:300]}
+    m["start_snapshot"] = {"state": "failed", "reason": mf.failure_cause(reason), "detail": reason[:300]}
     m["capture"].update(status="failed", phase="failed", errors=[reason[:300]])
     m["boundary"] = {"cli_version": None, "trusted": False, "reason": "capture_failed"}
     return mf.refresh(m)
@@ -588,6 +588,47 @@ def _open_pointer(stores: Stores, session_id: str) -> Path:
     return stores.meta / "open" / session_id
 
 
+OPEN_POINTER_STALE_H = 72  # a Stop this long after maintenance joined the episode is not expected
+
+
+def retire_open_pointers(stores: Stores, now: str) -> dict[str, Any]:
+    """Remove ``open/`` pointers that only wait for a Stop which will not come.
+
+    A pointer is kept after a maintenance join so a later Stop can replace that provisional
+    join. Once the episode has been maintenance-joined for ``OPEN_POINTER_STALE_H`` the
+    session is over; the pointer is local operational state and the manifest keeps every
+    fact, so retiring it loses no evidence. Episodes never joined stay open and are counted."""
+    out: dict[str, Any] = {"retired": [], "open_unjoined": [], "dangling": 0}
+    now_dt = parse_iso(now)
+    d = stores.meta / "open"
+    if now_dt is None or not d.is_dir():
+        return out
+    for p in sorted(d.iterdir()):
+        try:
+            ep = p.read_text(encoding="utf-8").strip()
+            m = read_manifest(stores, ep) if manifest_path(stores, ep).is_file() else None
+        except (OSError, ValueError):
+            continue
+        if m is None:
+            out["dangling"] += 1
+            continue
+        cap = m["capture"]
+        joined = parse_iso((cap.get("join") or {}).get("at") or m.get("ended_at") or "")
+        if (cap.get("phase") == "ended" and (cap.get("join") or {}).get("by") == "maintain"
+                and joined is not None and now_dt - joined > timedelta(hours=OPEN_POINTER_STALE_H)):
+            try:
+                if p.read_text(encoding="utf-8").strip() == ep:
+                    p.unlink()
+                    out["retired"].append(ep)
+            except OSError:
+                pass
+        elif cap.get("phase") == "started":
+            started = parse_iso(m.get("started_at") or "")
+            if started is not None and now_dt - started > timedelta(hours=OPEN_POINTER_STALE_H):
+                out["open_unjoined"].append(ep)
+    return out
+
+
 def run_start(payload: dict[str, Any], env: dict[str, str], *, now: str | None = None) -> dict[str, Any]:
     """The ``UserPromptSubmit`` side. Returns what happened (for tests and dry mode)."""
     t0 = time.perf_counter()
@@ -785,6 +826,22 @@ def _is_capture_failure(m: dict[str, Any]) -> bool:
         m["start_snapshot"].get("state") == "failed" and m["start_snapshot"].get("reason") in STREAK_SNAPSHOT_REASONS)
 
 
+def capture_failure_times(stores: Stores, env: dict[str, str]) -> list[str]:
+    """Start times of every capture failure on record: failed manifests and not-yet-drained pending records."""
+    times = [m["started_at"] for m in scan_manifests(stores).manifests if _is_capture_failure(m)]
+    try:
+        for line in _pending_file(env).read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("started_at"), str):
+                times.append(rec["started_at"])
+    except OSError:
+        pass
+    return sorted(times)
+
+
 def failure_streaks(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Repos whose latest ``FAILURE_STREAK`` or more episodes are all capture failures."""
     by_repo: dict[str, list[dict[str, Any]]] = {}
@@ -921,6 +978,11 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
             exp = expire(stores, now=now, commit=False)
             counts.update(expired_deleted=exp["expired_deleted"], expire_errors=exp["errors"],
                           expire_undated=exp["undated"])
+        ptr = retire_open_pointers(stores, now)
+        counts.update(open_pointers_retired=len(ptr["retired"]), open_unjoined_stale=ptr["open_unjoined"][:20])
+        if ptr["retired"]:
+            log_line(stores, f"maintain: retired {len(ptr['retired'])} open pointer(s) past their Stop window: "
+                             + ",".join(ptr["retired"][:20]))
         after = scan_manifests(stores)
         counts["manifests_unreadable"] = len(set(unreadable) | set(after.unreadable))
         flags = failure_streaks(after.manifests)

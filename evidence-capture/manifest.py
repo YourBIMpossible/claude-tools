@@ -151,17 +151,38 @@ def compute_funnel(m: dict[str, Any]) -> dict[str, bool]:
     return f
 
 
+# The first three stages are independently observed gates (link, start snapshot, dependency
+# screen); each later stage is reached only when every earlier stage holds.
+GATES = FUNNEL[:3]
+GATED = FUNNEL[3:]
+
+
 def validate_funnel(f: dict[str, Any]) -> list[str]:
-    """Violations of monotonicity: a later stage true while an earlier one is false."""
+    """Violations of order: a gated stage true while an earlier stage is false.
+
+    Gate flags are independent observations, so e.g. a complete snapshot with no packet
+    link is consistent, not a violation."""
     bad = []
-    seen_false = None
-    for stage in FUNNEL:
-        v = bool(f.get(stage))
-        if seen_false and v:
-            bad.append(f"{stage} true after {seen_false} false")
-        if not v and seen_false is None:
-            seen_false = stage
+    for i, stage in enumerate(GATED, start=len(GATES)):
+        if f.get(stage):
+            missing = [s for s in FUNNEL[:i] if not f.get(s)]
+            if missing:
+                bad.append(f"{stage} true while {missing[0]} false")
     return bad
+
+
+def cumulative_funnel(fl: list[dict[str, Any]]) -> dict[str, int]:
+    """Ordered counts: episodes for which a stage and every stage before it hold."""
+    return {stage: sum(1 for f in fl if all(f.get(s) for s in FUNNEL[:i + 1])) for i, stage in enumerate(FUNNEL)}
+
+
+FAILURE_CAUSES = ("store_unusable", "stores_not_configured")
+
+
+def failure_cause(reason: str) -> str:
+    """The recorded cause of a refused or failed start: a known ``cause: detail`` prefix, else write_error."""
+    head = reason.split(":", 1)[0].strip()
+    return head if head in FAILURE_CAUSES else "write_error"
 
 
 def provisional_candidate(f: dict[str, Any]) -> bool:

@@ -25,7 +25,7 @@ from store import Stores, check_content_store, commit_meta, meta_clean, read_del
 
 EPISODES_TARGET = 50
 ORIGIN_BUCKETS = ("human", "task_notification", "hook", "other")
-SNAPSHOT_REASONS = ("timeout", "size_cap", "write_error", "head_unresolved")
+SNAPSHOT_REASONS = ("timeout", "size_cap", "write_error", "head_unresolved", "store_unusable", "stores_not_configured")
 BOUNDARY_BUCKETS = ("cli_untested", "bracket_dirty", "lock_present", "hook_killed")
 
 
@@ -149,8 +149,22 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
 
     # funnel
     fl = [m["funnel"] for m in ms]
+    # Manifests written before failure causes were recorded label every refused start write_error;
+    # the true cause is the prefix of the recorded error. Stored manifests stay untouched.
+    corrected = 0
+
+    def snap_reason(m: dict[str, Any]) -> Any:
+        nonlocal corrected
+        r = m["start_snapshot"].get("reason")
+        if m["capture"].get("status") == "failed" and r == "write_error":
+            errs = m["capture"].get("errors") or []
+            cause = mf.failure_cause(errs[0]) if errs else r
+            if cause != r:
+                corrected += 1
+                return cause
+        return r
     link_states = Counter(m["link"].get("state") for m in ms)
-    snap_bad = Counter(m["start_snapshot"].get("reason") for m in ms if m["start_snapshot"].get("state") != "complete")
+    snap_bad = Counter(snap_reason(m) for m in ms if m["start_snapshot"].get("state") != "complete")
     by_reason = {k: snap_bad.get(k, 0) for k in SNAPSHOT_REASONS}
     other = sum(v for k, v in snap_bad.items() if k not in SNAPSHOT_REASONS)
     if other:
@@ -183,10 +197,13 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
                      "untrusted_by_reason": {k: buckets.get(k, 0) for k in BOUNDARY_BUCKETS},
                      "untrusted_raw": dict(sorted(raw.items()))},
         "provisional_candidates": sum(1 for f in fl if mf.provisional_candidate(f)),
+        "cumulative": mf.cumulative_funnel(fl),
+        "cause_corrections": {"write_error_to_recorded_cause": corrected,
+                              "source": "capture.errors prefix; stored manifests unchanged"},
     }
     violations = [m["episode_id"] for m in ms if mf.validate_funnel(m["funnel"])]
     if violations:
-        notes.append(f"funnel monotonicity violated in {len(violations)} manifest(s)")
+        notes.append(f"funnel order violated in {len(violations)} manifest(s)")
 
     # exclusions
     per_rule = {r: {"yes": 0, "no": 0, "unknown": 0} for r in mf.RULES}
@@ -255,7 +272,7 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
     fail_causes = Counter()
     for m in fails:
         errs = m["capture"].get("errors") or []
-        fail_causes[m["start_snapshot"].get("reason") if m["start_snapshot"].get("state") == "failed"
+        fail_causes[snap_reason(m) if m["start_snapshot"].get("state") == "failed"
                     else (errs[0] if errs else "unknown")] += 1
     start_ms = [m["capture"]["start_ms"] for m in ms if isinstance(m["capture"].get("start_ms"), int)]
     end_ms = [m["capture"]["end_ms"] for m in ms if isinstance(m["capture"].get("end_ms"), int)]

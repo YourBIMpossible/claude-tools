@@ -151,6 +151,15 @@ def test_backstop_reports_failures(root: Path) -> None:
     assert backstop.health(status, now=later)["state"] == "stale"
     assert backstop.health(root / "none.json")["state"] == "never_run"
 
+    # 7. refusals after the last pass are never hidden behind its "ok"
+    after = [iso(now_utc() + timedelta(minutes=i + 1)) for i in range(pipeline.FAILURE_STREAK)]
+    before = [iso(now_utc() - timedelta(days=2))]
+    assert backstop.health(status, failure_times=before)["state"] == "ok"
+    one = backstop.health(status, failure_times=after[:1], now=after[-1])
+    assert one["state"] == "warn" and one["capture_failures_since_last_run"] == 1, one
+    many = backstop.health(status, failure_times=before + after, now=after[-1])
+    assert many["state"] == "fail" and many["capture_failures_since_last_run"] == pipeline.FAILURE_STREAK, many
+
 
 def test_backstop_waits_for_maintenance_child(root: Path) -> None:
     """A hook-launched maintenance run holding the lock delays the backstop, not fails it."""

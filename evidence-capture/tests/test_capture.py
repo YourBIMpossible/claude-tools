@@ -24,6 +24,7 @@ sys.path.insert(0, str(PKG))
 import common  # noqa: E402
 import join  # noqa: E402
 import linkage  # noqa: E402
+import pipeline  # noqa: E402
 import manifest as mf  # noqa: E402
 import screen  # noqa: E402
 import snapshot  # noqa: E402
@@ -570,7 +571,16 @@ def test_funnel_stages_monotone(root: Path) -> None:
     m["funnel"].update(privacy_cleared=True, payload_materialized=True, replay_verified=True)
     f = mf.compute_funnel(m)
     assert not any(f.values()), f  # nothing earlier holds → nothing later survives
-    assert mf.validate_funnel({"packet_linked": False, "start_snapshot_complete": True}) == ["start_snapshot_complete true after packet_linked false"]
+    # gate flags are independent observations: a complete snapshot without a link is consistent
+    assert mf.validate_funnel({"packet_linked": False, "start_snapshot_complete": True}) == []
+    assert mf.validate_funnel({"packet_linked": True, "start_snapshot_complete": False,
+                               "dependency_screen_clear": True, "privacy_cleared": True}) == [
+        "privacy_cleared true while start_snapshot_complete false"]
+    fl = [{"packet_linked": False, "start_snapshot_complete": True},
+          {"packet_linked": True, "start_snapshot_complete": True, "dependency_screen_clear": False},
+          {"packet_linked": True, "start_snapshot_complete": False}]
+    cum = mf.cumulative_funnel(fl)
+    assert (cum["packet_linked"], cum["start_snapshot_complete"], cum["dependency_screen_clear"]) == (2, 1, 0), cum
     assert mf.validate_funnel({k: True for k in mf.FUNNEL}) == []
     m["link"]["state"] = "linked"
     m["start_snapshot"] = {"state": "complete"}
@@ -610,6 +620,17 @@ def test_owner_resolution_limits(root: Path) -> None:
 # ------------------------------------------------------------------------ runner
 
 REPORT: dict[str, object] = {}
+def test_failure_cause_from_recorded_error(root: Path) -> None:
+    assert mf.failure_cause("store_unusable: metadata store is not a git repository") == "store_unusable"
+    assert mf.failure_cause("stores_not_configured") == "stores_not_configured"
+    assert mf.failure_cause("OSError: disk full") == "write_error"
+    rec = {"episode_id": "cap_f", "session_id": "s", "started_at": "2026-10-05T11:13:55Z",
+           "prompt_sha256": "0" * 64, "prompt_len": 1}
+    m = pipeline.failed_manifest(rec, "store_unusable: metadata .git/info/exclude lacks the content exclusions")
+    assert m["start_snapshot"]["reason"] == "store_unusable" and m["capture"]["status"] == "failed"
+    assert not m["funnel"]["start_snapshot_complete"]  # a failed start is never promoted
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

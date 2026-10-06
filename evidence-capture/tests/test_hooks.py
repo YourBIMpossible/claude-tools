@@ -485,6 +485,31 @@ def test_maintain_store_problems_are_findings(root: Path) -> None:
     assert pipeline.maintain_findings({"action": "maintained", "store_problems": []}) == ([], [])
 
 
+def test_open_pointer_retired_after_stop_window(root: Path) -> None:
+    """2026-10-05: seven open/ pointers from Sep 29-30 outlived their maintenance-joined episodes."""
+    fx = Fixture(root)
+    sid, sid2 = str(uuid.uuid4()), str(uuid.uuid4())
+    pid, ts = fx.start(sid)
+    fx.transcript(sid, PROMPT, pid, ts)
+    second = "Now add a docstring to alpha."
+    ts2 = iso(now_utc())
+    fx.start(sid, prompt=second, packet=False)
+    fx.transcript(sid, second, None, ts2, append=True, edit=False)
+    pipeline.run_maintain(fx.stores, fx.env)
+    first = [m for m in manifests(fx.stores) if m["session_id"] == sid and m["started_at"] < ts2][0]
+    later = [m for m in manifests(fx.stores) if m["session_id"] == sid and m["started_at"] >= ts2][0]
+    open_dir = fx.stores.meta / "open"
+    (open_dir / sid).write_text(first["episode_id"] + "\n", encoding="utf-8")  # Stop never came
+    (open_dir / sid2).write_text(later["episode_id"] + "\n", encoding="utf-8")  # never joined
+    soon = pipeline.retire_open_pointers(fx.stores, iso(now_utc() + timedelta(hours=1)))
+    assert soon["retired"] == [] and (open_dir / sid).is_file(), soon  # a late Stop may still replace the join
+    late = iso(now_utc() + timedelta(hours=pipeline.OPEN_POINTER_STALE_H + 1))
+    res = pipeline.retire_open_pointers(fx.stores, late)
+    assert res["retired"] == [first["episode_id"]] and not (open_dir / sid).exists(), res
+    assert res["open_unjoined"] == [later["episode_id"]] and (open_dir / sid2).is_file(), res
+    assert pipeline.read_manifest(fx.stores, first["episode_id"]) == first  # the manifest is untouched
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

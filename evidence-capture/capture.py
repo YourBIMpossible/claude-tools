@@ -92,7 +92,8 @@ def main(argv: list[str] | None = None) -> int:
             print(args.task_xml)
             return 0
         if args.health:
-            _print(backstop.health(backstop.status_path(env)))
+            st = _stores(env)
+            _print(backstop.health(backstop.status_path(env), failure_times=pipeline.capture_failure_times(st, env)))
             return 0
         rec = backstop.run_backstop(env)
         _print(rec)
@@ -114,7 +115,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "report":
         commit, _ = pipeline.tool_identity()
         import backstop
-        path, ck = write_checkpoint(st, tool_commit=commit, backstop=backstop.health(backstop.status_path(env)))
+        path, ck = write_checkpoint(st, tool_commit=commit, backstop=backstop.health(
+            backstop.status_path(env), failure_times=pipeline.capture_failure_times(st, env)))
         _print({"checkpoint": str(path), "episodes": ck["denominator"]["episodes_total"],
                 "provisional_candidates": ck["funnel"]["provisional_candidates"]})
         return 0
