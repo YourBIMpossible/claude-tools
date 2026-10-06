@@ -1201,6 +1201,7 @@ def test_shell_repo_mutation_blocks_x2_yes(root: Path) -> None:
         "repo script": ("node scripts/build.mjs", {"unresolved_effect:exec:node"}, False),
         "checkout": ("git switch -c topic", {"git_worktree:git switch"}, False),
         "failed commit": ("git commit -qm n", {"git_history:git commit:failed"}, True),
+        "call operator on a variable": ("& $exe --version", {"unresolved_effect:exec:$exe"}, False),
     }
     for label, (cmd, want, err) in cases.items():
         turns = [{"prompt": f"task {label}", "tools": [{"name": "Bash", "input": {"command": cmd}, "error": err}]}]
@@ -1214,7 +1215,8 @@ def test_shell_repo_mutation_blocks_x2_yes(root: Path) -> None:
         == ["git_history", "content_write", "unresolved_target", "unresolved_effect"]
     # mutations in another repository, temp files and plain reads leave X2 = yes
     for cmd in (f"cd '{other}' && git add -A && git commit -qm n", "git status && git log -3 > /dev/null",
-                "echo x > /tmp/scratch.txt", f"git -C '{other}' switch main", f"cd '{other}' && python -m pytest"):
+                "echo x > /tmp/scratch.txt", f"git -C '{other}' switch main", f"cd '{other}' && python -m pytest",
+                "Get-ChildItem | ForEach-Object { $_.FullName }; $i++; $false"):
         m = joined(root, repo, [{"prompt": "look only", "tools": [{"name": "Bash", "input": {"command": cmd}}]}], 0)
         assert m["observation"]["shell_repo_mutations"] == [], (cmd, m["observation"])
         assert rule(m, "X2") == "yes", (cmd, m["exclusions"], m["observation"])
