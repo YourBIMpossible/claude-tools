@@ -172,6 +172,7 @@ class PathUse:
     path: str
     role: str  # read | search | write | exec | nav | script
     verb: str
+    base: str | None = None  # directory a relative path is relative to when the command sets one (git -C)
 
 
 @dataclass
@@ -183,6 +184,11 @@ class Segment:
     queries: list[str] = field(default_factory=list)
     miss_reason: str | None = None
     has_pathlike: bool = False
+
+
+def _is_absolute(p: str) -> bool:
+    q = p.replace("\\", "/")
+    return bool(re.match(r"^[a-zA-Z]:/", q)) or q.startswith(("/", "~", "$"))
 
 
 def is_pathlike(tok: str) -> bool:
@@ -524,11 +530,11 @@ def parse_segment(seg: str) -> Segment:
         return s
     pos, flagged = flags_and_positionals(verb, args)
 
-    def add(paths: list[str], role: str) -> None:
+    def add(paths: list[str], role: str, base: str | None = None) -> None:
         for p in paths:
             c = _clean_arg(p)
             if c:
-                s.paths.append(PathUse(c, role, verb))
+                s.paths.append(PathUse(c, role, verb, base))
 
     if verb.startswith((SUB.lower(), BODY.lower(), BLOCK.lower())):
         s.kind = "nonfile"
@@ -557,7 +563,12 @@ def parse_segment(seg: str) -> Segment:
     elif verb == "git":
         s.kind = "git"
         j = 0
+        git_base: str | None = None
         while j < len(args) and args[j].startswith("-"):
+            if args[j] == "-C" and j + 1 < len(args):
+                d = _clean_arg(args[j + 1])
+                if d:  # successive -C options compose, as in git itself
+                    git_base = d if git_base is None or _is_absolute(d) else f"{git_base}/{d}"
             j += 2 if args[j] in {"-C", "-c", "--git-dir", "--work-tree"} else 1
         sub = args[j].lower() if j < len(args) else ""
         rest = args[j + 1:]
@@ -584,7 +595,7 @@ def parse_segment(seg: str) -> Segment:
             elif (is_pathlike(a) and (is_filelike(a) or role == "write")
                   and not re.match(r"^[0-9a-f]{7,40}$", a)):
                 paths.append(a)
-        add(paths, role)
+        add(paths, role, git_base)
     elif verb in WRITE:
         s.kind = "write"
         for fl, val in flagged:

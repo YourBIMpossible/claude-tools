@@ -238,9 +238,37 @@ def test_powershell_assignment_and_foreach() -> None:
           "ps: ForEach-Object script block parses")
 
 
+def test_repo_aware_relative_paths() -> None:
+    """A relative shell path is resolved against git -C and the call's cwd before matching."""
+    segs, _ = sp.parse_command(r"git -C F:\Other diff CLAUDE.md")
+    check([(u.path, u.base) for g in segs for u in g.paths] == [("CLAUDE.md", "F:/Other")],
+          "git -C: the directory is carried as the path base")
+    segs, _ = sp.parse_command("git -C F:/Other -C sub log -- a.py")
+    check([u.base for g in segs for u in g.paths] == ["F:/Other/sub"], "git -C: successive -C compose")
+
+    def touched(cmd: str, cwd: str | None) -> tuple[list[str], int]:
+        c = call(1, "Bash", {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        fp = fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+        return [t[1] for t in fp.touches], fp.outside
+
+    check(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT) == ([], 1),
+          "another repository's same-named file is outside, not a hit")
+    check(touched("git diff CLAUDE.md", WT) == (["claude.md"], 0), "the repo's own relative file still counts")
+    check(touched("cat CLAUDE.md", "F:/Other") == ([], 1), "a relative path from a cwd outside the repo is outside")
+    check(touched("cat docs/CLAUDE.md", WT + "/src") == (["src/docs/claude.md"], 0),
+          "a relative path resolves against a subdirectory cwd")
+    check(touched("git -C sub show HEAD:x.py", WT) == (["sub/x.py"], 0), "a relative -C resolves against the cwd")
+    check(touched("cat CLAUDE.md", None) == (["claude.md"], 0), "no recorded cwd keeps the historical reading")
+    check(not fpm.overlap(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT)[0], ["claude.md"]),
+          "the ckpt-7 cross-repository CLAUDE.md case no longer overlaps a cited CLAUDE.md")
+
+
 def main() -> int:
     test_shell_paths()
     test_powershell_assignment_and_foreach()
+    test_repo_aware_relative_paths()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
