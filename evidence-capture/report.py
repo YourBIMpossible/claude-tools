@@ -9,7 +9,11 @@ writes ``checkpoints/ckpt-<n>.json`` and its markdown rendering and commits both
 Keys beyond the §12 list are additive and documented where they are produced:
 ``denominator.by_origin.unjoined`` (episodes whose transcript turn was never found, so
 their origin is unknown), ``funnel.boundary.untrusted_raw`` (the manifest's own reasons
-before mapping onto the four §12 buckets) and ``notes``.
+before mapping onto the four §12 buckets), ``denominator.by_origin.peer``/``meta``
+(continuations recorded but never promoted), ``stage_status`` (privacy as passed, failed
+or not_reached; reconstruction and replay as passed, failed, not_evaluated or unknown),
+``human_yield`` (the experimental population: completed human tasks, with every
+independent blocker counted on its own) and ``notes``.
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ from review import load_owner_review, verify_payload
 from store import Stores, check_content_store, commit_meta, meta_clean, read_deletions, scan_manifests
 
 EPISODES_TARGET = 50
-ORIGIN_BUCKETS = ("human", "task_notification", "hook", "other")
+ORIGIN_BUCKETS = ("human", "task_notification", "peer", "meta", "hook", "other")
 SNAPSHOT_REASONS = ("timeout", "size_cap", "write_error", "head_unresolved", "store_unusable", "stores_not_configured")
 BOUNDARY_BUCKETS = ("cli_untested", "bracket_dirty", "lock_present", "hook_killed")
 
@@ -34,11 +38,75 @@ def _origin_bucket(origin: str | None) -> str | None:
         return None
     if origin in mf.HUMAN_ORIGINS:
         return "human"
-    if origin == "task_notification":
-        return "task_notification"
-    if origin == "hook":
-        return "hook"
+    if origin in ("task_notification", "peer", "meta", "hook"):
+        return origin
     return "other"
+
+
+def privacy_status(m: dict[str, Any]) -> str:
+    """``passed``/``failed`` only when the privacy-scope check actually ran; an episode
+    held or excluded before it is ``not_reached``, never a privacy failure."""
+    pv = (m.get("review") or {}).get("privacy")
+    if not isinstance(pv, dict) or pv.get("passed") is None:
+        return "not_reached"
+    return "passed" if pv["passed"] else "failed"
+
+
+def later_stage_status(m: dict[str, Any], stage: str) -> str:
+    """Reconstruction or replay: ``not_evaluated`` until every earlier stage holds;
+    then ``passed`` when recorded true, ``failed`` when a failure is recorded under
+    ``m[stage]``, else ``unknown`` (reached, no result)."""
+    i = mf.FUNNEL.index(stage)
+    f = m["funnel"]
+    if not all(f.get(s) for s in mf.FUNNEL[:i]):
+        return "not_evaluated"
+    if f.get(stage):
+        return "passed"
+    return "failed" if (m.get(stage) or {}).get("state") == "failed" else "unknown"
+
+
+def human_yield(ms: list[dict[str, Any]]) -> dict[str, Any]:
+    """Candidate yield among completed human tasks. Each blocker is counted
+    independently (an episode with three blockers counts in all three), and zero
+    candidates is reported as a count, not a judgement about replayability."""
+    pop = [m for m in ms if _origin_bucket(m["prompt"].get("origin")) == "human"
+           and m["capture"].get("status") == "complete"]
+    blockers: Counter[str] = Counter()
+    for m in pop:
+        f = m["funnel"]
+        if not f.get("packet_linked"):
+            blockers["link:" + str(m["link"].get("state"))] += 1
+        if m["start_snapshot"].get("state") != "complete":
+            blockers["snapshot:" + str(m["start_snapshot"].get("reason") or m["start_snapshot"].get("state"))] += 1
+        if not m["boundary"].get("trusted"):
+            blockers["boundary:" + _boundary_bucket(m["boundary"].get("reason"))] += 1
+        for r in ("X1", "X2", "X3", "X4", "X5"):
+            st = mf.rule_state(m["exclusions"], r)
+            if st != "no":
+                blockers[f"{r}:{st}"] += 1
+        if not m["observation"].get("sufficient", False):
+            blockers["observation:insufficient"] += 1
+        if privacy_status(m) != "passed":
+            blockers["privacy:" + privacy_status(m)] += 1
+    return {"population": "prompt.origin human, capture complete", "completed_human_tasks": len(pop),
+            "provisional_candidates": sum(1 for m in pop if mf.provisional_candidate(m["funnel"])),
+            "cumulative": mf.cumulative_funnel([m["funnel"] for m in pop]),
+            "blocked_only_by": dict(sorted(Counter(
+                k for m in pop for k in [_sole_blocker(m)] if k).items())),
+            "independent_blockers": dict(sorted(blockers.items()))}
+
+
+def _sole_blocker(m: dict[str, Any]) -> str | None:
+    """The one gate stopping an episode when exactly one of link, snapshot+boundary and
+    screen fails; None otherwise."""
+    f = m["funnel"]
+    failing = [g for g in mf.GATES if not f.get(g)]
+    if len(failing) != 1:
+        return None
+    if failing[0] == "dependency_screen_clear":
+        yes = [r for r in ("X1", "X2", "X3", "X4", "X5") if mf.rule_state(m["exclusions"], r) != "no"]
+        return "screen:" + "+".join(yes)
+    return failing[0]
 
 
 def _boundary_bucket(reason: str | None) -> str:
@@ -200,6 +268,11 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
         "cumulative": mf.cumulative_funnel(fl),
         "cause_corrections": {"write_error_to_recorded_cause": corrected,
                               "source": "capture.errors prefix; stored manifests unchanged"},
+        "stage_status": {"privacy": dict(sorted(Counter(privacy_status(m) for m in ms).items())),
+                         "start_state_reconstructed": dict(sorted(Counter(
+                             later_stage_status(m, "start_state_reconstructed") for m in ms).items())),
+                         "replay_verified": dict(sorted(Counter(
+                             later_stage_status(m, "replay_verified") for m in ms).items()))},
     }
     violations = [m["episode_id"] for m in ms if mf.validate_funnel(m["funnel"])]
     if violations:
@@ -305,6 +378,7 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
         "denominator": {"episodes_total": len(ms), "manifests_unreadable": len(scan.unreadable), "by_origin": by_origin,
                         "by_capture_status": {k: by_status.get(k, 0) for k in ("complete", "partial", "failed")}},
         "funnel": funnel,
+        "human_yield": human_yield(ms),
         "exclusions": {"per_rule": per_rule, "first_failing_rule": dict(sorted(first_failing.items())),
                        "cooccurrence": [{"rules": list(k), "count": v} for k, v in sorted(cooc.items())],
                        "owner_resolutions": resolved},
@@ -353,8 +427,14 @@ def render_markdown(ck: dict[str, Any]) -> str:
              "| Funnel stage | true | false |", "|---|---:|---:|"]
     for stage in mf.FUNNEL:
         lines.append(f"| {stage} | {f[stage]['true']} | {f[stage]['false']} |")
-    lines += ["", f"Provisional candidates: {f['provisional_candidates']}. Boundary trusted: {f['boundary']['trusted']}; "
+    hy = ck["human_yield"]
+    lines += ["", f"Cumulative: {f['cumulative']}.", f"Stage status: {f['stage_status']}.", "",
+              f"Provisional candidates: {f['provisional_candidates']}. Boundary trusted: {f['boundary']['trusted']}; "
               f"untrusted: {f['boundary']['untrusted_by_reason']}.", "",
+              f"Human yield: {hy['provisional_candidates']} candidate(s) of {hy['completed_human_tasks']} completed "
+              f"human tasks; cumulative {hy['cumulative']}.", "",
+              f"Independent blockers (human): {hy['independent_blockers']}.", "",
+              f"Blocked by a single gate (human): {hy['blocked_only_by']}.", "",
               "| Rule | yes | no | unknown |", "|---|---:|---:|---:|"]
     for r, v in ck["exclusions"]["per_rule"].items():
         lines.append(f"| {r} | {v['yes']} | {v['no']} | {v['unknown']} |")

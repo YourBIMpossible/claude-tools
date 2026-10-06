@@ -171,6 +171,11 @@ def test_capture_disabled_in_twin(root: Path) -> None:
     sid = str(uuid.uuid4())
     fx.start(sid, packet=False)
     assert not [m for m in manifests(fx.stores) if m["session_id"] == sid]
+    # skipped prompts leave metadata-only diagnostics; the kill switch leaves none
+    skips = [json.loads(x) for x in (fx.stores.meta / pipeline.START_SKIPS).read_text(encoding="utf-8").splitlines()]
+    assert [r["reason"] for r in skips] == ["not_enabled", "disabled_by_repo"], skips
+    assert skips[1]["session_id"] == sid and all(set(r) == {"at", "reason", "session_id", "cwd_sha256"} for r in skips)
+    assert PROMPT not in (fx.stores.meta / pipeline.START_SKIPS).read_text(encoding="utf-8")
     # the Twin's child environment disables capture
     sys.path.insert(0, str(PKG.parent / "evidence-twin"))
     import twin  # noqa: E402
@@ -508,6 +513,47 @@ def test_open_pointer_retired_after_stop_window(root: Path) -> None:
     assert res["retired"] == [first["episode_id"]] and not (open_dir / sid).exists(), res
     assert res["open_unjoined"] == [later["episode_id"]] and (open_dir / sid2).is_file(), res
     assert pipeline.read_manifest(fx.stores, first["episode_id"]) == first  # the manifest is untouched
+
+
+def test_rescreen_corrects_and_records(root: Path) -> None:
+    import rescreen
+    fx = Fixture(root)
+    sid = str(uuid.uuid4())
+    pid, ts = fx.start(sid)
+    tp = fx.transcript(sid, PROMPT, pid, ts)
+    fx.end(sid, tp)
+    good = fx.episode(sid)
+    # idempotent on a manifest the current tool produced
+    rec = rescreen.run_rescreen(fx.stores, fx.env)
+    assert rec["changed"] == [] and rec["outcomes"] == {"rescreened": 1}, rec
+    assert fx.episode(sid)["observation"] == good["observation"]
+    # a stale judgement (as an older tool wrote it) is recomputed, with provenance
+    stale = fx.episode(sid)
+    stale["prompt"]["origin"] = "queued_command:prompt"
+    stale["observation"] = {"sufficient": False, "causes": ["stale_cause"]}
+    store.write_manifest(fx.stores, stale)
+    rec = rescreen.run_rescreen(fx.stores, fx.env)
+    m = fx.episode(sid)
+    assert m["prompt"]["origin"] == good["prompt"]["origin"] and m["observation"] == good["observation"], m["observation"]
+    corr = m["corrections"][-1]
+    assert corr["by"] == "rescreen" and corr["before"]["origin"] == "queued_command:prompt"
+    assert corr["before"]["causes"] == ["stale_cause"] and corr["after"]["sufficient"] == good["observation"]["sufficient"]
+    assert rec["before"]["by_cause"] == {"stale_cause": 1} and rec["changed"][0]["episode_id"] == m["episode_id"]
+    assert Path(rec["record"]).is_file() and rec["committed"] and store.meta_clean(fx.stores)
+    # transcript gone: a sufficient judgement over delegated work is withdrawn, not kept
+    m["observation"] = {"sufficient": True, "causes": []}
+    m["capture"]["join"]["subagents"] = 1
+    for c in mf.DEP_CATEGORIES:
+        m["deps"][c]["required"] = "no"
+    store.write_manifest(fx.stores, m)
+    tp.unlink()
+    rec = rescreen.run_rescreen(fx.stores, fx.env)
+    m = fx.episode(sid)
+    assert rec["outcomes"] == {"invalidated_transcript_unavailable": 1}, rec["outcomes"]
+    assert m["observation"]["sufficient"] is False and "rescreen_transcript_unavailable" in m["observation"]["causes"]
+    assert all(m["deps"][c]["required"] == "unknown" for c in mf.DEP_CATEGORIES if c != "prior_conversation")
+    assert not m["funnel"]["dependency_screen_clear"]
+    assert PROMPT not in Path(rec["record"]).read_text(encoding="utf-8")
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

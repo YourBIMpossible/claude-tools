@@ -56,6 +56,9 @@ PROMPT_REQUIRED_RE = {
     "external_repository": re.compile(r"\b(?:the |in )?other repo(?:sitory)?\b|\bfrom (?:the )?[\w-]+ repo\b", re.I),
     "memory_or_scratch": re.compile(r"\byour memory\b|\bremember(?:ed)? (?:from|that)\b|\bscratchpad\b|\btask output\b|\bMEMORY\.md\b", re.I),
 }
+# "the pasted text" names a dependency only when the paste is not inline in the prompt.
+INLINE_PASTE_RE = re.compile(r"<pasted_content\b", re.I)
+PASTE_PHRASE_RE = re.compile(r"\bthe pasted (?:text|content)\b", re.I)
 DEICTIC_RE = re.compile(r"\b(?:as (?:above|before|discussed|we said|I said)|continue|carry on|go ahead|proceed|the plan we|that file|those files|same as|again|the previous|earlier (?:you|we)|like (?:before|last time)|now do|next,? do|also do|the other one|this one)\b", re.I)
 NEXT_STEP_RE = re.compile(r"^\s*(?:yes|ok|okay|approved?|proceed|go|do it|continue|next|same)\b[.!]?\s*$", re.I)
 
@@ -211,9 +214,11 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
     for call in obs["tool_calls"]:
         name, inp = call["name"], call["input"]
         cats_here: list[str] = []
+        # A delegated call resolves relative paths against its own agent's cwd.
+        call_cwd = (call.get("cwd") or cwd) if call.get("source", "main") != "main" else cwd
         if name in SHELL_TOOLS:
             cmd = str(inp.get("command") or "")
-            sobs, clean = _shell_observations(cmd, idx, cwd, markers)
+            sobs, clean = _shell_observations(cmd, idx, call_cwd, markers)
             if not clean:
                 causes.append("shell_path_miss")
             for c, items in sobs.items():
@@ -225,12 +230,12 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
         elif name in EDIT_TOOLS or name in READ_TOOLS:
             p = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
             if isinstance(p, str):
-                cat = classify_path(p, idx, cwd, markers)
+                cat = classify_path(p, idx, call_cwd, markers)
                 if cat:
                     observed[cat].append(f"{name}:{p[:80]}")
                     cats_here.append(cat)
                 elif name in EDIT_TOOLS:
-                    rel = idx.relative(p) or idx.relative(f"{cwd or idx.root}/{p}")
+                    rel = idx.relative(p) or idx.relative(f"{call_cwd or idx.root}/{p}")
                     if rel and rel not in edited:
                         edited.append(rel)
                     first_edit_seen = True
@@ -263,7 +268,9 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
         if c == "prior_conversation":
             continue
         ev: list[dict[str, str]] = []
-        if PROMPT_REQUIRED_RE.get(c) and PROMPT_REQUIRED_RE[c].search(prompt):
+        named = PROMPT_REQUIRED_RE.get(c) and PROMPT_REQUIRED_RE[c].search(
+            PASTE_PHRASE_RE.sub("", prompt) if c == "attachment" and INLINE_PASTE_RE.search(prompt) else prompt)
+        if named:
             ev.append({"kind": "prompt_names_dependency", "detail": c})
         overlap = edit_lines & read_lines[c]
         if overlap:

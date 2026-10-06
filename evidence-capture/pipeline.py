@@ -518,9 +518,11 @@ def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str
     cap = m["capture"]
     errors = [e for e in cap.get("errors", []) if not e.startswith(("join:", "end_", "root:"))]
     m["ended_by"] = None  # recomputed by every join
-    obs = join(m, transcript)
+    misses: list[str] = []
+    obs = join(m, transcript, misses)
     if obs is None:
-        cap.update(errors=errors + ["join:prompt_not_in_transcript"], status="partial")
+        reason = "join:prompt_ambiguous" if "prompt_ambiguous" in misses else "join:prompt_not_in_transcript"
+        cap.update(errors=errors + [reason], status="partial")
         cap["join"] = {"state": "prompt_not_found", "by": by, "at": now}
         mf.refresh(m, (load_owner_review(stores, m["episode_id"]) or {}).get("rules"))
         return None
@@ -554,7 +556,8 @@ def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str
                 status = "partial"
     cap.update(status=status, errors=errors, phase="ended")
     cap["join"] = {"state": "joined", "by": by, "at": now, "tool_calls": len(obs["tool_calls"]),
-                   "subagents": obs.get("subagent_count", 0)}
+                   "subagents": obs.get("subagent_count", 0),
+                   "subagents_unresolved": obs.get("subagent_unresolved", 0)}
     mf.refresh(m, (load_owner_review(stores, m["episode_id"]) or {}).get("rules"))
     if root is None:
         return None
@@ -639,10 +642,33 @@ def retire_open_pointers(stores: Stores, now: str) -> dict[str, Any]:
     return out
 
 
+START_SKIPS = "diagnostics/start-skips.jsonl"
+
+
+def record_start_skip(env: dict[str, str], payload: dict[str, Any], reason: str, now: str | None) -> None:
+    """Metadata-only record of a prompt the start hook deliberately did not capture:
+    reason, session id, time and a cwd hash. Never the prompt. Never raises."""
+    try:
+        stores = resolve_stores(env)
+        if stores is None:
+            return
+        sid = payload.get("session_id")
+        cwd = payload.get("cwd")
+        rec = {"at": now or iso(now_utc()), "reason": reason,
+               "session_id": sid if isinstance(sid, str) and SESSION_RE.match(sid) else None,
+               "cwd_sha256": sha256_bytes(norm_path(cwd).encode()) if isinstance(cwd, str) and cwd else None}
+        path = stores.meta / START_SKIPS
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:  # diagnostics must never affect the prompt
+        return
+
+
 def run_start(payload: dict[str, Any], env: dict[str, str], *, now: str | None = None) -> dict[str, Any]:
     """The ``UserPromptSubmit`` side. Returns what happened (for tests and dry mode)."""
     t0 = time.perf_counter()
-    if disabled(env):
+    if disabled(env):  # the kill switch (and the Twin) means write nothing at all
         return {"action": "disabled"}
     session_id, prompt, cwd = payload.get("session_id"), payload.get("prompt"), payload.get("cwd")
     if not isinstance(session_id, str) or not SESSION_RE.match(session_id) or not isinstance(prompt, str):
@@ -650,9 +676,11 @@ def run_start(payload: dict[str, Any], env: dict[str, str], *, now: str | None =
         return {"action": "bad_input"}
     root = find_repo_root(cwd)
     if root is None:
+        record_start_skip(env, payload, "not_enabled", now)
         return {"action": "not_enabled"}
     cfg = load_capture_config(root)
     if not cfg["enabled"]:
+        record_start_skip(env, payload, "disabled_by_repo", now)
         return {"action": "disabled_by_repo"}
     stores = resolve_stores(env)
     started_at = now or iso(now_utc())

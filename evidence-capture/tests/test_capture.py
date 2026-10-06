@@ -83,7 +83,11 @@ def packet(pid: str, prompt: str, created: str, head_sha: str | None, session: s
 # --------------------------------------------------------------- synthetic transcripts
 
 def transcript_lines(turns: list[dict], version: str = "9.9.9") -> list[str]:
-    """``turns``: [{prompt, origin?, meta?, tools:[{name,input,result,error?}], brief?}]."""
+    """``turns``: [{prompt, origin?, meta?, queued?, tools:[{name,input,result,error?,agent?}], brief?}].
+
+    ``queued``: the prompt arrives as a ``queued_command`` attachment carrying these extra
+    attachment fields (commandMode, origin, isMeta) — the transcript's real shape. ``agent``
+    on a tool: its result reports that subagent id, as an Agent call's result does."""
     lines: list[str] = []
     n = 0
     for t in turns:
@@ -95,6 +99,9 @@ def transcript_lines(turns: list[dict], version: str = "9.9.9") -> list[str]:
             entry["isMeta"] = True
         if t.get("origin"):
             entry["origin"] = {"kind": t["origin"]}
+        if isinstance(t.get("queued"), dict):
+            entry = {"type": "attachment", "uuid": f"u-{n}", "timestamp": ts, "sessionId": SESSION, "version": version,
+                     "attachment": {"type": "queued_command", "prompt": t["prompt"], **t["queued"]}}
         lines.append(json.dumps(entry))
         if t.get("brief"):
             lines.append(json.dumps({"type": "attachment", "timestamp": ts, "sessionId": SESSION,
@@ -105,10 +112,13 @@ def transcript_lines(turns: list[dict], version: str = "9.9.9") -> list[str]:
             lines.append(json.dumps({"type": "assistant", "timestamp": ts, "sessionId": SESSION, "version": version,
                                      "message": {"id": f"msg_{n}_{k}", "role": "assistant", "content": [
                                          {"type": "tool_use", "id": tid, "name": tool["name"], "input": tool["input"]}]}}))
-            lines.append(json.dumps({"type": "user", "timestamp": ts, "sessionId": SESSION,
-                                     "message": {"role": "user", "content": [
-                                         {"type": "tool_result", "tool_use_id": tid, "is_error": bool(tool.get("error")),
-                                          "content": tool.get("result", "ok")}]}}))
+            result = {"type": "user", "timestamp": ts, "sessionId": SESSION,
+                      "message": {"role": "user", "content": [
+                          {"type": "tool_result", "tool_use_id": tid, "is_error": bool(tool.get("error")),
+                           "content": tool.get("result", "ok")}]}}
+            if tool.get("agent"):
+                result["toolUseResult"] = {"status": "completed", "agentId": tool["agent"]}
+            lines.append(json.dumps(result))
         if t.get("tools") or t.get("reply", True):
             lines.append(json.dumps({"type": "assistant", "timestamp": ts, "sessionId": SESSION, "version": version,
                                      "message": {"id": f"msg_{n}_end", "role": "assistant",
@@ -120,6 +130,32 @@ def write_transcript(root: Path, turns: list[dict], name: str = SESSION) -> Path
     p = root / f"{name}.jsonl"
     p.write_text("\n".join(transcript_lines(turns)) + "\n", encoding="utf-8")
     return p
+
+
+def write_subagent(root: Path, agent: str, tools: list[dict], spawned_by: str | None = None,
+                   ts: str = "2026-09-26T10:01:00.000Z", cwd: str | None = None, name: str = SESSION) -> Path:
+    """``<session>/subagents/agent-<agent>.jsonl`` (every line ``isSidechain``) plus its
+    ``.meta.json`` naming the spawning tool-use id, when ``spawned_by`` is given."""
+    d = root / name / "subagents"
+    d.mkdir(parents=True, exist_ok=True)
+    base = {"isSidechain": True, "agentId": agent, "sessionId": name, "timestamp": ts, "cwd": cwd}
+    lines = [json.dumps({**base, "type": "user", "message": {"role": "user", "content": "delegated task"}})]
+    for k, tool in enumerate(tools):
+        tid = f"toolu_{agent}_{k}"
+        lines.append(json.dumps({**base, "type": "assistant", "timestamp": tool.get("ts", ts), "message": {
+            "id": f"msg_{agent}_{k}", "role": "assistant",
+            "content": [{"type": "tool_use", "id": tid, "name": tool["name"], "input": tool["input"]}]}}))
+        result = {**base, "type": "user", "timestamp": tool.get("ts", ts), "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": tool.get("result", "ok")}]}}
+        if tool.get("agent"):
+            result["toolUseResult"] = {"agentId": tool["agent"]}
+        lines.append(json.dumps(result))
+    path = d / f"agent-{agent}.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if spawned_by:
+        (d / f"agent-{agent}.meta.json").write_text(json.dumps(
+            {"agentType": "general-purpose", "toolUseId": spawned_by, "spawnDepth": 1}), encoding="utf-8")
+    return path
 
 
 def joined(root: Path, repo: Path, turns: list[dict], which: int, complete: bool = True,
@@ -408,7 +444,7 @@ def test_join_turn_and_bounds(root: Path) -> None:
     m = base_manifest("second task", started="2026-09-26T10:03:00.000000Z")
     obs = join.join(m, tr)
     assert obs is not None
-    assert m["prompt_uuid"] == "u-3" and m["prompt"]["origin"] == "user" and m["prompt"]["index_in_session"] == 1
+    assert m["prompt_uuid"] == "u-3" and m["prompt"]["origin"] == "human" and m["prompt"]["index_in_session"] == 1
     assert m["ended_by"] == "prompt" and m["boundary"]["cli_version"] == "9.9.9"
     assert [c["name"] for c in obs["tool_calls"]] == ["Edit"]
     assert m["prior_context"]["has_prior_conversation"] is True
@@ -650,8 +686,8 @@ def test_packet_discovery_repo_store_names_and_session_roots(root: Path) -> None
 
 def test_find_turn_meta_and_contained_prompts(root: Path) -> None:
     h = common.sha256_text
-    inner = "please review the hand-back"
-    wrapped = "Another session sent a message:\n<agent-message>\n" + inner + "\n</agent-message>"
+    inner = '<agent-message from="lane-b">\nplease review the hand-back\n</agent-message>'
+    wrapped = "Another Claude session sent a message:\n" + inner + "\n\nThis came from another Claude session."
     ev = lambda i, kind, text, ts: join.Event(i, kind, ts, {"sha256": h(text), "text": text, "uuid": str(i),
                                                           "origin": "meta", "attachment": False})
     tr = join.Transcript(root / "t.jsonl", [ev(0, "candidate", "meta prompt", "2026-10-01T00:00:00Z"),
@@ -665,6 +701,245 @@ def test_find_turn_meta_and_contained_prompts(root: Path) -> None:
     assert join.find_turn(tr, h(inner), "2026-10-01T00:05:00Z") is None
     assert join.find_turn(tr, h(inner), "2026-10-01T00:05:00Z", len(inner) - 1) is None
     assert join.find_turn(tr, h(inner), "2026-10-01T01:00:00Z", len(inner)) is None
+
+
+# ------------------------------------------------------------- delegated work (D1)
+
+AGENT_ID = "a1b2c3d4e5f60718"
+
+
+def _delegating_turns(repo: Path, extra: list[dict] | None = None) -> list[dict]:
+    return [{"prompt": "fix alpha via a helper", "tools": [
+        {"name": "Agent", "input": {"prompt": "do it"}, "result": f"done\nagentId: {AGENT_ID}", "agent": AGENT_ID},
+        *(extra or [])]}, {"prompt": "next task"}]
+
+
+def test_delegated_reads_and_edits_are_observed(root: Path) -> None:
+    repo = make_repo(root)
+    other = make_repo(root, "other")
+    doc = "the quick brown fox jumps over the lazy dog, twice\n"
+    (other / "DOC.md").write_text(doc, encoding="utf-8")
+    write_subagent(root, AGENT_ID, [
+        {"name": "Read", "input": {"file_path": str(other / "DOC.md")}, "result": doc},
+        {"name": "Write", "input": {"file_path": str(repo / "DOC.md"), "content": doc}}], spawned_by="toolu_1_0")
+    turns = _delegating_turns(repo)
+    tr = write_transcript(root, turns)
+    m = base_manifest(turns[0]["prompt"], started="2026-09-26T10:01:00.000000Z")
+    obs = join.join(m, tr)
+    assert obs["subagent_count"] == 1 and obs["subagent_unresolved"] == 0
+    assert {c["source"] for c in obs["tool_calls"]} == {"main", f"agent-{AGENT_ID}"}
+    m = joined(root, repo, turns, 0)
+    assert "missing_subagent_transcript" not in m["observation"]["causes"], m["observation"]
+    assert m["edited_files"] == [{"path_sha256": common.path_sha256("DOC.md")}]
+    assert m["deps"]["external_repository"]["required"] == "yes" and rule(m, "X4") == "yes"
+    assert rule(m, "X2") == "no"  # the delegated edit is a repository edit
+
+
+def test_delegated_network_external_path_and_other_session(root: Path) -> None:
+    repo = make_repo(root)
+    outside = root / "outside"
+    outside.mkdir()
+    write_subagent(root, AGENT_ID, [
+        {"name": "WebFetch", "input": {"url": "https://example.invalid/doc"}, "result": "page"},
+        {"name": "Read", "input": {"file_path": str(outside / "notes.txt")}, "result": "n"},
+        {"name": "Bash", "input": {"command": "git worktree add ../lane-x"}, "result": ""},
+        {"name": "SendMessage", "input": {"to": "lane-b", "message": "hi"}, "result": "sent"}],
+        spawned_by="toolu_1_0")
+    m = joined(root, repo, _delegating_turns(repo), 0)
+    obs = {c: m["deps"][c]["observed"] for c in ("network", "external_path", "other_session")}
+    assert obs["network"] >= 1 and obs["external_path"] >= 1 and obs["other_session"] >= 3, obs
+    assert m["deps"]["network"]["required"] != "no" and m["deps"]["external_path"]["required"] != "no"
+
+
+def test_delegation_resolves_by_agent_id_and_nested_agents(root: Path) -> None:
+    repo = make_repo(root)
+    nested = "f0e1d2c3b4a59687"
+    # no meta file: resolved through the agentId the Agent result reports
+    write_subagent(root, AGENT_ID, [{"name": "Agent", "input": {"prompt": "deeper"}, "result": "ok", "agent": nested}])
+    write_subagent(root, nested, [{"name": "WebSearch", "input": {"query": "x"}, "result": "r"}],
+                   spawned_by=f"toolu_{AGENT_ID}_0")
+    tr = write_transcript(root, _delegating_turns(repo))
+    m = base_manifest("fix alpha via a helper", started="2026-09-26T10:01:00.000000Z")
+    obs = join.join(m, tr)
+    assert obs["subagent_count"] == 2 and obs["subagent_unresolved"] == 0, obs["causes"]
+    assert any(c["name"] == "WebSearch" and c["source"] == f"agent-{nested}" for c in obs["tool_calls"])
+    m = joined(root, repo, _delegating_turns(repo), 0)
+    assert m["deps"]["network"]["observed"] >= 1
+
+
+def test_missing_subagent_stays_unknown(root: Path) -> None:
+    repo = make_repo(root)
+    edit = {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}
+    # one delegation joined, a second one with no preserved transcript
+    write_subagent(root, AGENT_ID, [{"name": "Read", "input": {"file_path": str(repo / "README.md")}}], spawned_by="toolu_1_0")
+    turns = [{"prompt": "fix alpha", "tools": [
+        {"name": "Agent", "input": {"prompt": "a"}, "agent": AGENT_ID},
+        {"name": "Agent", "input": {"prompt": "b"}, "agent": "deadbeefdeadbeef"}, edit]}]
+    m = joined(root, repo, turns, 0)
+    assert "missing_subagent_transcript" in m["observation"]["causes"] and m["observation"]["sufficient"] is False
+    assert all(m["deps"][c]["required"] != "no" for c in mf.DEP_CATEGORIES if c != "prior_conversation")
+
+
+def test_subagent_of_another_turn_is_not_attached(root: Path) -> None:
+    repo = make_repo(root)
+    # the agent is spawned in turn 2; turn 1 must not see its WebFetch
+    write_subagent(root, AGENT_ID, [{"name": "WebFetch", "input": {"url": "https://example.invalid"}, "result": "p"}],
+                   spawned_by="toolu_2_0", ts="2026-09-26T10:02:00.000Z")
+    edit = {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}
+    turns = [{"prompt": "fix alpha", "tools": [edit]},
+             {"prompt": "research", "tools": [{"name": "Agent", "input": {"prompt": "r"}, "agent": AGENT_ID}]}]
+    m = joined(root, repo, turns, 0)
+    assert m["deps"]["network"]["observed"] == 0 and m["observation"]["sufficient"] is True, m["observation"]
+    m2 = joined(root, repo, turns, 1)
+    assert m2["deps"]["network"]["observed"] == 1
+
+
+def test_resumed_subagent_joins_the_resuming_turn(root: Path) -> None:
+    repo = make_repo(root)
+    write_subagent(root, AGENT_ID, [
+        {"name": "Read", "input": {"file_path": str(repo / "README.md")}, "result": "r"},
+        {"name": "WebFetch", "input": {"url": "https://example.invalid"}, "result": "p", "ts": "2026-09-26T10:02:30.000Z"}],
+        spawned_by="toolu_1_0")
+    turns = [{"prompt": "start a helper", "tools": [{"name": "Agent", "input": {"prompt": "x"}, "agent": AGENT_ID}]},
+             {"prompt": "continue the helper", "tools": [{"name": "SendMessage", "input": {"to": AGENT_ID, "message": "go"}}]}]
+    m1 = joined(root, repo, turns, 0)
+    m2 = joined(root, repo, turns, 1)
+    assert m1["deps"]["network"]["observed"] == 0 and "subagent_beyond_turn" not in m1["observation"]["causes"]
+    assert m2["deps"]["network"]["observed"] == 1
+    # never referenced again: activity after the turn ended leaves the turn unverified
+    turns[1] = {"prompt": "unrelated"}
+    m1 = joined(root, repo, turns, 0)
+    assert "subagent_beyond_turn" in m1["observation"]["causes"] and m1["observation"]["sufficient"] is False
+
+
+def test_main_transcript_ignores_inline_sidechain_entries(root: Path) -> None:
+    tr = write_transcript(root, [{"prompt": "hello"}])
+    with tr.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "user", "isSidechain": True, "timestamp": "2026-09-26T10:01:05.000Z",
+                             "message": {"role": "user", "content": "side prompt"}}) + "\n")
+    assert [e.data["text"] for e in join.parse_transcript(tr).events if e.kind == "prompt"] == ["hello"]
+    assert [e.data["text"] for e in join.parse_transcript(tr, sidechain=True).events if e.kind == "prompt"] == ["hello", "side prompt"]
+
+
+# ------------------------------------------------------------------ origins (D3)
+
+def test_origin_shapes_from_real_transcripts(root: Path) -> None:
+    repo = make_repo(root)
+    turns = [
+        {"prompt": "fix alpha", "origin": "human"},
+        {"prompt": "also update the readme", "queued": {"commandMode": "prompt", "origin": {"kind": "human"}}},
+        {"prompt": "<task-notification>bg done</task-notification>", "queued": {"commandMode": "task-notification"}},
+        {"prompt": "<task-notification>x</task-notification>", "queued": {"commandMode": "task-notification",
+                                                                        "origin": {"kind": "task-notification", "producer": "session-task"}}},
+        {"prompt": '<agent-message from="b">\nhi\n</agent-message>', "queued": {"commandMode": "prompt", "isMeta": True,
+                                                                               "origin": {"kind": "peer", "from": "b"}}},
+        {"prompt": "<task-notification>y</task-notification>", "origin": "task-notification"},
+        {"prompt": "relay", "origin": "peer", "meta": True},
+        {"prompt": "legacy queued", "queued": {"commandMode": "prompt"}},
+        {"prompt": "second task"},
+    ]
+    tr = write_transcript(root, turns)
+    events = [e for e in join.parse_transcript(tr).events if e.kind in ("prompt", "candidate")]
+    assert [e.data["origin"] for e in events] == [
+        "human", "human", "task_notification", "task_notification", "peer", "task_notification", "peer",
+        "queued_command:prompt", "human"], [e.data["origin"] for e in events]
+    m = base_manifest("fix alpha", started="2026-09-26T10:01:00.000000Z")
+    obs = join.join(m, tr)
+    # only the next human prompt typed between turns ends the episode
+    assert obs["turn"]["end"] == next(i for i, e in enumerate(join.parse_transcript(tr).events)
+                                      if e.data.get("text") == "second task")
+    assert "interleaved_human_prompt" in obs["causes"]
+    q = base_manifest("also update the readme", started="2026-09-26T10:02:00.000000Z")
+    join.join(q, tr)
+    mf.refresh(q)
+    assert q["prompt"]["origin"] == "human" and rule(q, "X1") == "no"
+    for prompt, minute, origin in (("<task-notification>bg done</task-notification>", 3, "task_notification"),
+                                   ("relay", 7, "peer"), ("legacy queued", 8, "queued_command:prompt")):
+        n = base_manifest(prompt, started=f"2026-09-26T10:{minute:02d}:00.000000Z")
+        join.join(n, tr)
+        mf.refresh(n)
+        assert n["prompt"]["origin"] == origin and rule(n, "X1") == "yes", (prompt, n["prompt"]["origin"])
+
+
+# ------------------------------------------------------------ attachments (D2)
+
+def test_inline_paste_is_not_an_attachment(root: Path) -> None:
+    repo = make_repo(root)
+    edit = {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}
+    inline = "apply the pasted text\n<pasted_content>\ndef alpha(x): return x\n</pasted_content>"
+    m = joined(root, repo, [{"prompt": inline, "tools": [edit]}], 0)
+    assert m["prompt"]["has_attachment"] is False and m["deps"]["attachment"]["required"] == "no", m["deps"]["attachment"]
+    for prompt in ("apply this [Pasted text #1 +12 lines]", "see <attached_file path=x.png>", "fix [Image #2]",
+                   "apply the pasted text"):
+        m = joined(root, repo, [{"prompt": prompt, "tools": [edit]}], 0)
+        assert m["deps"]["attachment"]["required"] == "yes" and rule(m, "X4") == "yes", prompt
+
+
+# -------------------------------------------------------- wrapped prompts (item 7)
+
+def test_envelope_match_is_parsed_unique_and_exact(root: Path) -> None:
+    h = common.sha256_text
+    element = '<agent-message from="lane-b">\nplease review\n</agent-message>'
+    peer = "Another Claude session sent a message:\n" + element + "\n\nThat sender is an agent."
+    ev = lambda i, text, ts: join.Event(i, "prompt", ts, {"sha256": h(text), "text": text, "uuid": str(i),
+                                                         "origin": "peer", "attachment": False})
+    t0 = "2026-10-01T00:05:00Z"
+    tr = join.Transcript(root / "t.jsonl", [ev(0, peer, t0)], 0, [], "s")
+    assert join.find_turn(tr, h(element), t0, len(element)) == (0, "contained")
+    # slash command envelopes: /name and /name args
+    cmd = "<command-message>close</command-message>\n<command-name>/close</command-name>"
+    cmd_args = cmd + "\n<command-args>status</command-args>"
+    tr = join.Transcript(root / "t.jsonl", [ev(0, cmd, t0), ev(1, cmd_args, "2026-10-01T00:09:00Z")], 0, [], "s")
+    assert join.find_turn(tr, h("/close"), t0, len("/close")) == (0, "contained")
+    assert join.find_turn(tr, h("/close status"), "2026-10-01T00:09:00Z", len("/close status")) == (1, "contained")
+    # an unrelated substring in arbitrary text never matches, even with exact hash and length
+    skill = "Base directory for this skill\n## /close status (read-only)\nReport lines"
+    tr = join.Transcript(root / "t.jsonl", [ev(0, skill, t0)], 0, [], "s")
+    assert join.find_turn(tr, h("/close"), t0, len("/close")) is None
+    assert join.find_turn(tr, h(element), t0, len(element)) is None
+    # the element inside an unrecognized wrapper is not a parsed envelope
+    tr = join.Transcript(root / "t.jsonl", [ev(0, "FYI\n" + element + "\nthanks", t0)], 0, [], "s")
+    assert join.find_turn(tr, h(element), t0, len(element)) is None
+    # two envelopes carrying the same payload inside the window: ambiguous, nothing joined
+    tr = join.Transcript(root / "t.jsonl", [ev(0, peer, t0), ev(1, peer, "2026-10-01T00:05:30Z")], 0, [], "s")
+    misses: list[str] = []
+    assert join.find_turn(tr, h(element), t0, len(element), misses) is None and misses == ["prompt_ambiguous"]
+    # a matching envelope outside the window is not ambiguous with one inside it
+    tr = join.Transcript(root / "t.jsonl", [ev(0, peer, t0), ev(1, peer, "2026-10-01T00:20:00Z")], 0, [], "s")
+    assert join.find_turn(tr, h(element), t0, len(element)) == (0, "contained")
+
+
+# ------------------------------------------------------------- report statuses
+
+def test_report_stage_status_and_human_yield(root: Path) -> None:
+    import report
+    repo = make_repo(root)
+    edit = {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}
+    m = joined(root, repo, [{"prompt": "fix alpha", "origin": "human", "tools": [edit]}], 0)
+    m["capture"]["status"] = "complete"
+    assert report.privacy_status(m) == "not_reached"
+    m["review"] = {"privacy": {"passed": False}}
+    assert report.privacy_status(m) == "failed"
+    m["review"] = {"privacy": {"passed": True}}
+    assert report.privacy_status(m) == "passed"
+    assert report.later_stage_status(m, "replay_verified") == "not_evaluated"
+    for k in mf.FUNNEL[:5]:
+        m["funnel"][k] = True
+    assert report.later_stage_status(m, "start_state_reconstructed") == "unknown"
+    m["start_state_reconstructed"] = {"state": "failed"}
+    assert report.later_stage_status(m, "start_state_reconstructed") == "failed"
+    m["funnel"]["start_state_reconstructed"] = True
+    assert report.later_stage_status(m, "start_state_reconstructed") == "passed"
+    peer = joined(root, repo, [{"prompt": "relay", "origin": "peer", "meta": True}], 0)
+    peer["capture"]["status"] = "complete"
+    assert report._origin_bucket(peer["prompt"]["origin"]) == "peer"
+    m2 = joined(root, repo, [{"prompt": "fix alpha", "origin": "human", "tools": [edit]}], 0)
+    m2["capture"]["status"] = "complete"
+    hy = report.human_yield([m2, peer])
+    assert hy["completed_human_tasks"] == 1 and hy["provisional_candidates"] == 0
+    assert not any(k.startswith("link:") for k in hy["independent_blockers"]), hy
+    assert hy["independent_blockers"], hy
+    assert hy["independent_blockers"]["privacy:not_reached"] == 1
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

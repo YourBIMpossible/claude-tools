@@ -56,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     mp = sub.add_parser("maintain")
     mp.add_argument("--quiet", action="store_true")
     sub.add_parser("report")
+    sub.add_parser("rescreen", help="re-join and re-screen every joined episode; commit a corrections record")
     fa = sub.add_parser("fn-audit")
     fsub = fa.add_subparsers(dest="action", required=True)
     fsub.add_parser("sheet")
@@ -120,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
         _print({"checkpoint": str(path), "episodes": ck["denominator"]["episodes_total"],
                 "provisional_candidates": ck["funnel"]["provisional_candidates"]})
         return 0
+    if args.cmd == "rescreen":
+        import rescreen
+        res = rescreen.run_rescreen(st, env)
+        _print({k: v for k, v in res.items() if k != "changed"} | {"changed": len(res.get("changed", []))})
+        return 0 if res.get("action") != "skipped" else 1
     if args.cmd == "fn-audit":
         try:
             if args.action == "sheet":
