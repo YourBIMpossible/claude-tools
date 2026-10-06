@@ -359,8 +359,9 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
     for call in obs["tool_calls"]:
         name, inp = call["name"], call["input"]
         cats_here: list[str] = []
-        # A delegated call resolves relative paths against its own agent's cwd.
-        call_cwd = (call.get("cwd") or cwd) if call.get("source", "main") != "main" else cwd
+        # Every call resolves relative paths against the cwd recorded with it; the episode-level
+        # cwd (the transcript's last distinct cwd, possibly from a later turn) is only a fallback.
+        call_cwd = call.get("cwd") or cwd
         if name in SHELL_TOOLS:
             cmd = str(inp.get("command") or "")
             sobs, clean = _shell_observations(cmd, idx, call_cwd, markers)
