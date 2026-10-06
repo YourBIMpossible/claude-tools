@@ -542,6 +542,25 @@ def test_rescreen_corrects_and_records(root: Path) -> None:
     assert corr["before"]["causes"] == ["stale_cause"] and corr["after"]["sufficient"] == good["observation"]["sufficient"]
     assert rec["before"]["by_cause"] == {"stale_cause": 1} and rec["changed"][0]["episode_id"] == m["episode_id"]
     assert Path(rec["record"]).is_file() and rec["committed"] and store.meta_clean(fx.stores)
+    # a stale X2 effect classification is rewritten even when no rule state changes
+    stale = fx.episode(sid)
+    stale["observation"]["shell_repo_mutations"] = ["unresolved:git commit"]
+    store.write_manifest(fx.stores, stale)
+    rec = rescreen.run_rescreen(fx.stores, fx.env)
+    m = fx.episode(sid)
+    assert m["observation"] == good["observation"] and rec["changed"][0]["fields"] == ["shell_repo_mutations"], rec["changed"]
+    # transcript gone: a stored no-edit judgement without delegation is withdrawn too
+    m["observation"] = {"sufficient": True, "causes": []}
+    m["edited_files"] = []
+    store.write_manifest(fx.stores, m)
+    hidden = tp.with_suffix(".hidden")
+    tp.rename(hidden)
+    rec = rescreen.run_rescreen(fx.stores, fx.env)
+    assert rec["outcomes"] == {"invalidated_transcript_unavailable": 1}, rec["outcomes"]
+    assert mf.rule_state(fx.episode(sid)["exclusions"], "X2") == "unknown"
+    hidden.rename(tp)
+    rescreen.run_rescreen(fx.stores, fx.env)
+    m = fx.episode(sid)
     # transcript gone: a sufficient judgement over delegated work is withdrawn, not kept
     m["observation"] = {"sufficient": True, "causes": []}
     m["capture"]["join"]["subagents"] = 1

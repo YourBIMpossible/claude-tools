@@ -61,6 +61,8 @@ def summary(m: dict[str, Any]) -> dict[str, Any]:
             "rules": {e["rule"]: e["state"] for e in m["exclusions"]},
             "dependency_screen_clear": bool(m["funnel"].get("dependency_screen_clear")),
             "edited_files": len(m.get("edited_files") or []),
+            # X2 evidence: a reclassified effect must be persisted even when no rule state moves.
+            "shell_repo_mutations": list(m["observation"].get("shell_repo_mutations") or []),
             "task_class": (m.get("task_class") or {}).get("mechanical")}
 
 
@@ -91,7 +93,9 @@ def rescreen_one(stores: Stores, m: dict[str, Any], env: dict[str, str]) -> str:
     """Re-join and re-screen ``m`` in place; the outcome label."""
     tr = find_transcript(m["session_id"], env)
     if tr is None:
-        if m["observation"].get("sufficient") and _delegated(m):
+        # A sufficient judgement that cannot be re-derived under the current rules (delegated
+        # work, or a stored "no edit" the current shell-effect rules never saw) is withdrawn.
+        if m["observation"].get("sufficient") and (_delegated(m) or not m.get("edited_files")):
             invalidate(m, "rescreen_transcript_unavailable")
             return "invalidated_transcript_unavailable"
         return "transcript_unavailable"
