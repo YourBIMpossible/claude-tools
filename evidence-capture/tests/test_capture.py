@@ -942,6 +942,13 @@ def test_report_stage_status_and_human_yield(root: Path) -> None:
     assert hy["independent_blockers"]["privacy:not_reached"] == 1
 
 
+def test_dot_segments_terminate(root: Path) -> None:
+    """Regression: a path with more ``..`` than segments looped forever."""
+    assert screen._resolve_dots("f:/../x") == "f:/x"
+    assert screen._resolve_dots("/a/../../b/./c") == "/b/c"
+    assert screen._resolve_dots("c:/a/b/../c") == "c:/a/c"
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

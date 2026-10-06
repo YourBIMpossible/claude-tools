@@ -105,6 +105,22 @@ def _home_markers() -> list[str]:
             home + "/appdata/local/temp/claude", "/tmp/claude"]
 
 
+def _resolve_dots(p: str) -> str:
+    """Collapse ``.`` and ``..`` segments in one pass; a ``..`` above the anchor is
+    dropped (it cannot climb past a drive or the root)."""
+    head, sep, rest = p.partition("/")
+    out: list[str] = []
+    for seg in rest.split("/"):
+        if seg == ".":
+            continue
+        if seg == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(seg)
+    return head + sep + "/".join(out)
+
+
 def classify_path(path: str, idx: RepoIndex, cwd: str | None, markers: list[str]) -> str | None:
     """Category of one path use, or None when it is inside the repository."""
     raw = path.strip().strip("'\"")
@@ -115,9 +131,7 @@ def classify_path(path: str, idx: RepoIndex, cwd: str | None, markers: list[str]
     if not re.match(r"^(?:[A-Za-z]:/|/|\\\\)", raw.replace("\\", "/")):
         raw = f"{cwd or idx.root}/{raw}"
     p = norm_path(raw).lower()
-    p = re.sub(r"/\./", "/", p)
-    while "/../" in p:
-        p = re.sub(r"/[^/]+/\.\./", "/", p, count=1)
+    p = _resolve_dots(p)
     if any(p == m or p.startswith(m + "/") for m in markers):
         return "memory_or_scratch"
     if p == idx.root or p.startswith(idx.root + "/"):
