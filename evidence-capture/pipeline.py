@@ -479,6 +479,21 @@ def resolve_repo_root(m: dict[str, Any], cwds: list[str]) -> Path | None:
     return None
 
 
+def screen_root(m: dict[str, Any], cwds: list[str]) -> tuple[Path | None, str | None]:
+    """The root path the screen classifies against, and where it came from.
+
+    The screen needs the captured root only as a path (inside versus outside), so a
+    worktree removed after capture still yields it: the path whose hash the start hook
+    recorded, recovered from the transcript cwds. ``checkout`` when the checkout still
+    exists, ``capture_hash`` when only the recorded hash identifies it. Today's main
+    checkout is never substituted."""
+    live = resolve_repo_root(m, cwds)
+    if live is not None:
+        return live, "checkout"
+    cands = _root_candidates(m["repo"].get("root_sha256"), cwds)
+    return (cands[0], "capture_hash") if cands else (None, None)
+
+
 def captured_root_gone(m: dict[str, Any], cwds: list[str]) -> bool:
     """True when the captured root is identified among the cwd ancestors but no longer
     exists as a checkout (a removed worktree)."""
@@ -559,11 +574,12 @@ def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str
                      brief_empty=(brief["len"] == 0) if brief else None)
     m["boundary"] = boundary_for(m, stores, env)
     status = "complete"
-    if root is None:
+    sroot, source = screen_root(m, cwds)
+    if sroot is None:
         errors.append("root:unresolved")
         status = "partial"
     else:
-        screen(m, obs, root, cwd=cwds[-1] if cwds else str(root),
+        screen(m, obs, sroot, cwd=cwds[-1] if cwds else str(sroot),
                untracked_paths=_untracked_paths(stores, m["episode_id"]), complete=True)
     if cap.get("status") == "failed":
         status = "failed"
@@ -578,7 +594,7 @@ def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str
     cap.update(status=status, errors=errors, phase="ended")
     cap["join"] = {"state": "joined", "by": by, "at": now, "tool_calls": len(obs["tool_calls"]),
                    "subagents": obs.get("subagent_count", 0),
-                   "subagents_unresolved": obs.get("subagent_unresolved", 0)}
+                   "subagents_unresolved": obs.get("subagent_unresolved", 0), "root_source": source}
     mf.refresh(m, (load_owner_review(stores, m["episode_id"]) or {}).get("rules"))
     if root is None:
         return None

@@ -8,9 +8,17 @@ mechanical task class; then the rules and funnel are refreshed. Link, boundary,
 snapshot, review and retention are left as they are.
 
 A judgement the current tool can no longer support is invalidated, never kept: when the
-turn cannot be found again, or the transcript is gone and the episode was judged
-sufficient although it delegated work or touched another session, the observation
-becomes insufficient and every ``required: no`` that rested on it becomes ``unknown``.
+turn cannot be found again, the captured root cannot be identified, the episode's work
+does not finish within its time limit, or the transcript is gone and the episode was
+judged sufficient although it delegated work or touched another session, the
+observation becomes insufficient and every ``required: no`` that rested on it becomes
+``unknown``. A worktree removed after capture is not such a case: the screen uses the
+root path whose hash the start hook recorded (``root_source: capture_hash``).
+
+Bounded: each episode is re-screened in a child process killed after
+``EPISODE_TIMEOUT_S``; the maintenance lock is refreshed after every episode, and once
+``RUN_BUDGET_S`` is spent the remaining episodes are left unchanged and listed as
+``deferred``. A stuck episode therefore cannot hold maintenance.
 
 Each changed manifest gets a ``corrections`` entry (tool commit, before and after); the
 run writes ``corrections/<stamp>-rescreen.json`` with before/after counts and the list of
@@ -19,14 +27,20 @@ changed episodes. Both are committed to the metadata repository. Hashes and coun
 from __future__ import annotations
 
 import copy
+import json
+import os
+import subprocess
+import sys
+import time
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 import manifest as mf
 from common import iso, now_utc, write_json_atomic
 from join import join
-from pipeline import (MAINTAIN_LOCK, _try_lock, _unlock, _untracked_paths, captured_root_gone, episode_lock,
-                      find_transcript, resolve_repo_root, tool_identity, transcript_cwds)
+from pipeline import (MAINTAIN_LOCK, _try_lock, _unlock, _untracked_paths, episode_lock,
+                      find_transcript, screen_root, tool_identity, transcript_cwds)
 from review import load_owner_review
 from screen import screen
 from store import Stores, commit_meta, manifest_path, scan_manifests, write_manifest
@@ -34,6 +48,9 @@ from store import Stores, commit_meta, manifest_path, scan_manifests, write_mani
 # Fields the join and screen own; nothing else is copied back from the re-screen.
 PROMPT_FIELDS = ("uuid", "origin", "index_in_session", "has_attachment")
 DELEGATION_CAUSES = ("missing_subagent_transcript", "subagent_beyond_turn")
+EPISODE_TIMEOUT_S = 60.0
+RUN_BUDGET_S = 1800.0
+CHILD_ARGV = (sys.executable, str(Path(__file__).resolve()), "--child")
 
 
 def summary(m: dict[str, Any]) -> dict[str, Any]:
@@ -89,19 +106,57 @@ def rescreen_one(stores: Stores, m: dict[str, Any], env: dict[str, str]) -> str:
     for k in PROMPT_FIELDS:
         m["prompt"][k] = probe["prompt"].get(k)
     cwds = transcript_cwds(tr)
-    root = resolve_repo_root(m, cwds)
+    root, source = screen_root(m, cwds)
     if root is None:
-        gone = captured_root_gone(m, cwds)
-        invalidate(m, "rescreen_root_gone" if gone else "rescreen_root_unresolved")
-        return "invalidated_root_gone" if gone else "invalidated_root_unresolved"
+        invalidate(m, "rescreen_root_unresolved")
+        return "invalidated_root_unresolved"
     screen(probe, obs, root, cwd=cwds[-1] if cwds else str(root),
            untracked_paths=_untracked_paths(stores, m["episode_id"]), complete=True)
     for k in ("prior_context", "deps", "edited_files", "observation"):
         m[k] = probe[k]
     m["task_class"]["mechanical"] = probe["task_class"].get("mechanical")
     m["capture"]["join"].update(subagents=obs.get("subagent_count", 0),
-                                subagents_unresolved=obs.get("subagent_unresolved", 0))
-    return "rescreened"
+                                subagents_unresolved=obs.get("subagent_unresolved", 0), root_source=source)
+    return "rescreened" if source == "checkout" else "rescreened_root_removed"
+
+
+def run_child(stores: Stores, m: dict[str, Any], env: dict[str, str], timeout_s: float,
+              argv: tuple[str, ...] = CHILD_ARGV) -> tuple[str, dict[str, Any] | None]:
+    """Re-screen ``m`` in a child process; (outcome, re-screened manifest or None).
+
+    The child gets the manifest and store paths on stdin and is killed after
+    ``timeout_s``; a timeout, crash or unreadable reply is an outcome, never a hang."""
+    req = json.dumps({"manifest": m, "meta": str(stores.meta), "content": str(stores.content)})
+    try:
+        cp = subprocess.run(list(argv), input=req.encode("utf-8"), capture_output=True, timeout=timeout_s,
+                            env={**env, "PYTHONIOENCODING": "utf-8"})
+    except subprocess.TimeoutExpired:
+        return "timeout", None
+    except OSError:
+        return "child_failed", None
+    if cp.returncode != 0:
+        return "child_failed", None
+    try:
+        rep = json.loads(cp.stdout.decode("utf-8"))
+        return str(rep["outcome"]), rep["manifest"]
+    except (ValueError, KeyError, TypeError):
+        return "child_failed", None
+
+
+def _child_main() -> int:
+    req = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    stores = Stores(meta=Path(req["meta"]), content=Path(req["content"]))
+    m = req["manifest"]
+    outcome = rescreen_one(stores, m, dict(os.environ))
+    sys.stdout.write(json.dumps({"outcome": outcome, "manifest": m}))
+    return 0
+
+
+def _touch(lock: Path) -> None:
+    try:
+        os.utime(lock)
+    except OSError:
+        pass
 
 
 def _counts(sums: list[dict[str, Any]]) -> dict[str, Any]:
@@ -117,7 +172,8 @@ def _counts(sums: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
-                 commit: bool = True) -> dict[str, Any]:
+                 commit: bool = True, episode_timeout_s: float = EPISODE_TIMEOUT_S,
+                 run_budget_s: float = RUN_BUDGET_S, child_argv: tuple[str, ...] = CHILD_ARGV) -> dict[str, Any]:
     """Re-screen every joined episode under the maintenance lock; the corrections record."""
     lock = stores.meta / MAINTAIN_LOCK
     if not _try_lock(lock):
@@ -126,26 +182,37 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
     tool_commit, _ = tool_identity()
     try:
         scan = scan_manifests(stores)
-        befores, afters, changed, busy = [], [], [], []
+        befores, afters, changed, busy, deferred = [], [], [], [], []
         outcomes: Counter[str] = Counter()
         touched = []
+        deadline = time.monotonic() + run_budget_s
         for m in sorted(scan.manifests, key=lambda x: x["started_at"]):
             if (m["capture"].get("join") or {}).get("state") != "joined":
                 continue
             ep = m["episode_id"]
+            _touch(lock)
+            if time.monotonic() >= deadline:
+                deferred.append(ep)
+                continue
             elock = episode_lock(stores, ep)
             if not _try_lock(elock):
                 busy.append(ep)
                 continue
             try:
                 before = summary(m)
-                outcome = rescreen_one(stores, m, env)
+                join_before = dict(m["capture"].get("join") or {})
+                outcome, done = run_child(stores, m, env, episode_timeout_s, child_argv)
+                if done is not None:
+                    m = done
+                else:
+                    invalidate(m, f"rescreen_{outcome}")
+                    outcome = f"invalidated_{outcome}"
                 mf.refresh(m, (load_owner_review(stores, ep) or {}).get("rules"))
                 after = summary(m)
                 outcomes[outcome] += 1
                 befores.append(before)
                 afters.append(after)
-                if after != before:
+                if after != before or m["capture"].get("join") != join_before:
                     m.setdefault("corrections", []).append(
                         {"at": now, "by": "rescreen", "tool_commit": tool_commit, "outcome": outcome,
                          "before": before, "after": after})
@@ -156,7 +223,8 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
             finally:
                 _unlock(elock)
         rec = {"kind": "rescreen", "at": now, "tool_commit": tool_commit, "outcomes": dict(sorted(outcomes.items())),
-               "busy_skipped": busy, "before": _counts(befores), "after": _counts(afters),
+               "busy_skipped": busy, "deferred": deferred,
+               "limits": {"episode_timeout_s": episode_timeout_s, "run_budget_s": run_budget_s}, "before": _counts(befores), "after": _counts(afters),
                "changed": changed, "manifests_unreadable": len(scan.unreadable)}
         path = stores.meta / "corrections" / f"{now.replace(':', '').replace('-', '')}-rescreen.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,3 +236,7 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
         return rec
     finally:
         _unlock(lock)
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--child"]:
+    sys.exit(_child_main())

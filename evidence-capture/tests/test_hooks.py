@@ -12,6 +12,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import shutil
 import tempfile
 import traceback
 import uuid
@@ -554,6 +556,44 @@ def test_rescreen_corrects_and_records(root: Path) -> None:
     assert all(m["deps"][c]["required"] == "unknown" for c in mf.DEP_CATEGORIES if c != "prior_conversation")
     assert not m["funnel"]["dependency_screen_clear"]
     assert PROMPT not in Path(rec["record"]).read_text(encoding="utf-8")
+
+
+def test_rescreen_bounded_child_timeout(root: Path) -> None:
+    import rescreen
+    fx = Fixture(root)
+    sid = str(uuid.uuid4())
+    pid, ts = fx.start(sid)
+    tp = fx.transcript(sid, PROMPT, pid, ts)
+    fx.end(sid, tp)
+    stuck = (sys.executable, "-c", "import time; time.sleep(30)")
+    t0 = time.monotonic()
+    rec = rescreen.run_rescreen(fx.stores, fx.env, episode_timeout_s=1.0, child_argv=stuck)
+    assert time.monotonic() - t0 < 20, "a stuck child must not hold the run"
+    assert rec["outcomes"] == {"invalidated_timeout": 1}, rec["outcomes"]
+    m = fx.episode(sid)
+    assert m["observation"]["sufficient"] is False and "rescreen_timeout" in m["observation"]["causes"]
+    assert not (fx.stores.meta / pipeline.MAINTAIN_LOCK).exists()
+    # budget spent: remaining episodes are deferred untouched, and the lock is released
+    rec = rescreen.run_rescreen(fx.stores, fx.env, run_budget_s=0.0)
+    assert rec["deferred"] == [m["episode_id"]] and rec["outcomes"] == {}, rec
+    assert not (fx.stores.meta / pipeline.MAINTAIN_LOCK).exists()
+
+
+def test_rescreen_removed_worktree_uses_captured_root(root: Path) -> None:
+    import rescreen
+    fx = Fixture(root)
+    sid = str(uuid.uuid4())
+    pid, ts = fx.start(sid)
+    tp = fx.transcript(sid, PROMPT, pid, ts)
+    fx.end(sid, tp)
+    good = fx.episode(sid)
+    snap = good["start_snapshot"]
+    shutil.rmtree(fx.repo / ".git", onerror=lambda f, p, e: (os.chmod(p, 0o700), f(p)))
+    rec = rescreen.run_rescreen(fx.stores, fx.env)
+    m = fx.episode(sid)
+    assert rec["outcomes"] == {"rescreened_root_removed": 1}, (rec["outcomes"], (fx.repo / ".git").exists(), m["capture"]["join"])
+    assert m["capture"]["join"]["root_source"] == "capture_hash"
+    assert m["start_snapshot"] == snap and m["observation"] == good["observation"]
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
