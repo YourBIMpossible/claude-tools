@@ -93,7 +93,43 @@ def human_yield(ms: list[dict[str, Any]]) -> dict[str, Any]:
             "cumulative": mf.cumulative_funnel([m["funnel"] for m in pop]),
             "blocked_only_by": dict(sorted(Counter(
                 k for m in pop for k in [_sole_blocker(m)] if k).items())),
-            "independent_blockers": dict(sorted(blockers.items()))}
+            "independent_blockers": dict(sorted(blockers.items())),
+            "partition": blocker_partition(pop)}
+
+
+def blocker_partition(pop: list[dict[str, Any]]) -> dict[str, Any]:
+    """Each completed human task in exactly one class, so the classes sum to the
+    population. ``boundary_only``: every other pre-privacy gate holds (link, start
+    snapshot, sufficient observation, every rule ``no``), so accepting the CLI boundary
+    would let it reach privacy. ``boundary_plus_other``: the boundary is untrusted and
+    something else also fails, split by whether that is a known scope exclusion (a rule
+    ``yes``) or only unresolved evidence. With a trusted boundary, ``scope_excluded``
+    (a rule ``yes``) and ``unresolved`` (rule ``unknown``, insufficient observation,
+    no link, incomplete snapshot) follow. Privacy stays ``not_reached`` for every
+    episode not past the gates, never ``failed``."""
+    out: Counter[str] = Counter()
+    for m in pop:
+        if mf.provisional_candidate(m["funnel"]):
+            out["candidate"] += 1
+            continue
+        states = [mf.rule_state(m["exclusions"], r) for r in mf.RULES]
+        scope = "yes" in states
+        unresolved = ("unknown" in states or not m["observation"].get("sufficient", False)
+                      or m["link"].get("state") != "linked"
+                      or m["start_snapshot"].get("state") != "complete")
+        if not m["boundary"].get("trusted"):
+            b = _boundary_bucket(m["boundary"].get("reason"))
+            if not scope and not unresolved:
+                out[f"boundary_only:{b}"] += 1
+            else:
+                out[f"boundary_plus_{'scope_excluded' if scope else 'unresolved'}:{b}"] += 1
+        elif scope:
+            out["scope_excluded"] += 1
+        elif unresolved:
+            out["unresolved"] += 1
+        else:
+            out["privacy_" + privacy_status(m)] += 1
+    return {"classes": dict(sorted(out.items())), "total": sum(out.values())}
 
 
 def _sole_blocker(m: dict[str, Any]) -> str | None:
@@ -435,6 +471,7 @@ def render_markdown(ck: dict[str, Any]) -> str:
               f"human tasks; cumulative {hy['cumulative']}.", "",
               f"Independent blockers (human): {hy['independent_blockers']}.", "",
               f"Blocked by a single gate (human): {hy['blocked_only_by']}.", "",
+              f"Partition (human, sums to population): {hy['partition']['classes']}.", "",
               "| Rule | yes | no | unknown |", "|---|---:|---:|---:|"]
     for r, v in ck["exclusions"]["per_rule"].items():
         lines.append(f"| {r} | {v['yes']} | {v['no']} | {v['unknown']} |")

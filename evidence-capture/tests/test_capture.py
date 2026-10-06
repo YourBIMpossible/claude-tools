@@ -9,6 +9,7 @@ Synthetic example — contains no private repository data or production findings
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
@@ -940,6 +941,22 @@ def test_report_stage_status_and_human_yield(root: Path) -> None:
     assert not any(k.startswith("link:") for k in hy["independent_blockers"]), hy
     assert hy["independent_blockers"], hy
     assert hy["independent_blockers"]["privacy:not_reached"] == 1
+    # partition: one class per task, summing to the population
+    def shaped(rules: str, trusted: bool, sufficient: bool = True) -> dict:
+        x = copy.deepcopy(m2)
+        x["funnel"] = {k: False for k in mf.FUNNEL}
+        x["link"]["state"] = "linked"
+        x["start_snapshot"]["state"] = "complete"
+        x["observation"]["sufficient"] = sufficient
+        x["boundary"] = {"trusted": trusted, "reason": None if trusted else "boundary_untested"}
+        x["exclusions"] = [{"rule": r, "state": rules} for r in mf.RULES]
+        return x
+    pop = [shaped("no", False), shaped("yes", False), shaped("unknown", False), shaped("no", False, False),
+           shaped("yes", True), shaped("unknown", True)]
+    part = report.blocker_partition(pop)
+    assert part["total"] == len(pop) and part["classes"] == {
+        "boundary_only:cli_untested": 1, "boundary_plus_scope_excluded:cli_untested": 1,
+        "boundary_plus_unresolved:cli_untested": 2, "scope_excluded": 1, "unresolved": 1}, part
 
 
 def test_dot_segments_terminate(root: Path) -> None:
