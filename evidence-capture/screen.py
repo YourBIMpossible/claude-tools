@@ -127,6 +127,14 @@ def _resolve_dots(p: str) -> str:
     return head + sep + "/".join(out)
 
 
+MSYS_PATH_RE = re.compile(r"^/([A-Za-z])(?=/|$)")
+
+
+def msys_to_windows(path: str) -> str:
+    """Map an MSYS/Git-Bash drive path (``/f/x``) to its Windows form (``F:/x``); others unchanged."""
+    return MSYS_PATH_RE.sub(lambda mt: f"{mt.group(1).upper()}:", path.replace("\\", "/"), count=1)
+
+
 def classify_path(path: str, idx: RepoIndex, cwd: str | None, markers: list[str]) -> str | None:
     """Category of one path use, or None when it is inside the repository."""
     raw = path.strip().strip("'\"")
@@ -134,11 +142,11 @@ def classify_path(path: str, idx: RepoIndex, cwd: str | None, markers: list[str]
         return None
     if raw.startswith("~"):
         raw = norm_path(Path.home()) + raw[1:]
-    raw = raw.replace("\\", "/")
+    raw = msys_to_windows(raw)
     ext = re.match(r"^//[?.]/(unc/)?", raw, re.IGNORECASE)  # Win32 extended-length / device prefixes, UNC form included
     if ext:
         raw = ("//" if ext.group(1) else "") + raw[ext.end():]
-    base = cwd or idx.root
+    base = msys_to_windows(cwd) if cwd else idx.root
     rel_drive = re.match(r"^([A-Za-z]):(?!/)", raw)  # C:x is relative to that drive's own cwd
     if rel_drive:
         if base[:2].lower() != rel_drive.group(1).lower() + ":":
@@ -278,11 +286,43 @@ def _expand_assignments(cmd: str) -> str:
     return cmd
 
 
-def _shell_repo_mutations(cmd: str, idx: RepoIndex, cwd: str | None, markers: list[str]) -> list[str]:
-    """Mutations of the repository working tree or index made by one shell command.
+GIT_INDEX_ONLY = {"add", "update-index"}
+GIT_HISTORY_ONLY = {"commit"}
+# Entry classes, in the order a reader should weigh them. Only ``content_write`` names a resolved
+# file-content write; the git classes change index, history or checkout state, which may or may
+# not carry content written in this episode; the ``unresolved_*`` classes are effects the
+# transcript cannot establish. None of them names an edited-file set.
+MUTATION_CLASSES = ("content_write", "git_worktree", "git_index", "git_history",
+                    "unresolved_target", "unresolved_effect")
 
-    Follows ``cd``/``Set-Location`` within the command. An entry starting ``unresolved:`` is a
-    mutation (or inline interpreter code) whose target directory could not be resolved.
+
+def _git_class(sub: str) -> str:
+    if sub in GIT_INDEX_ONLY:
+        return "git_index"
+    if sub in GIT_HISTORY_ONLY:
+        return "git_history"
+    return "git_worktree"  # checkout/switch/merge/apply/reset/... may rewrite tracked content
+
+
+def mutation_class(entry: str) -> str:
+    """Class of one ``shell_repo_mutations`` entry; pre-classification records map conservatively."""
+    head = entry.split(":", 1)[0]
+    if head in MUTATION_CLASSES:
+        return head
+    if head == "unresolved":
+        return "unresolved_effect" if ":inline:" in entry else "unresolved_target"
+    if entry.startswith("git "):
+        return _git_class(entry[4:].split()[0])
+    return "content_write" if head == "write" else "unresolved_effect"
+
+
+def _shell_repo_mutations(cmd: str, idx: RepoIndex, cwd: str | None, markers: list[str]) -> list[str]:
+    """Repository effects of one shell command, as ``<class>:<detail>`` entries (``MUTATION_CLASSES``).
+
+    Follows ``cd``/``Set-Location`` within the command. ``unresolved_target`` is a write or git
+    mutation whose directory could not be resolved; ``unresolved_effect`` is interpreter code,
+    a script or a tool runner executed against the repository, whose file effects the transcript
+    does not show.
     """
     out: list[str] = []
     segments, _ = parse_command(_expand_assignments(cmd))
@@ -314,8 +354,9 @@ def _shell_repo_mutations(cmd: str, idx: RepoIndex, cwd: str | None, markers: li
             if mt and mt.group(2).lower() in GIT_MUTATING:
                 gc = re.search(r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", mt.group(1))
                 w = where(_shell_path(gc.group(1)) if gc else (cur if cur_known else None))
+                sub = mt.group(2).lower()
                 if w != "outside":
-                    out.append(f"{'' if w == 'repo' else 'unresolved:'}git {mt.group(2).lower()}")
+                    out.append(f"{_git_class(sub) if w == 'repo' else 'unresolved_target'}:git {sub}")
             continue
         for use in seg.paths:
             if use.role == "write":
@@ -324,9 +365,17 @@ def _shell_repo_mutations(cmd: str, idx: RepoIndex, cwd: str | None, markers: li
                     continue
                 w = where(_shell_path(tgt))
                 if w != "outside":
-                    out.append(f"{'' if w == 'repo' else 'unresolved:'}write:{verb}")
-        if INLINE_CODE_RE.match(seg.text) and where(cur if cur_known else None) != "outside":
-            out.append(f"unresolved:inline:{verb}")
+                    out.append(f"{'content_write' if w == 'repo' else 'unresolved_target'}:write:{verb}")
+        if INLINE_CODE_RE.match(seg.text):
+            if where(cur if cur_known else None) != "outside":
+                out.append(f"unresolved_effect:inline:{verb}")
+        elif seg.kind == "exec":
+            # A script or runner may write anywhere; it counts when it runs from the repository,
+            # from an unresolved directory, or names a repository file to execute.
+            in_repo = where(cur if cur_known else None) != "outside" or any(
+                u.role in ("exec", "script") and where(_shell_path(u.path)) != "outside" for u in seg.paths)
+            if in_repo:
+                out.append(f"unresolved_effect:exec:{verb}")
     return out
 
 
@@ -368,7 +417,9 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
                     cats_here.append(c)
             if re.search(r"\b(?:git\s+(?:add|commit|apply|checkout|restore|mv|rm)|>\s*\S|tee\s|sed\s+-i|Set-Content|Out-File)\b", cmd):
                 first_edit_seen = True
-            shell_mutations.extend(_shell_repo_mutations(cmd, idx, call_cwd, markers))
+            # A failed command may still have partly applied, so it stays an entry, marked as attempted.
+            failed = ":failed" if call.get("is_error") else ""
+            shell_mutations.extend(e + failed for e in _shell_repo_mutations(cmd, idx, call_cwd, markers))
         elif name in EDIT_TOOLS or name in READ_TOOLS:
             p = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
             if isinstance(p, str):
