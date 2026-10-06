@@ -25,14 +25,17 @@ from common import iso, now_utc, parse_iso
 from manifest import FINAL_LINK_STATES, refresh
 from store import Stores, log_line, write_manifest
 
-PACKET_GLOB = "ep_*.json"
+PACKET_GLOB = "*ep_*.json"  # EC archive names <id>.json; repo stores name <ts>_<id>.json
 HOOK_START_SKEW_S = 10
 
 
-def packet_dirs(repo_root: Path | None, stores: Stores) -> list[Path]:
+def packet_dirs(repo_root: Path | None, stores: Stores, session_roots: list[Path] | None = None) -> list[Path]:
+    """The capture's checkout store, then the session's own checkout stores (EC writes to the
+    session project root, which can differ from a worktree the prompt ran in), then archives."""
     dirs: list[Path] = []
-    if repo_root is not None:
-        dirs.append(repo_root / ".evidence-compiler" / "packets")
+    for r in [repo_root, *(session_roots or [])]:
+        if r is not None and (d := r / ".evidence-compiler" / "packets") not in dirs:
+            dirs.append(d)
     dirs.extend(Path(p) for p in stores.packet_dirs)
     return dirs
 
@@ -119,7 +122,8 @@ def resolve_link(m: dict[str, Any], packets: list[dict[str, Any]], now: str | No
 
 def reconcile(stores: Stores, manifests: list[dict[str, Any]], repo_root_by_episode: dict[str, Path] | None = None,
               extra_packets: list[dict[str, Any]] | None = None, *, now: str | None = None,
-              rules_for: Callable[[str], dict[str, Any] | None] | None = None) -> dict[str, int]:
+              rules_for: Callable[[str], dict[str, Any] | None] | None = None,
+              session_roots: list[Path] | None = None) -> dict[str, int]:
     """Re-run linkage for every non-final manifest; writes only when the link changed (its
     state or its packet). A changed manifest has its exclusions and funnel recomputed first,
     with the owner's rules from ``rules_for(episode_id)`` when given. Maintenance calls this
@@ -134,7 +138,7 @@ def reconcile(stores: Stores, manifests: list[dict[str, Any]], repo_root_by_epis
         root = (repo_root_by_episode or {}).get(m["episode_id"])
         key = str(root) if root else ""
         if key not in cache:
-            cache[key] = load_packets(packet_dirs(root, stores)) + list(extra_packets or [])
+            cache[key] = load_packets(packet_dirs(root, stores, session_roots)) + list(extra_packets or [])
         new = resolve_link(m, cache[key], now)
         counts[new["state"]] += 1
         if new["state"] != m["link"].get("state") or new.get("packet_id") != m["link"].get("packet_id"):

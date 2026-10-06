@@ -631,6 +631,42 @@ def test_failure_cause_from_recorded_error(root: Path) -> None:
     assert not m["funnel"]["start_snapshot_complete"]  # a failed start is never promoted
 
 
+def test_packet_discovery_repo_store_names_and_session_roots(root: Path) -> None:
+    import json as _j
+    wt, proj = root / "wt", root / "proj"
+    for r in (wt, proj):
+        (r / ".evidence-compiler" / "packets").mkdir(parents=True)
+    pk = {"packet_id": "ep_00000000000000aa", "created_at": "2026-10-01T00:00:00Z",
+          "identity": {"session_id": "s1", "head": "h"}, "correlation": {"prompt_hash": "x"}}
+    # EC repo stores prefix the id with a timestamp; the archive does not
+    (proj / ".evidence-compiler" / "packets" / "2026-10-01T00-00-00.000000Z_ep_00000000000000aa.json").write_text(
+        _j.dumps(pk), encoding="utf-8")
+    st = type("S", (), {"packet_dirs": []})()
+    assert linkage.load_packets(linkage.packet_dirs(wt, st)) == []
+    found = linkage.load_packets(linkage.packet_dirs(wt, st, [proj, wt]))
+    assert [p["packet_id"] for p in found] == ["ep_00000000000000aa"], found
+    assert len(linkage.packet_dirs(wt, st, [wt])) == 1
+
+
+def test_find_turn_meta_and_contained_prompts(root: Path) -> None:
+    h = common.sha256_text
+    inner = "please review the hand-back"
+    wrapped = "Another session sent a message:\n<agent-message>\n" + inner + "\n</agent-message>"
+    ev = lambda i, kind, text, ts: join.Event(i, kind, ts, {"sha256": h(text), "text": text, "uuid": str(i),
+                                                          "origin": "meta", "attachment": False})
+    tr = join.Transcript(root / "t.jsonl", [ev(0, "candidate", "meta prompt", "2026-10-01T00:00:00Z"),
+                                            ev(1, "prompt", wrapped, "2026-10-01T00:05:00Z")], 0, [], "s")
+    assert join.find_turn(tr, h("meta prompt"), "2026-10-01T00:00:01Z") == (0, "exact")
+    tr.events.insert(0, join.Event(9, "candidate", "2026-10-01T00:00:01Z", {"sha256": h("meta prompt"),
+                                                                          "origin": "queue_enqueue"}))
+    assert join.find_turn(tr, h("meta prompt"), "2026-10-01T00:00:01Z") == (1, "exact")  # enqueue skipped
+    assert join.find_turn(tr, h(inner), "2026-10-01T00:05:00Z", len(inner)) == (2, "contained")
+    # strict: no length, a wrong length, or outside the window never matches
+    assert join.find_turn(tr, h(inner), "2026-10-01T00:05:00Z") is None
+    assert join.find_turn(tr, h(inner), "2026-10-01T00:05:00Z", len(inner) - 1) is None
+    assert join.find_turn(tr, h(inner), "2026-10-01T01:00:00Z", len(inner)) is None
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

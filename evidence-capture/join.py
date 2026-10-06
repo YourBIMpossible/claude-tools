@@ -184,18 +184,41 @@ def subagent_transcripts(transcript: Path) -> list[Path]:
     return sorted(d.glob("*.jsonl")) if d.is_dir() else []
 
 
-def find_turn(tr: Transcript, prompt_sha256: str, started_at: str) -> int | None:
-    """Index of the prompt event with this hash, nearest to ``started_at``."""
+CONTAINED_WINDOW_S = 120
+
+
+def _contains_hash(text: str, prompt_sha256: str, prompt_len: int) -> bool:
+    """True when some substring of exactly ``prompt_len`` chars hashes to ``prompt_sha256``."""
+    return any(sha256_text(text[i:i + prompt_len]) == prompt_sha256 for i in range(len(text) - prompt_len + 1))
+
+
+def find_turn(tr: Transcript, prompt_sha256: str, started_at: str,
+              prompt_len: int | None = None) -> tuple[int, str] | None:
+    """(index, match) of the event carrying the hook's prompt, nearest to ``started_at``.
+
+    ``exact``: a prompt (or meta prompt) event whose whole text has the hook's hash. Queue
+    enqueue records carry no turn and are never matched.
+    ``contained``: the transcript wraps the hook's prompt (a peer-message envelope); an
+    exact-hash substring of the hook's length inside an event within CONTAINED_WINDOW_S.
+    Hash equality is required either way; nothing looser is accepted."""
     start = parse_iso(started_at)
-    best: tuple[float, int] | None = None
-    for i, ev in enumerate(tr.events):
-        if ev.kind != "prompt" or ev.data["sha256"] != prompt_sha256:
-            continue
+
+    def dist(ev: Event) -> float:
         ts = parse_iso(ev.ts)
-        dist = abs((ts - start).total_seconds()) if ts and start else float("inf")
-        if best is None or dist < best[0]:
-            best = (dist, i)
-    return best[1] if best else None
+        return abs((ts - start).total_seconds()) if ts and start else float("inf")
+
+    for kinds in (("prompt",), ("candidate",)):
+        hits = [(dist(ev), i) for i, ev in enumerate(tr.events)
+                if ev.kind in kinds and "text" in ev.data and ev.data["sha256"] == prompt_sha256]
+        if hits:
+            return min(hits)[1], "exact"
+    if not prompt_len:
+        return None
+    hits = [(d, i) for i, ev in enumerate(tr.events)
+            if ev.kind in ("prompt", "candidate") and isinstance(ev.data.get("text"), str)
+            and len(ev.data["text"]) > prompt_len and (d := dist(ev)) <= CONTAINED_WINDOW_S
+            and _contains_hash(ev.data["text"], prompt_sha256, prompt_len)]
+    return (min(hits)[1], "contained") if hits else None
 
 
 def window_end(tr: Transcript, start: int) -> tuple[int, str]:
@@ -264,16 +287,17 @@ def join(m: dict[str, Any], transcript: Path) -> dict[str, Any] | None:
     only brief inside the bounds) and returns the observation dict for the screen.
     """
     tr = parse_transcript(transcript)
-    start = find_turn(tr, m["prompt"]["sha256"], m["started_at"])
-    if start is None:
+    found = find_turn(tr, m["prompt"]["sha256"], m["started_at"], m["prompt"].get("len"))
+    if found is None:
         return None
+    start, match = found
     ev = tr.events[start]
     end, ended_by = window_end(tr, start)
     subs = [parse_transcript(p) for p in subagent_transcripts(transcript)]
     obs = observe(tr, start, end, subs)
     human_before = sum(1 for e in tr.events[:start] if e.kind == "prompt" and e.data["origin"] in HUMAN_ORIGINS)
     m["prompt_uuid"] = ev.data.get("uuid")
-    m["prompt"].update(origin=ev.data["origin"], index_in_session=human_before, has_attachment=bool(ev.data["attachment"]))
+    m["prompt"].update(origin=ev.data["origin"], index_in_session=human_before, has_attachment=bool(ev.data.get("attachment")))
     m["prior_context"]["has_prior_conversation"] = human_before > 0
     m["ended_by"] = m.get("ended_by") or ended_by
     if tr.versions:
@@ -292,6 +316,7 @@ def join(m: dict[str, Any], transcript: Path) -> dict[str, Any] | None:
                    "earlier_prompt_text": [e.data["text"] for e in tr.events[:start] if e.kind == "prompt"],
                    "earlier_edit_paths": _edit_paths(tr.events[:start])}
     obs["subagent_count"] = len(subs)
+    obs["prompt_match"] = match
     return obs
 
 

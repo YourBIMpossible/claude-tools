@@ -478,6 +478,16 @@ def resolve_repo_root(m: dict[str, Any], cwds: list[str]) -> Path | None:
     return None
 
 
+def session_roots(cwds: list[str]) -> list[Path]:
+    """Every checkout the session's transcript ran in; EC stores packets under these."""
+    out: list[Path] = []
+    for cwd in cwds:
+        root = find_repo_root(cwd)
+        if root is not None and root not in out:
+            out.append(root)
+    return out
+
+
 def _untracked_paths(stores: Stores, ep: str) -> list[str]:
     p = stores.snapshots / ep / "untracked.json"
     if not p.is_file():
@@ -520,7 +530,7 @@ def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str
     else:
         m["ended_at"] = iso(turn_end) if turn_end else now
     root = resolve_repo_root(m, cwds)
-    m["link"] = resolve_link(m, load_packets(packet_dirs(root, stores)), now)
+    m["link"] = resolve_link(m, load_packets(packet_dirs(root, stores, session_roots(cwds))), now)
     brief = _pick_brief(obs, m)
     m["link"].update(brief_sha256=brief["sha256"] if brief else None, brief_len=brief["len"] if brief else None,
                      brief_empty=(brief["len"] == 0) if brief else None)
@@ -948,9 +958,11 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
                             changed = True
                     if m["link"].get("state") not in mf.FINAL_LINK_STATES and m.get("ended_at"):
                         tr = find_transcript(m["session_id"], env)
-                        root = resolve_repo_root(m, transcript_cwds(tr)) if tr else None
+                        tcwds = transcript_cwds(tr) if tr else []
+                        root = resolve_repo_root(m, tcwds) if tr else None
                         rc = reconcile(stores, [m], {ep: root} if root else None, now=now,
-                                       rules_for=lambda e: (load_owner_review(stores, e) or {}).get("rules"))
+                                       rules_for=lambda e: (load_owner_review(stores, e) or {}).get("rules"),
+                                       session_roots=session_roots(tcwds))
                         if rc["changed"]:
                             counts["relinked"] += 1
                             changed = False  # reconcile wrote the manifest, with every change made so far
