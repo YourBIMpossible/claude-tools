@@ -261,6 +261,13 @@ def test_repo_aware_relative_paths() -> None:
           "a relative path resolves against a subdirectory cwd")
     check(touched("git -C sub show HEAD:x.py", WT) == (["sub/x.py"], 0), "a relative -C resolves against the cwd")
     check(touched("cat CLAUDE.md", None) == (["claude.md"], 0), "no recorded cwd keeps the historical reading")
+    check(touched("$r='F:/Other'; git -C $r diff CLAUDE.md", WT) == ([], 1),
+          "git -C $variable: the directory is unknown, so the path is not attributed to the repo")
+    check(touched("cd /f/Other && cat CLAUDE.md", WT) == ([], 2), "cd to another repository moves later relative paths")
+    check(touched("cd src && cat a.py", WT) == (["src/a.py"], 0), "cd into a subdirectory keeps them in the repo")
+    check(touched("cd $d; cat a.py", WT) == ([], 1), "cd to a variable leaves later relative paths unattributed")
+    check(touched("popd; cat a.py", WT) == ([], 1), "popd leaves later relative paths unattributed")
+    check(touched("cat a.py; cd /f/Other", WT) == (["a.py"], 1), "a later cd does not move earlier segments")
     check(not fpm.overlap(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT)[0], ["claude.md"]),
           "the ckpt-7 cross-repository CLAUDE.md case no longer overlaps a cited CLAUDE.md")
 

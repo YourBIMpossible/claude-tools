@@ -133,21 +133,37 @@ def norm(raw: str, roots: Iterable[str]) -> str | None:
     return p if p and p not in {".", ".."} and not p.startswith("../") else None
 
 
-def resolve(raw: str, base: str | None, cwd: str | None) -> str:
+UNRESOLVED = "<unresolved-dir>"  # a directory the command set but this parser cannot evaluate ($var, popd, bare cd)
+
+
+def _join_dir(d: str | None, cwd: str | None) -> str | None:
+    """d made absolute against cwd; UNRESOLVED when it cannot be."""
+    if d is None:
+        return cwd
+    if cwd == UNRESOLVED or "$" in d or "%" in d:
+        return UNRESOLVED if not sp._is_absolute(d) or d.startswith("$") else d
+    if sp._is_absolute(d):
+        return d
+    return f"{cwd.replace(chr(92), '/').rstrip('/')}/{d}" if cwd else UNRESOLVED
+
+
+def resolve(raw: str, base: str | None, cwd: str | None) -> str | None:
     """A shell path argument made absolute against the directory the command ran in.
 
-    Relative arguments resolve against an explicit command base (git -C) and then the call's
-    recorded cwd, so a relative name under another repository is never read as this
-    repository's file. Absolute arguments, and relative ones with no known directory, are
-    returned unchanged (the latter keep the historical repo-relative reading).
+    Relative arguments resolve against an explicit command base (git -C) and then the
+    working directory in effect (the call's recorded cwd as moved by earlier cd segments),
+    so a relative name under another repository is never read as this repository's file.
+    Returns None when that directory cannot be determined: such a path is not attributed
+    to the repository. Absolute arguments are returned unchanged, and with no recorded cwd
+    a relative path keeps the historical repo-relative reading.
     """
     if sp._is_absolute(raw):
         return raw
-    d = base
-    if d is not None and not sp._is_absolute(d):
-        d = f"{cwd.rstrip(chr(92) + '/')}/{d}" if cwd else None
-    if d is None:
-        d = cwd
+    if cwd is None and base is None:
+        return raw
+    d = _join_dir(base, cwd)
+    if d == UNRESOLVED or (d is not None and d.startswith(("$", "~"))):
+        return None
     return f"{d.replace(chr(92), '/').rstrip('/')}/{raw}" if d else raw
 
 
@@ -226,6 +242,7 @@ class Footprint:
                 self._touch(idx, inp["path"], "search", native=True)
         elif name in SHELL_TOOLS and isinstance(inp.get("command"), str):
             segments, script = sp.parse_command(inp["command"])
+            wd: str | None = call.get("cwd")
             for seg in segments:
                 self.shell_segments += 1
                 if seg.has_pathlike or seg.kind == "miss":
@@ -239,8 +256,16 @@ class Footprint:
                     self.queries.append((idx, seg.text))
                 for use in seg.paths:
                     edit = use.role == "write" and use.verb != "git"
-                    self._touch(idx, resolve(use.path, use.base, call.get("cwd")), use.role,
-                                edit=edit, native=False)
+                    target = resolve(use.path, use.base, wd)
+                    if target is None:
+                        self.outside += 1
+                        continue
+                    self._touch(idx, target, use.role, edit=edit, native=False)
+                if seg.kind == "nav":
+                    # Later segments run in the new directory; one this parser cannot evaluate
+                    # (cd -, popd, a variable) leaves later relative paths unattributed.
+                    dest = seg.paths[0].path if seg.paths and seg.verb not in {"popd", "pop-location"} else None
+                    wd = UNRESOLVED if dest is None or dest == "-" else _join_dir(dest, wd if wd is not None else UNRESOLVED)
             for use in script:
                 self._touch(idx, use.path, "script", native=False)
 
