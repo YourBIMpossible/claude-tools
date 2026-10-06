@@ -111,6 +111,7 @@ def transcript_lines(turns: list[dict], version: str = "9.9.9") -> list[str]:
         for k, tool in enumerate(t.get("tools", [])):
             tid = f"toolu_{n}_{k}"
             lines.append(json.dumps({"type": "assistant", "timestamp": ts, "sessionId": SESSION, "version": version,
+                                     **({"cwd": tool["cwd"]} if tool.get("cwd") else {}),
                                      "message": {"id": f"msg_{n}_{k}", "role": "assistant", "content": [
                                          {"type": "tool_use", "id": tid, "name": tool["name"], "input": tool["input"]}]}}))
             result = {"type": "user", "timestamp": ts, "sessionId": SESSION,
@@ -1237,6 +1238,27 @@ def test_msys_drive_paths_resolve_like_windows_paths(root: Path) -> None:
     assert m["deps"]["external_repository"]["observed"] == 1, m["deps"]
     assert screen.msys_to_windows("/tmp/x") == "/tmp/x" and screen.msys_to_windows("/f/a/b") == "F:/a/b"
 
+
+
+def test_shell_call_uses_its_own_recorded_cwd(root: Path) -> None:
+    """A call's recorded cwd wins over the episode fallback (the transcript's last cwd, which
+    may come from a later turn in another directory)."""
+    repo = make_repo(root)
+    other = make_repo(root, "other")
+    turns = [{"prompt": "run", "tools": [{"name": "Bash", "cwd": str(repo),
+                                           "input": {"command": "node -e \"require('fs')\"; ./build.sh"}}]}]
+    tr = write_transcript(root, turns)
+    m = base_manifest("run", started="2026-09-26T10:01:00.000000Z")
+    m["repo"]["head"] = head(repo)
+    obs = join.join(m, tr)
+    assert obs is not None and obs["tool_calls"][0]["cwd"] == str(repo)
+    screen.screen(m, obs, repo, cwd=str(other))
+    muts = m["observation"]["shell_repo_mutations"]
+    assert "unresolved_effect:inline:node" in muts and "unresolved_effect:exec:build.sh" in muts, muts
+    # without a recorded cwd the episode fallback still applies
+    del obs["tool_calls"][0]["cwd"]
+    screen.screen(m, obs, repo, cwd=str(other))
+    assert m["observation"]["shell_repo_mutations"] == [], m["observation"]
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
