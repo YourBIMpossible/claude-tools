@@ -1001,24 +1001,50 @@ def test_shell_repo_mutation_blocks_x2_yes(root: Path) -> None:
     msys = "/" + str(repo)[0].lower() + str(repo)[2:].replace("\\", "/")
     cases = {
         "commit via shell": (f"cd '{repo}' && D=docs && cat >> \"$D/NOTES.md\" <<'X'\nline\nX\ngit add -A && git commit -qm n",
-                             {"write:cat", "git add", "git commit"}),
-        "msys cd then redirect": (f"cd {msys}; echo x > out.txt", {"write:echo"}),
-        "unknown cd then commit": ("cd \"$SOMEWHERE\" && git commit -qm n", {"unresolved:git commit"}),
-        "inline interpreter in repo": ("python - <<'PY'\nprint(1)\nPY", {"unresolved:inline:python"}),
+                             {"content_write:write:cat", "git_index:git add", "git_history:git commit"}, False),
+        "msys cd then redirect": (f"cd {msys}; echo x > out.txt", {"content_write:write:echo"}, False),
+        "unknown cd then commit": ("cd \"$SOMEWHERE\" && git commit -qm n", {"unresolved_target:git commit"}, False),
+        "inline interpreter in repo": ("python - <<'PY'\nprint(1)\nPY", {"unresolved_effect:inline:python"}, False),
+        "test runner in repo": ("python -m pytest tests", {"unresolved_effect:exec:python"}, False),
+        "repo script": ("node scripts/build.mjs", {"unresolved_effect:exec:node"}, False),
+        "checkout": ("git switch -c topic", {"git_worktree:git switch"}, False),
+        "failed commit": ("git commit -qm n", {"git_history:git commit:failed"}, True),
     }
-    for label, (cmd, want) in cases.items():
-        turns = [{"prompt": f"task {label}", "tools": [{"name": "Bash", "input": {"command": cmd}}]}]
+    for label, (cmd, want, err) in cases.items():
+        turns = [{"prompt": f"task {label}", "tools": [{"name": "Bash", "input": {"command": cmd}, "error": err}]}]
         m = joined(root, repo, turns, 0)
         got = set(m["observation"]["shell_repo_mutations"])
         assert want <= got, (label, got)
         assert rule(m, "X2") == "unknown", (label, m["exclusions"])
         assert m["edited_files"] == []  # the file set is not invented from a shell command
+    # pre-classification record entries map to a class conservatively
+    assert [screen.mutation_class(e) for e in ("git commit", "write:cat", "unresolved:git add", "unresolved:inline:py")] \
+        == ["git_history", "content_write", "unresolved_target", "unresolved_effect"]
     # mutations in another repository, temp files and plain reads leave X2 = yes
     for cmd in (f"cd '{other}' && git add -A && git commit -qm n", "git status && git log -3 > /dev/null",
-                "echo x > /tmp/scratch.txt", f"git -C '{other}' switch main", "python -m pytest tests"):
+                "echo x > /tmp/scratch.txt", f"git -C '{other}' switch main", f"cd '{other}' && python -m pytest"):
         m = joined(root, repo, [{"prompt": "look only", "tools": [{"name": "Bash", "input": {"command": cmd}}]}], 0)
         assert m["observation"]["shell_repo_mutations"] == [], (cmd, m["observation"])
         assert rule(m, "X2") == "yes", (cmd, m["exclusions"], m["observation"])
+
+
+def test_msys_drive_paths_resolve_like_windows_paths(root: Path) -> None:
+    """A Git-Bash ``/f/...`` path to a repository file is in-repo, not an external dependency."""
+    repo = make_repo(root)
+    other = make_repo(root, "other")
+
+    def msys(p: Path) -> str:
+        return "/" + str(p)[0].lower() + str(p)[2:].replace("\\", "/")
+
+    m = joined(root, repo, [{"prompt": "look", "tools": [
+        {"name": "Bash", "input": {"command": f"cat {msys(repo)}/README.md && cd {msys(repo)} && cat README.md"}}]}], 0)
+    assert m["deps"]["external_path"]["observed"] == 0, m["deps"]["external_path"]
+    assert m["deps"]["external_repository"]["observed"] == 0 and rule(m, "X2") == "yes"
+    # a genuinely external file and another repository stay external
+    m = joined(root, repo, [{"prompt": "look", "tools": [
+        {"name": "Bash", "input": {"command": f"cat {msys(other)}/README.md"}}]}], 0)
+    assert m["deps"]["external_repository"]["observed"] == 1, m["deps"]
+    assert screen.msys_to_windows("/tmp/x") == "/tmp/x" and screen.msys_to_windows("/f/a/b") == "F:/a/b"
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
