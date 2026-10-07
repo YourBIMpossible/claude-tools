@@ -743,7 +743,9 @@ def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str
         screen(m, obs, sroot, cwd=cwds[-1] if cwds else str(sroot),
                untracked_paths=_untracked_paths(stores, m["episode_id"]), complete=True, edited_out=edited)
         if by == "end" and root is not None:  # only the live Stop sees the end state; maintenance never
-            causal_hooks.end(m, sroot, stores.content, edited)
+            gaps = obs.get("subagent_unresolved") or 0
+            gaps = (len(gaps) if isinstance(gaps, list) else int(gaps)) + ("subagent_beyond_turn" in obs.get("causes", []))
+            causal_hooks.end(m, sroot, stores.content, edited, calls=obs.get("tool_calls"), subagent_gaps=gaps)
     if cap.get("status") == "failed":
         status = "failed"
     elif any(e.startswith("start_") for e in errors):

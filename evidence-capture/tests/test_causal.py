@@ -277,28 +277,42 @@ def test_checks_run_on_materialized_end_state_only(tmp: Path) -> None:
 
 def _good_record() -> dict:
     return {"identity_accepted": True, "start_problems": [], "end_problems": [], "history_problems": [],
-            "unsupported": [], "attribution": {"unattributed": [], "other_worktrees_moved": []},
-            "dependency_drift": [], "checks": [{"kind": "file_absent", "path": "x"}],
-            "check_results": [{"passed": False}]}
+            "start_fidelity": [], "end_fidelity": [], "unsupported": [],
+            "attribution": {"unattributed": [], "other_worktrees_moved": []},
+            "worktrees": {"contaminating": [], "unknown": [], "shared_state_changed": False},
+            "dependency_drift": [], "registration_problems": [], "checks": [{"kind": "file_absent", "path": "x"}],
+            "check_results": [{"passed": True}], "check_results_start": [{"passed": False}]}
 
 
 def test_admission_gate(tmp: Path) -> None:
     assert causal.admit(_good_record()) == {"eligible": True, "reasons": []}
+    wt = {"contaminating": [], "unknown": [], "shared_state_changed": False}
     cases = {
         "identity_not_accepted": {"identity_accepted": False},
         "end_missing": {"end_problems": None},
         "history_unverified": {"history_problems": ["corrupt"]},
         "unsupported:lfs": {"unsupported": ["lfs"]},
+        "start_fidelity_not_proven": {"start_fidelity": None},
+        "end_fidelity_bytes_differ:2": {"end_fidelity": ["fidelity_bytes_differ:2"]},
         "unattributed_change": {"attribution": {"unattributed": ["x"], "other_worktrees_moved": []}},
-        "other_worktree_moved": {"attribution": {"unattributed": [], "other_worktrees_moved": ["w"]}},
+        "worktree_classification_missing": {"worktrees": None},
+        "shared_git_state_changed": {"worktrees": {**wt, "shared_state_changed": True}},
+        "other_worktree_contaminating": {"worktrees": {**wt, "contaminating": ["w"]}},
+        "other_worktree_unknown": {"worktrees": {**wt, "unknown": ["w"]}},
         "dependency_drift:tool:node": {"dependency_drift": ["tool:node"]},
-        "no_outcome_check": {"checks": None},
-        "outcome_checks_not_run": {"check_results": None},
+        "no_outcome_check": {"registration_problems": None},
+        "outcome_check_registration_unverified": {"registration_problems": ["registration_modified"]},
+        "outcome_checks_not_run": {"check_results_start": None},
         "outcome_check_not_evaluable": {"check_results": [{"passed": None}]},
+        "predicate_rejects_reference_end": {"check_results": [{"passed": False}]},
+        "predicate_not_discriminating": {"check_results_start": [{"passed": True}]},
     }
     for reason, patch in cases.items():
         got = causal.admit({**_good_record(), **patch})
         assert not got["eligible"] and got["reasons"] == [reason], (reason, got)
+    # moved-but-unrelated worktrees in the attribution no longer exclude on their own
+    assert causal.admit({**_good_record(), "attribution": {"unattributed": [], "other_worktrees_moved": ["w"]}})[
+        "eligible"]
     assert causal.admit({})["reasons"][:2] == ["identity_not_accepted", "start_missing"]
 
 
@@ -321,7 +335,11 @@ def test_end_to_end_synthetic_episode(tmp: Path) -> None:
               "attribution": causal.attribute(s, e, ["a.txt"], worktrees_start=wt0,
                                               worktrees_end=causal.worktree_fingerprints(repo)),
               "dependency_drift": causal.dependency_drift(d0, causal.dependency_fingerprint(e, TOOLS), ["a.txt"]),
+              "start_fidelity": [], "end_fidelity": [], "registration_problems": [],
+              "worktrees": {"contaminating": [], "unknown": [], "shared_state_changed": False},
               "checks": checks, "check_results": causal.run_checks(checks, tmp / "m")}
+    causal.materialize(ep / "start", tmp / "m0")
+    record["check_results_start"] = causal.run_checks(checks, tmp / "m0")
     assert causal.admit(record)["eligible"], causal.admit(record)
     assert record["check_results"][0]["passed"] is True
 

@@ -120,6 +120,56 @@ def _scan(top: Path) -> tuple[dict[str, dict[str, Any]], dict[str, bytes]]:
     return files, blobs
 
 
+def byte_manifest(top: Path, *, deadline: float | None = None, timeout: float = 60.0) -> dict[str, str] | None:
+    """``{path: sha256(raw bytes)}`` over every tracked and untracked-unignored path present
+    in the worktree (symlinks hashed as their target text). ``None`` when ``deadline``
+    (``time.monotonic``) passes first: fidelity is then unproven, never approximated."""
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    paths = list_paths(top)
+
+    def one(rel: str) -> tuple[str, str] | None:
+        if deadline is not None and _time.monotonic() > deadline:
+            raise TimeoutError
+        got = _read_entry(top, rel)
+        return None if got is None else (rel, got[0]["sha256"])
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows = list(pool.map(one, paths))
+    except TimeoutError:
+        return None
+    return dict(r for r in rows if r is not None)
+
+
+def manifest_digest(manifest: dict[str, str]) -> str:
+    return sha256_bytes(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def verify_fidelity(state_dest: Path, out: Path) -> list[str]:
+    """Problems if the materialized ``out`` is not byte-identical, path for path, to the
+    worktree at capture time (``state.json`` ``bytes``). No manifest is a problem."""
+    rec = read_state(state_dest)
+    want = rec.get("bytes")
+    if not isinstance(want, dict):
+        return [f"fidelity_unproven:{rec.get('bytes_problem') or 'no_byte_manifest'}"]
+    if rec.get("bytes_sha256") != manifest_digest(want):
+        return ["fidelity_manifest_corrupt"]
+    got = byte_manifest(out) or {}
+    missing = [p for p in want if p not in got]
+    extra = [p for p in got if p not in want]
+    differ = [p for p in want if p in got and got[p] != want[p]]
+    probs = []
+    if missing:
+        probs.append(f"fidelity_missing:{len(missing)}")
+    if extra:
+        probs.append(f"fidelity_extra:{len(extra)}")
+    if differ:
+        probs.append(f"fidelity_bytes_differ:{len(differ)}")
+    return probs
+
+
 def _make_read_only(directory: Path) -> None:
     for path in sorted(directory.rglob("*"), reverse=True):
         if path.is_file():
@@ -302,14 +352,20 @@ def _seal(dest: Path, record: dict[str, Any], blobs: dict[str, bytes]) -> None:
     _make_read_only(dest)
 
 
-def capture_overlay(repo: Path, dest: Path, *, label: str, timeout: float = 10.0) -> dict[str, Any]:
+def capture_overlay(repo: Path, dest: Path, *, label: str, timeout: float = 10.0,
+                    bytes_deadline: float | None = None) -> dict[str, Any]:
     """Seal HEAD + overlay to ``dest`` (which must not exist). Read twice; any change is
-    ``concurrent_change``. Writes nothing to the repository (``GIT_OPTIONAL_LOCKS=0``)."""
+    ``concurrent_change``. Writes nothing to the repository (``GIT_OPTIONAL_LOCKS=0``).
+
+    Between the two reads it also records ``bytes``, the raw-byte manifest of the whole
+    worktree (``byte_manifest``), so a restore can be proven byte-exact rather than merely
+    git-equivalent; past ``bytes_deadline`` it records ``bytes: None`` with the reason."""
     if dest.exists():
         raise CausalError("state exists; never overwritten")
     top_raw, head = _git(repo, "rev-parse", "--show-toplevel", "HEAD", timeout=timeout).decode().splitlines()  # top may contain spaces
     top = Path(top_raw)
     first, blobs = _read_overlay(top, timeout)  # with oids (git reads the files once more)
+    manifest = byte_manifest(top, deadline=bytes_deadline, timeout=timeout)
     second, _ = _read_overlay(top, timeout, oids=False)
     third = {rel: got[0] for rel in first["files"] if (got := _read_entry(top, rel)) is not None}
     plain = {rel: {k: v for k, v in e.items() if k != "oid"} for rel, e in first["files"].items()}
@@ -318,6 +374,13 @@ def capture_overlay(repo: Path, dest: Path, *, label: str, timeout: float = 10.0
         raise CausalError("concurrent_change")
     record = {"version": OVERLAY_VERSION, "kind": "overlay", "label": label, "head": head,
               "conversion": _conversion(top), **first}
+    if manifest is not None:
+        for rel, entry in first["files"].items():
+            if manifest.get(rel) != entry["sha256"]:
+                raise CausalError("concurrent_change")
+        record.update(bytes=manifest, bytes_sha256=manifest_digest(manifest), bytes_problem=None)
+    else:
+        record.update(bytes=None, bytes_sha256=None, bytes_problem="budget")
     _seal(dest, record, blobs)
     return record
 
@@ -424,8 +487,8 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
                              capture_output=True, env=env)  # the state's HEAD, an ancestor of the frozen head
         if pin.returncode != 0:
             return ["state head not in frozen history"]
-        proc = subprocess.run(["git", *conv, "clone", "-q", "--no-hardlinks", "-b", "replay", str(bare), str(out)],
-                              capture_output=True, env=env)
+        proc = subprocess.run(["git", *conv, "-c", "core.longpaths=true", "clone", "-q", "--no-hardlinks", "-b",
+                               "replay", str(bare), str(out)], capture_output=True, env=env)
         if proc.returncode != 0:
             return ["clone failed: " + proc.stderr.decode("utf-8", "replace").strip()[:200]]
     for k, v in rec["conversion"].items():
@@ -441,11 +504,44 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
         if entry["mode"] == "120000":
             return [f"symlink not reproducible: {rel}"]
         target.write_bytes(data)
+    _restore_raw_checkout_bytes(out, rec)
     paths, _ = _overlay_candidates(out, 60.0)
     expected = sorted(set(rec["files"]) | set(rec["deleted"]))
     if paths != expected:
         problems.append(f"overlay mismatch: {len(set(paths) ^ set(expected))} path(s)")
     return problems
+
+
+def _restore_raw_checkout_bytes(out: Path, rec: dict[str, Any]) -> None:
+    """A clean tracked file can hold bytes a fresh checkout would not write: it was checked
+    out before the recorded conversion config was set (an LF file under ``autocrlf=true``),
+    which git still calls clean. For each base path whose checked-out bytes miss the
+    capture-time sha256, write the unfiltered blob instead when THAT matches the sha256.
+    Nothing is guessed: a path matching neither stays different and ``verify_fidelity``
+    reports it."""
+    want = rec.get("bytes")
+    if not isinstance(want, dict):
+        return
+    got = byte_manifest(out) or {}
+    stale = [p for p, h in want.items() if p not in rec["files"] and p in got and got[p] != h]
+    if not stale:
+        return
+    oids = _head_oids(out, rec["head"], 60.0)
+    stale = [p for p in stale if p in oids]
+    proc = subprocess.run(["git", "-C", str(out), "cat-file", "--batch"], capture_output=True, env=git_env(),
+                          input="".join(f"{oids[p]}\n" for p in stale).encode(), timeout=120)
+    buf, pos = proc.stdout, 0
+    for rel in stale:
+        nl = buf.index(b"\n", pos)
+        head = buf[pos:nl].split()
+        if len(head) != 3:  # "<oid> missing": leave it for verify_fidelity to report
+            pos = nl + 1
+            continue
+        size = int(head[2])
+        data = buf[nl + 1:nl + 1 + size]
+        pos = nl + 2 + size
+        if sha256_bytes(data) == want[rel]:
+            (out / rel).write_bytes(data)
 
 
 # ------------------------------------------------------------------ history store
@@ -564,11 +660,53 @@ def _norm_rel(path: str, top: str | None) -> str:
     return p[2:] if p.startswith("./") else p
 
 
-def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str]:
-    """sha256(HEAD + status) of every OTHER worktree sharing this repository (statuses run
-    concurrently; one that cannot finish raises ``worktree_status_timeout``)."""
+def _status_paths(status: bytes) -> list[str]:
+    """Paths named by ``git status --porcelain=v2 -z`` (renames: both sides)."""
+    recs = status.split(b"\0")
+    out: set[str] = set()
+    i = 0
+    while i < len(recs):
+        r = recs[i]
+        i += 1
+        if not r:
+            continue
+        kind = r[:1]
+        if kind == b"1":
+            out.add(r.split(b" ", 8)[8].decode("utf-8", "surrogateescape"))
+        elif kind == b"2":
+            out.add(r.split(b" ", 9)[9].decode("utf-8", "surrogateescape"))
+            if i < len(recs):
+                out.add(recs[i].decode("utf-8", "surrogateescape"))
+                i += 1
+        elif kind == b"u":
+            out.add(r.split(b" ", 10)[10].decode("utf-8", "surrogateescape"))
+        elif kind in (b"?", b"!"):
+            out.add(r[2:].decode("utf-8", "surrogateescape"))
+    return sorted(out)
+
+
+def shared_git_state(repo: Path) -> str:
+    """sha256 over the repository state every worktree shares and that can change how this
+    checkout behaves: the common ``config``, ``info/`` (exclude, attributes, sparse
+    settings) and ``hooks/``, plus this worktree's own ``HEAD`` reference text. Other
+    worktrees' branch refs and objects are deliberately outside it (they cannot alter
+    this checkout's files or configuration)."""
+    gitdir, common = _gitdirs(repo)
+    parts: list[bytes] = []
+    for base in (common / "config", common / "info", common / "hooks", gitdir / "HEAD", gitdir / "config.worktree"):
+        files = [base] if base.is_file() else sorted(p for p in base.rglob("*") if p.is_file()) if base.is_dir() else []
+        for f in files:
+            parts.append(str(f.relative_to(common if f.is_relative_to(common) else gitdir)).replace("\\", "/").encode()
+                         + b"\0" + f.read_bytes())
+    return sha256_bytes(b"\0\0".join(parts))
+
+
+def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, Any]]:
+    """Every OTHER worktree sharing this repository: ``{path: {"fp", "head", "paths"}}``,
+    where ``fp`` is sha256(HEAD + status) and ``paths`` the paths its status names
+    (statuses run concurrently; one that cannot finish raises ``worktree_status_timeout``)."""
     me = os.path.normcase(os.path.realpath(_git(repo, "rev-parse", "--show-toplevel").decode().strip()))
-    out: dict[str, str] = {}
+    out: dict[str, dict[str, Any]] = {}
     procs: dict[str, tuple[bytes, subprocess.Popen[bytes]]] = {}
     for block in _git(repo, "worktree", "list", "--porcelain", "-z").split(b"\0\0"):
         fields = dict(f.split(b" ", 1) if b" " in f else (f, b"") for f in block.split(b"\0") if f)
@@ -576,7 +714,7 @@ def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str]:
         if not path or b"bare" in fields or os.path.normcase(os.path.realpath(path)) == me:
             continue
         if not os.path.isdir(path):
-            out[path] = "missing"
+            out[path] = {"fp": "missing", "head": None, "paths": None}
             continue
         procs[path] = (fields.get(b"HEAD", b""), subprocess.Popen(
             ["git", "-C", path, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
@@ -588,7 +726,67 @@ def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str]:
             proc.kill()
             proc.communicate()
             raise CausalError("worktree_status_timeout") from None
-        out[path] = sha256_bytes(head + b"\0" + status)
+        out[path] = {"fp": sha256_bytes(head + b"\0" + status), "head": head.decode() or None,
+                     "paths": _status_paths(status)}
+    return out
+
+
+def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str]:
+    return {k: v["fp"] for k, v in worktree_records(repo, timeout).items()}
+
+
+INSTALL_WORDS = ("npm install", "npm ci", "pnpm install", "yarn install", "yarn add", "npm i ",
+                 "pip install", "uv sync", "uv pip", "poetry install", "dotnet restore", "nuget restore",
+                 "dotnet add", "cargo fetch", "go mod download", "bundle install", "composer install")
+
+
+def classify_worktrees(start: dict[str, dict[str, Any]] | None, end: dict[str, dict[str, Any]] | None, *,
+                       shared_start: str | None, shared_end: str | None,
+                       calls: list[dict[str, Any]] | None, subagents_unresolved: int | None,
+                       top: str | None = None) -> dict[str, Any]:
+    """Split other-worktree movement during a turn into ``contaminating`` (it can have
+    reached this task's inputs, dependencies, shared state or attribution), ``unrelated``
+    (preserved evidence shows it cannot have) and ``unknown`` (the evidence to decide is
+    missing). Unknown is never unrelated.
+
+    A moved worktree is unrelated only when every one of these holds: both records exist
+    with path lists; the shared git state is unchanged; every tool call of the turn
+    (subagents included, none unresolved) is preserved and none names that worktree's
+    path; and no call ran a package install/restore (shared caches)."""
+    out: dict[str, Any] = {"contaminating": [], "unrelated": [], "unknown": [], "shared_state_changed": None}
+    if start is None or end is None:
+        out["unknown"].append("records_missing")
+        return out
+    if shared_start is None or shared_end is None:
+        out["shared_state_changed"] = None
+    else:
+        out["shared_state_changed"] = shared_start != shared_end
+    moved = sorted(k for k in set(start) | set(end) if (start.get(k) or {}).get("fp") != (end.get(k) or {}).get("fp"))
+    texts: list[str] | None = None
+    if calls is not None and subagents_unresolved == 0:
+        texts = [json.dumps(c.get("input") or {}, ensure_ascii=False).replace("\\\\", "/").replace("\\", "/").lower()
+                 for c in calls]
+    installs = texts is not None and any(w in t for t in texts for w in INSTALL_WORDS)
+    for wt in moved:
+        a, b = start.get(wt), end.get(wt)
+        if out["shared_state_changed"] is True:
+            out["contaminating"].append(wt)
+            continue
+        if (not a or not b or a.get("paths") is None or b.get("paths") is None
+                or out["shared_state_changed"] is None or texts is None):
+            out["unknown"].append(wt)
+            continue
+        needles = {wt.replace("\\", "/").rstrip("/").lower()}
+        if top:
+            t_norm = top.replace("\\", "/").rstrip("/").lower() + "/"
+            if next(iter(needles)).startswith(t_norm):
+                needles.add(next(iter(needles))[len(t_norm):])  # a nested worktree named relatively
+        if installs or any(n in t for t in texts for n in needles):
+            out["contaminating"].append(wt)
+        elif any("../" in t or "..\\" in t for t in texts):
+            out["unknown"].append(wt)  # a parent-relative reference could name it indirectly
+        else:
+            out["unrelated"].append(wt)
     return out
 
 
@@ -643,7 +841,10 @@ def dependency_drift(start: dict[str, Any], end: dict[str, Any], agent_writes: l
 
 def load_registry(path: Path) -> dict[str, list[dict[str, Any]]]:
     """``{"tasks": {task_id: {"checks": [...]}}}``; malformed entries raise."""
-    raw = json.loads(path.read_bytes())
+    return validate_tasks(json.loads(path.read_bytes()))
+
+
+def validate_tasks(raw: Any) -> dict[str, list[dict[str, Any]]]:
     tasks = raw.get("tasks") if isinstance(raw, dict) else None
     if not isinstance(tasks, dict):
         raise CausalError("registry: 'tasks' object required")
@@ -661,6 +862,42 @@ def load_registry(path: Path) -> dict[str, list[dict[str, Any]]]:
                 raise CausalError(f"registry: task {task} {c['kind']} check needs path")
         out[task] = checks
     return out
+
+
+GENERIC_TARGETS = frozenset({"", ".", "./", "all", "build", "test", "tests", "check", "lint", "ci", "--", "*"})
+
+
+def validate_predicate(checks: list[dict[str, Any]]) -> None:
+    """A correctness predicate must be task-specific and independently executable.
+
+    State checks (``file_*``) name a path inside the materialized state. Behavioral
+    checks (``command``) must carry ``asserts`` (what task behavior they establish) and a
+    ``target`` (the task's own test id, script or path) that appears in ``argv``; no
+    argument may be an absolute path (it would reach outside the materialized state).
+    A predicate whose behavioral checks are all generic (no target) is refused, and so is
+    an empty one: a build or full-suite result alone does not identify the task."""
+    if not isinstance(checks, list) or not checks:
+        raise CausalError("predicate has no checks")
+    validate_tasks({"tasks": {"_": {"checks": checks}}})
+    specific = 0
+    for c in checks:
+        if c["kind"] == "command":
+            argv = [str(a) for a in c["argv"]]
+            if any(os.path.isabs(a) or (len(a) > 1 and a[1] == ":") for a in argv):
+                raise CausalError("command check uses an absolute path; it must run inside the materialized state")
+            target = str(c.get("target") or "").strip()
+            if not str(c.get("asserts") or "").strip():
+                raise CausalError("command check needs 'asserts': the task behavior it establishes")
+            if target.lower() in GENERIC_TARGETS or not any(target in a for a in argv):
+                continue  # generic: allowed alongside, never sufficient
+            specific += 1
+        else:
+            rel = c["path"].replace("\\", "/")
+            if os.path.isabs(c["path"]) or rel.startswith("../") or "/../" in rel or (len(rel) > 1 and rel[1] == ":"):
+                raise CausalError("state check path must be relative to the repository")
+            specific += 1
+    if not specific:
+        raise CausalError("no task-specific check: a generic build/test result alone is not a correctness predicate")
 
 
 def _inside(root: Path, rel: str) -> Path:
@@ -707,8 +944,11 @@ def admit(record: dict[str, Any]) -> dict[str, Any]:
 
     ``record`` keys: ``identity_accepted`` (bool), ``start_problems``/``end_problems``/
     ``history_problems`` (lists), ``unsupported`` (list), ``attribution`` (from
-    ``attribute``), ``dependency_drift`` (list), ``checks`` (registered list or None),
-    ``check_results`` (from ``run_checks``).
+    ``attribute``), ``start_fidelity``/``end_fidelity`` (``verify_fidelity`` lists; None =
+    not proven), ``worktrees`` (``classify_worktrees`` lists), ``dependency_drift`` (list),
+    ``registration_problems`` (None = nothing registered), ``checks``, and
+    ``check_results``/``check_results_start`` (``run_checks`` on the materialized end and
+    start). The predicate must pass on the end and must not already pass on the start.
     """
     reasons: list[str] = []
     if record.get("identity_accepted") is not True:
@@ -720,21 +960,42 @@ def admit(record: dict[str, Any]) -> dict[str, Any]:
         elif probs:
             reasons.append(f"{key}_unverified")
     reasons += [f"unsupported:{r}" for r in record.get("unsupported") or []]
+    for key in ("start", "end"):
+        fid = record.get(f"{key}_fidelity")
+        if fid is None:
+            reasons.append(f"{key}_fidelity_not_proven")
+        else:
+            reasons += [f"{key}_{p}" for p in fid]
     att = record.get("attribution")
     if not att:
         reasons.append("attribution_missing")
+    elif att["unattributed"]:
+        reasons.append("unattributed_change")
+    wt = record.get("worktrees")
+    if wt is None:
+        reasons.append("worktree_classification_missing")
     else:
-        if att["unattributed"]:
-            reasons.append("unattributed_change")
-        if att["other_worktrees_moved"]:
-            reasons.append("other_worktree_moved")
+        if wt.get("shared_state_changed") is True:
+            reasons.append("shared_git_state_changed")
+        if wt["contaminating"]:
+            reasons.append("other_worktree_contaminating")
+        if wt["unknown"]:
+            reasons.append("other_worktree_unknown")
     reasons += [f"dependency_drift:{d}" for d in record.get("dependency_drift") or []]
-    if not record.get("checks"):
+    if record.get("registration_problems") is None:
         reasons.append("no_outcome_check")
+    elif record["registration_problems"]:
+        reasons.append("outcome_check_registration_unverified")
     else:
-        results = record.get("check_results")
-        if not results or len(results) != len(record["checks"]):
+        checks = record.get("checks") or []
+        end_r, start_r = record.get("check_results"), record.get("check_results_start")
+        if not end_r or len(end_r) != len(checks) or not start_r or len(start_r) != len(checks):
             reasons.append("outcome_checks_not_run")
-        elif any(r.get("passed") is None for r in results):
+        elif any(r.get("passed") is None for r in end_r + start_r):
             reasons.append("outcome_check_not_evaluable")
+        else:
+            if not all(r["passed"] for r in end_r):
+                reasons.append("predicate_rejects_reference_end")
+            if all(r["passed"] for r in start_r):
+                reasons.append("predicate_not_discriminating")  # already true before the task
     return {"eligible": not reasons, "reasons": reasons}
