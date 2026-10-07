@@ -474,6 +474,13 @@ def review_episode(stores: Stores, m: dict[str, Any], inputs: ReviewInputs | Non
             touched.append(stores.meta / "DELETIONS.log")
             retention.update(deleted_at=now, deleted_kind="snapshots",
                              deletion_verified=bool(out["deletion"] and out["deletion"]["verified"]))
+        if (stores.content / "causal" / ep).exists():  # causal states hold the same content
+            try:
+                out["causal_deletion"] = verified_delete(stores, "causal", ep, f"excluded:{reason}")
+            except StoreError as exc:
+                out["error"] = str(exc)
+                log_line(stores, f"review {ep}: causal state deletion not verified: {exc}")
+            touched.append(stores.meta / "DELETIONS.log")
     elif state == "held":
         m["funnel"]["privacy_cleared"] = False
         m["funnel"]["payload_materialized"] = False
@@ -601,7 +608,7 @@ def _content_due(stores: Stores, now_dt: datetime) -> Iterator[tuple[str, str, P
                                                                    datetime | None, dict[str, Any] | None]]:
     """Every snapshot and payload that is undated (expiry None) or past its expiry, with
     its manifest and any valid seal: ``(kind, episode, manifest path, manifest, expiry, seal)``."""
-    for kind in ("payloads", "snapshots"):
+    for kind in ("payloads", "snapshots", "causal"):
         base = stores.content / kind
         if not base.is_dir():
             continue
@@ -619,7 +626,8 @@ def _content_due(stores: Stores, now_dt: datetime) -> Iterator[tuple[str, str, P
                 continue
             seal = None
             if expires is not None:
-                sums = d / "SHA256SUMS"
+                # causal states expire and are sealed with their episode's start snapshot
+                sums = (stores.content / "snapshots" / ep if kind == "causal" else d) / "SHA256SUMS"
                 seal = valid_seal(stores, ep, sha256_file(sums) if sums.is_file() else None, now_dt)
             yield kind, ep, mp, m, expires, seal
 

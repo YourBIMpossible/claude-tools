@@ -342,8 +342,12 @@ def _shell_repo_mutations(cmd: str, idx: RepoIndex, cwd: str | None, markers: li
 
 
 def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | None = None,
-           untracked_paths: Iterable[str] = (), complete: bool = True) -> dict[str, Any]:
-    """Fill deps, edited_files, prior_context and observation in ``m`` from ``obs`` (join output)."""
+           untracked_paths: Iterable[str] = (), complete: bool = True,
+           edited_out: list[str] | None = None) -> dict[str, Any]:
+    """Fill deps, edited_files, prior_context and observation in ``m`` from ``obs`` (join output).
+
+    ``edited_out`` receives the plain repository-relative edited paths (for causal
+    attribution in memory); the manifest itself keeps only their hashes."""
     idx = RepoIndex(repo_root)
     markers = _home_markers()
     turn = obs["turn"]
@@ -471,6 +475,8 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
     m["deps"]["prior_conversation"] = {"observed": 1 if index else 0, "required": pc_required,
                                        "evidence": pc_ev, "observation_sufficient": sufficient}
     m["edited_files"] = [{"path_sha256": path_sha256(p)} for p in edited]
+    if edited_out is not None:
+        edited_out.extend(edited)
     m["observation"] = {"sufficient": sufficient, "causes": sorted(set(causes)),
                         "shell_repo_mutations": sorted(set(shell_mutations))}
     m["task_class"]["mechanical"] = _task_class(edited, obs["tool_calls"])
