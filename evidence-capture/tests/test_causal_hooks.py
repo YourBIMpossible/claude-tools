@@ -240,6 +240,8 @@ def test_causal_states_follow_snapshot_retention(root: Path) -> None:
     assert not cdir(fx, m).exists(), "expired causal state deleted"
     log = (fx.stores.meta / "DELETIONS.log").read_text(encoding="utf-8")
     assert '"kind": "causal"' in log
+    rec = [json.loads(x) for x in log.splitlines() if '"kind": "causal"' in x][-1]
+    assert rec["verified"] and rec["listed_paths"] > 0, rec
 
 
 def test_freeze_register_admit(root: Path) -> None:

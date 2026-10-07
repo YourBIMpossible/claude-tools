@@ -412,6 +412,8 @@ def verified_delete(stores: Stores, kind: str, episode: str, reason: str) -> dic
         return record
     sums_file = target / "SHA256SUMS"
     listed = list(read_sums(target))
+    for sub in sorted(p for p in target.iterdir() if p.is_dir() and (p / "SHA256SUMS").is_file()):
+        listed += [f"{sub.name}/{rel}" for rel in read_sums(sub)]  # causal: start/end/history seals
     record["listed_paths"] = len(listed)
     if sums_file.is_file():
         record["sums_sha256"] = sha256_file(sums_file)
