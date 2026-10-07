@@ -413,8 +413,6 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
     if problems:
         return problems
     rec = read_state(state_dest)
-    if json.loads((history_dest / "history.json").read_bytes())["head"] != rec["head"]:
-        return ["history head differs from state head"]
     if out.exists() and any(out.iterdir()):
         return ["materialize target not empty"]
     env = git_env()
@@ -422,6 +420,10 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
     with tempfile.TemporaryDirectory(prefix="ec-mat-") as tmp:
         bare = Path(tmp) / "h.git"
         restore_history(history_dest, bare)
+        pin = subprocess.run(["git", "-C", str(bare), "update-ref", "refs/heads/replay", rec["head"]],
+                             capture_output=True, env=env)  # the state's HEAD, an ancestor of the frozen head
+        if pin.returncode != 0:
+            return ["state head not in frozen history"]
         proc = subprocess.run(["git", *conv, "clone", "-q", "--no-hardlinks", "-b", "replay", str(bare), str(out)],
                               capture_output=True, env=env)
         if proc.returncode != 0:
@@ -449,11 +451,12 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
 # ------------------------------------------------------------------ history store
 
 
-def freeze_history(repo: Path, dest: Path) -> dict[str, Any]:
-    """Pack every object reachable from HEAD into ``dest/history.pack``; verify standalone."""
+def freeze_history(repo: Path, dest: Path, *, head: str | None = None) -> dict[str, Any]:
+    """Pack every object reachable from ``head`` (default HEAD) into ``dest/history.pack``;
+    verify standalone."""
     if dest.exists():
         raise CausalError("history exists; never overwritten")
-    head = _git(repo, "rev-parse", "HEAD").decode().strip()
+    head = _git(repo, "rev-parse", "--verify", f"{head or 'HEAD'}^{{commit}}").decode().strip()
     proc = subprocess.run(["git", "-C", str(repo), "pack-objects", "--revs", "--stdout", "-q"],
                           input=f"{head}\n".encode(), capture_output=True, env=git_env(), timeout=600)
     if proc.returncode != 0:

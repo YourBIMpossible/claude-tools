@@ -68,6 +68,17 @@ def main(argv: list[str] | None = None) -> int:
     am.add_argument("--tool-commit", required=True)
     ad = sub.add_parser("admit")
     ad.add_argument("episode")
+    cp = sub.add_parser("causal", help="commissioning: freeze history, register outcome checks, admit")
+    csub = cp.add_subparsers(dest="action", required=True)
+    cf = csub.add_parser("freeze")
+    cf.add_argument("episode")
+    cf.add_argument("--repo", required=True, type=Path)
+    cr = csub.add_parser("register")
+    cr.add_argument("episode")
+    cr.add_argument("--checks", required=True, type=Path, help="JSON list of checks (see causal.CHECK_KINDS)")
+    cr.add_argument("--rationale", required=True)
+    ca = csub.add_parser("admit")
+    ca.add_argument("episode")
     sub.add_parser("expire")
     bp = sub.add_parser("backstop")
     bp.add_argument("--health", action="store_true", help="print the backstop's standing and exit")
@@ -143,6 +154,24 @@ def main(argv: list[str] | None = None) -> int:
         res = audit.admission_check(st, args.episode)
         _print(res)
         return 0 if res["admitted"] else 1
+    if args.cmd == "causal":
+        import causal
+        import causal_admit
+        try:
+            if args.action == "freeze":
+                res = causal_admit.freeze(st, args.episode, args.repo)
+            elif args.action == "register":
+                checks = json.loads(args.checks.read_bytes())
+                if not isinstance(checks, list):
+                    raise causal.CausalError("--checks must hold a JSON list")
+                res = causal_admit.register(st, args.episode, checks, args.rationale)
+            else:
+                res = causal_admit.admit(st, args.episode)
+        except (causal.CausalError, OSError, ValueError) as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 2
+        _print(res)
+        return 0 if args.action != "admit" or res["eligible"] else 1
     if args.cmd == "expire":
         _print(expire(st))
         return 0

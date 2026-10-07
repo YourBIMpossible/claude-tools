@@ -29,6 +29,7 @@ owner-approved step.
 | `desktop_boundary_test.py` | Pinned-client boundary tests in the desktop client's streaming mode (synthetic repository) |
 | `desktop_host_probe.py` | Probe hooks and analysis for the desktop app itself (`claude-desktop` mode), run from a disposable repository |
 | `causal.py` | Causal machinery (D3): sealed end/start states, self-contained history pack, raw-byte restore, unsupported-state exclusions, attribution, dependency fingerprints, outcome-check registry, admission gate, overlay states (HEAD + raw dirty bytes) |
+| `causal_admit.py` | Commissioning: `capture.py causal freeze|register|admit` — lazy history freeze at the end HEAD, outcome checks registered (task-specific, committed, never replaced) before replay outputs exist, full admission verdict |
 | `causal_hooks.py` | Wires causal states into capture: start overlay on UserPromptSubmit (budgeted, fail-open), end overlay + attribution + dependency drift on the live Stop only; reasons recorded as `causal:<stage>:<reason>` |
 | `capture.py` | Command line |
 
