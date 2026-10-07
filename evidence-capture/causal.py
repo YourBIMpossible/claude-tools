@@ -120,7 +120,15 @@ def _scan(top: Path) -> tuple[dict[str, dict[str, Any]], dict[str, bytes]]:
     return files, blobs
 
 
-def byte_manifest(top: Path, *, deadline: float | None = None, timeout: float = 60.0) -> dict[str, str] | None:
+def mixed_eol(data: bytes) -> bool:
+    """CRLF together with a lone LF or CR: no checkout of any blob conversion writes this,
+    so the bytes cannot be derived from history and must be kept."""
+    crlf = data.count(b"\r\n")
+    return crlf > 0 and (data.count(b"\n") != crlf or data.count(b"\r") != crlf)
+
+
+def byte_manifest(top: Path, *, deadline: float | None = None, timeout: float = 60.0,
+                  keep: dict[str, bytes] | None = None) -> dict[str, str] | None:
     """``{path: sha256(raw bytes)}`` over every tracked and untracked-unignored path present
     in the worktree (symlinks hashed as their target text). ``None`` when ``deadline``
     (``time.monotonic``) passes first: fidelity is then unproven, never approximated."""
@@ -133,7 +141,11 @@ def byte_manifest(top: Path, *, deadline: float | None = None, timeout: float = 
         if deadline is not None and _time.monotonic() > deadline:
             raise TimeoutError
         got = _read_entry(top, rel)
-        return None if got is None else (rel, got[0]["sha256"])
+        if got is None:
+            return None
+        if keep is not None and got[0]["mode"] != "120000" and mixed_eol(got[1]):
+            keep[rel] = got[1]  # dict item assignment is atomic across the pool's threads
+        return rel, got[0]["sha256"]
 
     try:
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -210,11 +222,12 @@ def verify_state(dest: Path) -> list[str]:
         return ["state.json missing"]
     problems = list(verify_sums(dest))
     record = read_state(dest)
-    for rel, entry in record["files"].items():
-        obj = dest / "objects" / entry["sha256"]
+    refs = {rel: e["sha256"] for rel, e in record["files"].items()} | dict(record.get("raw") or {})
+    for rel, digest in refs.items():
+        obj = dest / "objects" / digest
         if not obj.is_file():
             problems.append(f"object missing for {rel}")
-        elif sha256_bytes(obj.read_bytes()) != entry["sha256"]:
+        elif sha256_bytes(obj.read_bytes()) != digest:
             problems.append(f"object corrupt for {rel}")
     return problems
 
@@ -365,7 +378,8 @@ def capture_overlay(repo: Path, dest: Path, *, label: str, timeout: float = 10.0
     top_raw, head = _git(repo, "rev-parse", "--show-toplevel", "HEAD", timeout=timeout).decode().splitlines()  # top may contain spaces
     top = Path(top_raw)
     first, blobs = _read_overlay(top, timeout)  # with oids (git reads the files once more)
-    manifest = byte_manifest(top, deadline=bytes_deadline, timeout=timeout)
+    kept: dict[str, bytes] = {}
+    manifest = byte_manifest(top, deadline=bytes_deadline, timeout=timeout, keep=kept)
     second, _ = _read_overlay(top, timeout, oids=False)
     third = {rel: got[0] for rel in first["files"] if (got := _read_entry(top, rel)) is not None}
     plain = {rel: {k: v for k, v in e.items() if k != "oid"} for rel, e in first["files"].items()}
@@ -378,7 +392,9 @@ def capture_overlay(repo: Path, dest: Path, *, label: str, timeout: float = 10.0
         for rel, entry in first["files"].items():
             if manifest.get(rel) != entry["sha256"]:
                 raise CausalError("concurrent_change")
-        record.update(bytes=manifest, bytes_sha256=manifest_digest(manifest), bytes_problem=None)
+        raw = {rel: manifest[rel] for rel in sorted(kept) if rel not in first["files"]}
+        blobs.update({manifest[rel]: kept[rel] for rel in raw})
+        record.update(bytes=manifest, bytes_sha256=manifest_digest(manifest), bytes_problem=None, raw=raw)
     else:
         record.update(bytes=None, bytes_sha256=None, bytes_problem="budget")
     _seal(dest, record, blobs)
@@ -494,6 +510,8 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
     for k, v in rec["conversion"].items():
         if v is not None:
             subprocess.run(["git", "-C", str(out), "config", k, v], check=True, env=env, capture_output=True)
+    subprocess.run(["git", "-C", str(out), "config", "core.longpaths", "true"], check=True, env=env,
+                   capture_output=True)  # a deep path under a longer root; not part of the worktree bytes
     subprocess.run(["git", "-C", str(out), "remote", "remove", "origin"], env=env, capture_output=True)
     for rel in rec["deleted"]:
         (out / rel).unlink(missing_ok=True)
@@ -504,6 +522,8 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
         if entry["mode"] == "120000":
             return [f"symlink not reproducible: {rel}"]
         target.write_bytes(data)
+    for rel, digest in (rec.get("raw") or {}).items():  # clean files whose bytes history cannot produce
+        (out / rel).write_bytes((state_dest / "objects" / digest).read_bytes())
     _restore_raw_checkout_bytes(out, rec)
     paths, _ = _overlay_candidates(out, 60.0)
     expected = sorted(set(rec["files"]) | set(rec["deleted"]))
@@ -515,8 +535,9 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
 def _restore_raw_checkout_bytes(out: Path, rec: dict[str, Any]) -> None:
     """A clean tracked file can hold bytes a fresh checkout would not write: it was checked
     out before the recorded conversion config was set (an LF file under ``autocrlf=true``),
-    which git still calls clean. For each base path whose checked-out bytes miss the
-    capture-time sha256, write the unfiltered blob instead when THAT matches the sha256.
+    which git still calls clean, or a CRLF file under ``eol=lf``. For each base path whose
+    checked-out bytes miss the capture-time sha256, write the unfiltered blob, or that blob
+    with LF -> CRLF, whichever matches the sha256.
     Nothing is guessed: a path matching neither stays different and ``verify_fidelity``
     reports it."""
     want = rec.get("bytes")
@@ -540,8 +561,10 @@ def _restore_raw_checkout_bytes(out: Path, rec: dict[str, Any]) -> None:
         size = int(head[2])
         data = buf[nl + 1:nl + 1 + size]
         pos = nl + 2 + size
-        if sha256_bytes(data) == want[rel]:
-            (out / rel).write_bytes(data)
+        for cand in (data, data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")):
+            if sha256_bytes(cand) == want[rel]:
+                (out / rel).write_bytes(cand)
+                break
 
 
 # ------------------------------------------------------------------ history store

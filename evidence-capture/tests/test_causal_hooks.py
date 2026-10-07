@@ -373,6 +373,41 @@ def test_fidelity_is_byte_exact_not_git_equivalent(root: Path) -> None:
     assert "start_fidelity_not_proven" in causal.admit({"start_fidelity": None})["reasons"]
 
 
+def test_clean_bytes_history_cannot_write(root: Path) -> None:
+    """Clean files whose bytes no checkout writes (the BIMpossible-family mismatches)."""
+    repo = root / "r"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "core.autocrlf", "true")
+    git(repo, "config", "core.longpaths", "true")
+    (repo / ".gitattributes").write_bytes(b"pinned.txt text eol=lf\n")
+    (repo / "mixed.md").write_bytes(b"a\r\nb\nc\r\n")
+    (repo / "pinned.txt").write_bytes(b"x\ny\n")
+    deep = "/".join(["d" * 40] * 6) + "/leaf.txt"  # past MAX_PATH under any root
+    (repo / deep).parent.mkdir(parents=True)
+    (repo / deep).write_bytes(b"deep\r\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    (repo / "pinned.txt").write_bytes(b"x\r\ny\r\n")  # normalizes to the blob: git calls it clean
+    git(repo, "add", "-A")
+    assert status(repo) == "", status(repo)
+    assert causal.mixed_eol(b"a\r\nb\n") and causal.mixed_eol(b"a\r\nb\r") and not causal.mixed_eol(b"a\r\nb\r\n")
+    hist = root / "hist"
+    causal.freeze_history(repo, hist)
+    rec = causal.capture_overlay(repo, root / "s", label="start")
+    assert rec["files"] == {} and list(rec["raw"]) == ["mixed.md"], rec["raw"]
+    assert causal.verify_state(root / "s") == []
+    assert causal.materialize_overlay(root / "s", hist, root / "o") == []
+    assert causal.verify_fidelity(root / "s", root / "o") == []
+    assert (root / "o" / "mixed.md").read_bytes() == b"a\r\nb\nc\r\n"
+    assert (root / "o" / "pinned.txt").read_bytes() == b"x\r\ny\r\n"
+    assert git(root / "o", "config", "core.longpaths").strip() == "true"
+    obj = root / "s" / "objects" / rec["raw"]["mixed.md"]
+    obj.chmod(0o644)
+    obj.write_bytes(b"tampered")
+    assert any("mixed.md" in p for p in causal.verify_state(root / "s"))
+
+
 def test_other_worktree_classification(root: Path) -> None:
     rec = {"fp": "a", "head": "h", "paths": []}
     moved = {"fp": "b", "head": "h", "paths": ["x.txt"]}
@@ -405,7 +440,7 @@ TESTS = [test_freeze_register_admit, test_start_end_preserved_and_attributed, te
          test_unsupported_reason_explicit, test_failures_are_explicit_and_fail_open,
          test_end_never_recorded_by_maintenance_or_twice, test_overlay_materializes_from_frozen_history,
          test_causal_states_follow_snapshot_retention, test_fidelity_is_byte_exact_not_git_equivalent,
-         test_other_worktree_classification]
+         test_other_worktree_classification, test_clean_bytes_history_cannot_write]
 
 
 def main() -> int:
