@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 from datetime import timedelta
@@ -128,6 +129,8 @@ def test_unattributed_change_and_other_worktree(root: Path) -> None:
     fx.end(sid, tp)
     a = fx.episode(sid)["causal"]["attribution"]
     assert a["unattributed"] == 1 and a["other_worktrees_moved"] == 1 and not a["isolated"], a
+    w = fx.episode(sid)["causal"]["worktrees"]
+    assert (w["unrelated"], w["contaminating"], w["unknown"], w["shared_state_changed"]) == (1, 0, 0, False), w
 
 
 def test_unsupported_reason_explicit(root: Path) -> None:
@@ -253,39 +256,156 @@ def test_freeze_register_admit(root: Path) -> None:
     assert {"history_missing", "no_outcome_check"} <= set(before["causal_reasons"]), before
     assert not before["eligible"]
     causal_admit.freeze(fx.stores, ep, fx.repo)
-    for bad, why in (([{"kind": "command", "argv": ["python", "-c", "0"]}], "generic"),
-                     ([{"kind": "file_absent", "path": "x"}], "")):
+    refused = (
+        ([{"kind": "command", "argv": ["python", "-m", "pytest"], "asserts": "suite passes"}], "generic"),
+        ([{"kind": "command", "argv": ["python", "-m", "pytest", "tests"], "target": "tests",
+           "asserts": "suite passes"}], "generic target"),
+        ([{"kind": "command", "argv": ["python", "t_alpha.py"], "target": "t_alpha.py"}], "no asserts"),
+        ([{"kind": "command", "argv": ["python", str(root / "t.py")], "target": "t.py", "asserts": "x"}], "abs"),
+        ([{"kind": "file_absent", "path": "../x"}], "escapes"),
+        ([{"kind": "file_absent", "path": "x"}], ""),
+        ([], "empty"),
+    )
+    for bad, why in refused:
         try:
             causal_admit.register(fx.stores, ep, bad, why)
-            raise AssertionError("registration should be refused")
+            raise AssertionError(f"registration should be refused: {why}")
         except causal.CausalError:
             pass
-    checks = [{"kind": "file_contains", "path": "src/alpha.py", "text": "x * 3 + 2"}]
+    # a behavioral predicate needs no file_* check; a generic command may ride along
+    causal.validate_predicate([{"kind": "command", "argv": ["python", "-m", "pytest", "tests/test_alpha.py::k"],
+                                "target": "tests/test_alpha.py::k", "asserts": "alpha returns 3x+2"},
+                               {"kind": "command", "argv": ["python", "-m", "pytest"], "asserts": "no regressions"}])
+    calls: list[str] = []
+    try:
+        causal_admit.launch(fx.stores, ep, lambda a: calls.append("ran"))
+        raise AssertionError("launch without a registration must refuse")
+    except causal_admit.RunRefused:
+        pass
+    assert calls == [], "the model launcher was called before authorization"
+    probe = "import sys; sys.exit(0 if b'x * 3 + 2' in open('src/alpha.py','rb').read() else 1)"
+    checks = [{"kind": "file_contains", "path": "src/alpha.py", "text": "x * 3 + 2"},
+              {"kind": "command", "argv": ["python", "-c", probe], "target": "src/alpha.py",
+               "asserts": "alpha's constant is 2"}]
     causal_admit.register(fx.stores, ep, checks, "the task changes alpha's constant")
     try:
         causal_admit.register(fx.stores, ep, checks, "again")
         raise AssertionError("re-registration should be refused")
     except causal.CausalError:
         pass
+    assert causal_admit.verify_registration(fx.stores, ep)[1] == []
     res = causal_admit.admit(fx.stores, ep)
-    assert res["check_results"] == [{"index": 0, "kind": "file_contains", "passed": True}], res
-    assert not {"history_missing", "no_outcome_check", "end_unverified", "history_unverified"}         & set(res["causal_reasons"]), res
+    assert [r["passed"] for r in res["check_results"]] == [True, True], res
+    assert [r["passed"] for r in res["check_results_start"]] == [False, False], res
+    bad = {"history_missing", "no_outcome_check", "end_unverified", "history_unverified", "start_fidelity_not_proven",
+           "end_fidelity_not_proven", "predicate_not_discriminating", "predicate_rejects_reference_end",
+           "outcome_check_registration_unverified", "worktree_classification_missing"}
+    assert not bad & set(res["causal_reasons"]), res
+    assert not any("fidelity" in r for r in res["causal_reasons"]), res
     assert "registered" in git(fx.stores.meta, "log", "-1", "--format=%s")
+    # tampering after registration: the guard refuses before any launch
+    p = causal_admit.checks_path(fx.stores, ep)
+    os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+    original = p.read_bytes()
+    p.write_bytes(original.replace(b"x * 3 + 2", b"x * 3 + 9"))
+    assert causal_admit.verify_registration(fx.stores, ep)[1], "tampered registration verified"
+    assert "outcome_check_registration_unverified" in causal_admit.admit(fx.stores, ep)["causal_reasons"]
+    try:
+        causal_admit.launch(fx.stores, ep, lambda a: calls.append("ran"))
+        raise AssertionError("tampered registration must refuse")
+    except causal_admit.RunRefused:
+        pass
+    assert calls == []
+    p.write_bytes(original)
+    # a predicate already true at start does not measure the task
     sid2 = str(uuid.uuid4())
     fx.end(sid2, turn(fx, sid2))
     ep2 = fx.episode(sid2)["episode_id"]
-    causal_admit.replay_dir(fx.stores, ep2).mkdir(parents=True)
+    causal_admit.freeze(fx.stores, ep2, fx.repo)
+    causal_admit.register(fx.stores, ep2, [{"kind": "file_contains", "path": "src/alpha.py", "text": "def "}], "weak")
+    assert "predicate_not_discriminating" in causal_admit.admit(fx.stores, ep2)["causal_reasons"]
+    sid3 = str(uuid.uuid4())
+    fx.end(sid3, turn(fx, sid3))
+    ep3 = fx.episode(sid3)["episode_id"]
+    causal_admit.replay_dir(fx.stores, ep3).mkdir(parents=True)
     try:
-        causal_admit.register(fx.stores, ep2, checks, "late")
+        causal_admit.register(fx.stores, ep3, checks, "late")
         raise AssertionError("registration after replay outputs should be refused")
     except causal.CausalError as exc:
         assert "before replay" in str(exc)
 
 
+def test_fidelity_is_byte_exact_not_git_equivalent(root: Path) -> None:
+    repo = root / "r"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "core.autocrlf", "false")
+    (repo / "lf.txt").write_bytes(b"checked out before autocrlf was set\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "lf")
+    git(repo, "config", "core.autocrlf", "true")  # git still calls lf.txt clean; a checkout would write CRLF
+    (repo / "a.txt").write_bytes(b"one\r\n")
+    (repo / "b.txt").write_bytes(b"two\r\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    for n in ("a.txt", "b.txt"):
+        (repo / n).unlink()
+    git(repo, "checkout", "-q", "--", "a.txt", "b.txt")
+    assert status(repo) == ""
+    hist = root / "hist"
+    causal.freeze_history(repo, hist)
+    good = causal.capture_overlay(repo, root / "s1", label="start")
+    assert good["bytes"] and good["bytes_problem"] is None, good
+    assert causal.materialize_overlay(root / "s1", hist, root / "o1") == []
+    assert causal.verify_fidelity(root / "s1", root / "o1") == []
+    assert (root / "o1" / "lf.txt").read_bytes() == b"checked out before autocrlf was set\n"
+    (repo / "b.txt").write_bytes(b"two\n")  # git may call this clean (normalized); the bytes differ
+    causal.capture_overlay(repo, root / "s2", label="start")
+    (root / "o1" / "b.txt").write_bytes(b"two\r\n")
+    assert causal.verify_fidelity(root / "s2", root / "o1") == ["fidelity_bytes_differ:1"]
+    (root / "o1" / "extra").write_bytes(b"")
+    (root / "o1" / "a.txt").unlink()
+    got = causal.verify_fidelity(root / "s1", root / "o1")
+    assert "fidelity_missing:1" in got and "fidelity_extra:1" in got, got
+    over = causal.capture_overlay(repo, root / "s3", label="start", bytes_deadline=time.monotonic() - 1)
+    assert over["bytes"] is None and over["bytes_problem"] == "budget", over
+    assert causal.verify_fidelity(root / "s3", root / "o1") == ["fidelity_unproven:budget"]
+    assert "start_fidelity_not_proven" in causal.admit({"start_fidelity": None})["reasons"]
+
+
+def test_other_worktree_classification(root: Path) -> None:
+    rec = {"fp": "a", "head": "h", "paths": []}
+    moved = {"fp": "b", "head": "h", "paths": ["x.txt"]}
+    s, e = {"F:/r/wt2": rec}, {"F:/r/wt2": moved}
+    read = [{"input": {"file_path": "F:/r/main/src/a.py"}}]
+
+    def cls(**kw):  # noqa: ANN003, ANN202
+        args = {"shared_start": "s", "shared_end": "s", "calls": read, "subagents_unresolved": 0, "top": "F:/r/main"}
+        return causal.classify_worktrees(s, e, **{**args, **kw})
+    assert cls()["unrelated"] == ["F:/r/wt2"]
+    assert cls(calls=None)["unknown"] == ["F:/r/wt2"], "missing tool evidence is unknown, not unrelated"
+    assert cls(subagents_unresolved=1)["unknown"] == ["F:/r/wt2"], "unresolved subagent is unknown"
+    assert cls(shared_end="t")["contaminating"] == ["F:/r/wt2"], "shared git state moved"
+    assert cls(shared_end=None)["unknown"] == ["F:/r/wt2"]
+    assert cls(calls=[{"input": {"command": "type F:\\r\\wt2\\x.txt"}}])["contaminating"] == ["F:/r/wt2"]
+    assert cls(calls=[{"input": {"command": "npm install"}}])["contaminating"] == ["F:/r/wt2"], "shared caches"
+    assert cls(calls=[{"input": {"command": "cat ../x"}}])["unknown"] == ["F:/r/wt2"]
+    assert causal.classify_worktrees(None, e, shared_start="s", shared_end="s", calls=read,
+                                     subagents_unresolved=0)["unknown"] == ["records_missing"]
+    nested = "F:/r/main/.claude/worktrees/l"
+    got = causal.classify_worktrees({nested: rec}, {nested: moved}, shared_start="s", shared_end="s",
+                                    calls=[{"input": {"pattern": "x", "path": ".claude/worktrees/l"}}],
+                                    subagents_unresolved=0, top="F:/r/main")
+    assert got["contaminating"] == [nested], got
+    v = causal.admit({"worktrees": {"contaminating": [], "unknown": ["x"], "shared_state_changed": False}})
+    assert "other_worktree_unknown" in v["reasons"] and "other_worktree_moved" not in v["reasons"], v
+
+
 TESTS = [test_freeze_register_admit, test_start_end_preserved_and_attributed, test_unattributed_change_and_other_worktree,
          test_unsupported_reason_explicit, test_failures_are_explicit_and_fail_open,
          test_end_never_recorded_by_maintenance_or_twice, test_overlay_materializes_from_frozen_history,
-         test_causal_states_follow_snapshot_retention]
+         test_causal_states_follow_snapshot_retention, test_fidelity_is_byte_exact_not_git_equivalent,
+         test_other_worktree_classification]
 
 
 def main() -> int:
