@@ -9,6 +9,10 @@ repository, and proof that nothing else moved. This module adds those pieces:
                          tracked and untracked unignored path as raw bytes, read twice
                          (any difference is ``concurrent_change``), content-addressed by
                          SHA-256, sealed with ``SHA256SUMS`` and made read-only
+* ``capture_overlay``    the hook-time form: HEAD plus the exact bytes of every path git
+                         reports as differing from it, sealed the same way;
+                         ``effective_oids`` compares two of them, ``materialize_overlay``
+                         rebuilds one from frozen history
 * ``freeze_history``     a self-contained pack of every object reachable from HEAD,
                          verified by indexing it into an empty repository (no
                          alternates, no reference to the source)
@@ -198,6 +202,250 @@ def neutralize_attributes(gitdir: Path) -> None:
     (info / "attributes").write_bytes(NEUTRAL_ATTRIBUTES)
 
 
+# ------------------------------------------------------------------ hook-time overlay states
+#
+# A full ``capture_state`` reads every file twice: seconds on a large checkout, too slow for
+# the prompt hook. The hooks instead seal an *overlay*: HEAD plus the bytes of every path
+# git reports as differing from it (tracked diffs, staged or not, and untracked-unignored
+# files), plus the tracked paths that are gone. Overlay bytes are raw and exact. Paths
+# outside the overlay are git-equivalent to HEAD: replay checks them out of the frozen
+# history under the recorded conversion settings (``core.autocrlf``/``core.eol``), so they
+# match the original up to git's own line-ending conversion, which git itself reports as
+# "unchanged". Every entry also carries its git blob id (``oid``, cleaned as git would) so
+# that start and end compare in git's terms.
+
+OVERLAY_VERSION = 1
+OVERLAY_MAX_FILES = 2000
+CONVERSION_KEYS = ("core.autocrlf", "core.eol", "core.safecrlf")
+
+
+def _blob_oid(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()  # noqa: S324 — git's object id
+
+
+def _overlay_candidates(top: Path, timeout: float) -> tuple[list[str], set[str]]:
+    """(paths differing from HEAD or untracked, the subset tracked in HEAD)."""
+    diff = _git(top, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "HEAD", timeout=timeout)
+    untracked = _git(top, "ls-files", "-z", "-o", "--exclude-standard", timeout=timeout)
+    tracked = {p.decode("utf-8", "surrogateescape") for p in diff.split(b"\0") if p}
+    others = {p.decode("utf-8", "surrogateescape") for p in untracked.split(b"\0") if p}
+    return sorted(tracked | others), tracked
+
+
+def _conversion(top: Path) -> dict[str, str | None]:
+    """The effective (last-wins) value of each ``CONVERSION_KEYS`` setting, or None."""
+    proc = subprocess.run(["git", "-C", str(top), "config", "-z", "--get-regexp", r"^core\.(autocrlf|eol|safecrlf)$"],
+                          capture_output=True, env=git_env(), timeout=10)
+    out: dict[str, str | None] = dict.fromkeys(CONVERSION_KEYS)
+    for rec in proc.stdout.decode("utf-8", "replace").split("\0"):
+        key, _, value = rec.partition("\n")
+        if key.lower() in out:
+            out[key.lower()] = value
+    return out
+
+
+def _clean_oids(top: Path, rels: list[str], timeout: float) -> list[str]:
+    if not rels:
+        return []
+    proc = subprocess.run(["git", "-C", str(top), "hash-object", "--stdin-paths"],
+                          input="\n".join(rels).encode("utf-8", "surrogateescape") + b"\n",
+                          capture_output=True, env=git_env(), timeout=timeout)
+    if proc.returncode != 0:
+        raise CausalError("hash-object failed")
+    oids = proc.stdout.decode().split()
+    if len(oids) != len(rels):
+        raise CausalError("hash-object count mismatch")
+    return oids
+
+
+def _read_overlay(top: Path, timeout: float, *, oids: bool = True) -> tuple[dict[str, Any], dict[str, bytes]]:
+    paths, tracked = _overlay_candidates(top, timeout)
+    if len(paths) > OVERLAY_MAX_FILES:
+        raise CausalError(f"overlay_too_large:{len(paths)}")
+    files: dict[str, dict[str, Any]] = {}
+    blobs: dict[str, bytes] = {}
+    deleted: list[str] = []
+    for rel in paths:
+        got = _read_entry(top, rel)
+        if got is None:
+            if rel not in tracked:
+                raise CausalError("concurrent_change")  # an untracked file vanished mid-read
+            deleted.append(rel)
+            continue
+        files[rel] = dict(got[0])
+        blobs[got[0]["sha256"]] = got[1]
+    if not oids:
+        return {"files": files, "deleted": deleted}, blobs
+    regular = [r for r in files if files[r]["mode"] != "120000"]
+    for rel, oid in zip(regular, _clean_oids(top, regular, timeout), strict=True):
+        files[rel]["oid"] = oid
+    for rel, entry in files.items():
+        if entry["mode"] == "120000":
+            entry["oid"] = _blob_oid(blobs[entry["sha256"]])
+    return {"files": files, "deleted": deleted}, blobs
+
+
+def _seal(dest: Path, record: dict[str, Any], blobs: dict[str, bytes]) -> None:
+    tmp = dest.with_name(dest.name + ".tmp")
+    if tmp.exists():
+        raise CausalError("stale temporary state present")
+    (tmp / "objects").mkdir(parents=True)
+    for digest, data in blobs.items():
+        (tmp / "objects" / digest).write_bytes(data)
+    (tmp / "state.json").write_bytes(json.dumps(record, sort_keys=True, indent=1).encode("utf-8"))
+    write_sums(tmp)
+    problems = verify_state(tmp)
+    if problems:
+        raise CausalError("verify failed: " + "; ".join(problems[:3]))
+    os.replace(tmp, dest)
+    _make_read_only(dest)
+
+
+def capture_overlay(repo: Path, dest: Path, *, label: str, timeout: float = 10.0) -> dict[str, Any]:
+    """Seal HEAD + overlay to ``dest`` (which must not exist). Read twice; any change is
+    ``concurrent_change``. Writes nothing to the repository (``GIT_OPTIONAL_LOCKS=0``)."""
+    if dest.exists():
+        raise CausalError("state exists; never overwritten")
+    top_raw, head = _git(repo, "rev-parse", "--show-toplevel", "HEAD", timeout=timeout).decode().splitlines()  # top may contain spaces
+    top = Path(top_raw)
+    first, blobs = _read_overlay(top, timeout)  # with oids (git reads the files once more)
+    second, _ = _read_overlay(top, timeout, oids=False)
+    third = {rel: got[0] for rel in first["files"] if (got := _read_entry(top, rel)) is not None}
+    plain = {rel: {k: v for k, v in e.items() if k != "oid"} for rel, e in first["files"].items()}
+    if (plain != second["files"] or first["deleted"] != second["deleted"] or third != second["files"]
+            or _git(top, "rev-parse", "HEAD", timeout=timeout).decode().strip() != head):
+        raise CausalError("concurrent_change")
+    record = {"version": OVERLAY_VERSION, "kind": "overlay", "label": label, "head": head,
+              "conversion": _conversion(top), **first}
+    _seal(dest, record, blobs)
+    return record
+
+
+def _head_oids(top: Path, head: str, timeout: float) -> dict[str, str]:
+    raw = _git(top, "ls-tree", "-r", "-z", "--full-tree", head, timeout=timeout)
+    out: dict[str, str] = {}
+    for rec in raw.split(b"\0"):
+        if not rec:
+            continue
+        meta, path = rec.split(b"\t", 1)
+        parts = meta.split()
+        if parts[1] == b"blob":
+            out[path.decode("utf-8", "surrogateescape")] = parts[2].decode()
+    return out
+
+
+def effective_oids(top: Path, start: dict[str, Any], end: dict[str, Any],
+                   timeout: float = 30.0) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``{"head", "files": {path: oid}}`` for start and end over every path either overlay or
+    a HEAD move touches: the shape ``attribute`` and ``changed_paths`` compare."""
+    head_s, head_e = _head_oids(top, start["head"], timeout), _head_oids(top, end["head"], timeout)
+    paths = set(start["files"]) | set(start["deleted"]) | set(end["files"]) | set(end["deleted"])
+    paths |= {p for p in set(head_s) | set(head_e) if head_s.get(p) != head_e.get(p)}
+
+    def at(rec: dict[str, Any], head: dict[str, str]) -> dict[str, Any]:
+        files: dict[str, Any] = {}
+        for p in paths:
+            if p in rec["files"]:
+                files[p] = rec["files"][p]["oid"]
+            elif p not in rec["deleted"] and p in head:
+                files[p] = head[p]
+        return {"head": rec["head"], "files": files}
+
+    return at(start, head_s), at(end, head_e)
+
+
+def lockfile_oids(state: dict[str, Any]) -> dict[str, str]:
+    """Lockfile entries of an ``effective_oids`` state (only paths that moved are present)."""
+    return {p: o for p, o in state["files"].items() if p.rsplit("/", 1)[-1] in LOCKFILES}
+
+
+HOOK_TOOLS: dict[str, list[str]] = {"git": ["git", "--version"], "node": ["node", "--version"],
+                                    "dotnet": ["dotnet", "--version"]}
+
+
+def tool_versions_async(tools: dict[str, list[str]] | None = None) -> dict[str, subprocess.Popen[bytes] | str]:
+    """Start every version probe at once; ``collect_tool_versions`` reaps them."""
+    out: dict[str, subprocess.Popen[bytes] | str] = {"python": sys.version.split()[0]}
+    for name, argv in sorted((tools or HOOK_TOOLS).items()):
+        try:
+            out[name] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError:
+            out[name] = "absent"
+    return out
+
+
+def collect_tool_versions(pending: dict[str, subprocess.Popen[bytes] | str], timeout: float) -> dict[str, str]:
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    out: dict[str, str] = {}
+    for name, proc in pending.items():
+        if isinstance(proc, str):
+            out[name] = proc
+            continue
+        try:
+            so, se = proc.communicate(timeout=max(0.0, deadline - _time.monotonic()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            out[name] = "unrecorded:timeout"
+            continue
+        text = (so or se).decode("utf-8", "replace").strip()
+        out[name] = text.splitlines()[0] if proc.returncode == 0 and text else f"error:{proc.returncode}"
+    return out
+
+
+def tool_drift(start: dict[str, str], end: dict[str, str]) -> list[str]:
+    """A changed or unrecorded version is drift: an unknown is never assumed equal."""
+    drift = []
+    for name in sorted(set(start) | set(end)):
+        a, b = start.get(name), end.get(name)
+        if a is None or b is None or a.startswith("unrecorded") or b.startswith("unrecorded") or a != b:
+            drift.append(f"tool:{name}")
+    return drift
+
+
+def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list[str]:
+    """Rebuild a hook-time state from frozen history + overlay into an empty ``out`` (a git
+    checkout on branch ``replay``). Returns problems; empty means git sees exactly the
+    recorded overlay as differing from HEAD."""
+    problems = verify_state(state_dest) + verify_history(history_dest)
+    if problems:
+        return problems
+    rec = read_state(state_dest)
+    if json.loads((history_dest / "history.json").read_bytes())["head"] != rec["head"]:
+        return ["history head differs from state head"]
+    if out.exists() and any(out.iterdir()):
+        return ["materialize target not empty"]
+    env = git_env()
+    conv = [a for k, v in rec["conversion"].items() if v is not None for a in ("-c", f"{k}={v}")]
+    with tempfile.TemporaryDirectory(prefix="ec-mat-") as tmp:
+        bare = Path(tmp) / "h.git"
+        restore_history(history_dest, bare)
+        proc = subprocess.run(["git", *conv, "clone", "-q", "--no-hardlinks", "-b", "replay", str(bare), str(out)],
+                              capture_output=True, env=env)
+        if proc.returncode != 0:
+            return ["clone failed: " + proc.stderr.decode("utf-8", "replace").strip()[:200]]
+    for k, v in rec["conversion"].items():
+        if v is not None:
+            subprocess.run(["git", "-C", str(out), "config", k, v], check=True, env=env, capture_output=True)
+    subprocess.run(["git", "-C", str(out), "remote", "remove", "origin"], env=env, capture_output=True)
+    for rel in rec["deleted"]:
+        (out / rel).unlink(missing_ok=True)
+    for rel, entry in rec["files"].items():
+        target = out / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = (state_dest / "objects" / entry["sha256"]).read_bytes()
+        if entry["mode"] == "120000":
+            return [f"symlink not reproducible: {rel}"]
+        target.write_bytes(data)
+    paths, _ = _overlay_candidates(out, 60.0)
+    expected = sorted(set(rec["files"]) | set(rec["deleted"]))
+    if paths != expected:
+        problems.append(f"overlay mismatch: {len(set(paths) ^ set(expected))} path(s)")
+    return problems
+
+
 # ------------------------------------------------------------------ history store
 
 
@@ -257,24 +505,29 @@ def verify_history(dest: Path) -> list[str]:
 # ------------------------------------------------------------------ exclusions
 
 
-def unsupported_state(repo: Path) -> list[str]:
-    """Reasons the checkout cannot be captured faithfully; empty means supported."""
+def unsupported_state(repo: Path, *, lfs_scan: bool = True) -> list[str]:
+    """Reasons the checkout cannot be captured faithfully; empty means supported.
+
+    ``lfs_scan=False`` skips the per-file LFS pointer scan (the prompt hook's budget);
+    the ``.gitattributes`` check still runs. Admission repeats the full scan."""
     reasons: list[str] = []
     gitdir, common = _gitdirs(repo)
-    stage = _git(repo, "ls-files", "-s", "-z")
-    if any(e.startswith(b"160000 ") for e in stage.split(b"\0")) or (repo / ".gitmodules").exists():
+    entries = [e for e in _git(repo, "ls-files", "-s", "-t", "-z").split(b"\0") if e]  # "<tag> <mode> ..."
+    if any(e[2:].startswith(b"160000 ") for e in entries) or (repo / ".gitmodules").exists():
         reasons.append("submodule")
     if (common / "shallow").exists():
         reasons.append("shallow_history")
     sparse = subprocess.run(["git", "-C", str(repo), "config", "--bool", "core.sparseCheckout"],
                             capture_output=True, env=git_env())
-    tags = _git(repo, "ls-files", "-t", "-z")
-    if sparse.stdout.strip() == b"true" or any(e.startswith(b"S ") for e in tags.split(b"\0")):
+    if sparse.stdout.strip() == b"true" or any(e.startswith(b"S ") for e in entries):
         reasons.append("sparse_checkout")
     if any((gitdir / name).exists() for name in STATE_FILES):
         reasons.append("operation_in_progress")
     lfs = False
-    for rel in list_paths(repo):
+    rels = list_paths(repo) if lfs_scan else [
+        name for e in entries
+        if (name := e.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")).rsplit("/", 1)[-1] == ".gitattributes"]
+    for rel in rels:
         full = repo / rel
         if rel.rsplit("/", 1)[-1] == ".gitattributes" and full.is_file() and b"filter=lfs" in full.read_bytes():
             lfs = True
@@ -308,10 +561,12 @@ def _norm_rel(path: str, top: str | None) -> str:
     return p[2:] if p.startswith("./") else p
 
 
-def worktree_fingerprints(repo: Path) -> dict[str, str]:
-    """sha256(HEAD + status) of every OTHER worktree sharing this repository."""
+def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str]:
+    """sha256(HEAD + status) of every OTHER worktree sharing this repository (statuses run
+    concurrently; one that cannot finish raises ``worktree_status_timeout``)."""
     me = os.path.normcase(os.path.realpath(_git(repo, "rev-parse", "--show-toplevel").decode().strip()))
     out: dict[str, str] = {}
+    procs: dict[str, tuple[bytes, subprocess.Popen[bytes]]] = {}
     for block in _git(repo, "worktree", "list", "--porcelain", "-z").split(b"\0\0"):
         fields = dict(f.split(b" ", 1) if b" " in f else (f, b"") for f in block.split(b"\0") if f)
         path = fields.get(b"worktree", b"").decode("utf-8", "surrogateescape")
@@ -320,8 +575,17 @@ def worktree_fingerprints(repo: Path) -> dict[str, str]:
         if not os.path.isdir(path):
             out[path] = "missing"
             continue
-        status = git_bytes(Path(path), "status", "--porcelain=v2", "-z", "--untracked-files=all", check=False)
-        out[path] = sha256_bytes(fields.get(b"HEAD", b"") + b"\0" + status)
+        procs[path] = (fields.get(b"HEAD", b""), subprocess.Popen(
+            ["git", "-C", path, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_env()))
+    for path, (head, proc) in procs.items():
+        try:
+            status, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise CausalError("worktree_status_timeout") from None
+        out[path] = sha256_bytes(head + b"\0" + status)
     return out
 
 

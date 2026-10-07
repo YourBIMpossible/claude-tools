@@ -410,7 +410,7 @@ def verify_sums(directory: Path) -> list[str]:
 def verified_delete(stores: Stores, kind: str, episode: str, reason: str) -> dict[str, Any]:
     """Delete ``<kind>/<episode>`` from the content store, verify it is gone, log it.
 
-    ``kind`` is ``snapshots`` or ``payloads``. The record is appended to
+    ``kind`` is ``snapshots``, ``payloads`` or ``causal``. The record is appended to
     ``DELETIONS.log`` in the metadata repo. Raises ``StoreError`` when verification fails.
     """
     target = stores.content / kind / episode
