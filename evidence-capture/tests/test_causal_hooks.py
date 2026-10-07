@@ -22,6 +22,7 @@ PKG = HERE.parent
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(HERE))
 import causal  # noqa: E402
+import causal_admit  # noqa: E402
 import causal_hooks  # noqa: E402
 import dryrun  # noqa: E402
 import review  # noqa: E402
@@ -241,7 +242,45 @@ def test_causal_states_follow_snapshot_retention(root: Path) -> None:
     assert '"kind": "causal"' in log
 
 
-TESTS = [test_start_end_preserved_and_attributed, test_unattributed_change_and_other_worktree,
+def test_freeze_register_admit(root: Path) -> None:
+    fx = Fixture(root)
+    sid = str(uuid.uuid4())
+    fx.end(sid, turn(fx, sid))
+    ep = fx.episode(sid)["episode_id"]
+    before = causal_admit.admit(fx.stores, ep)
+    assert {"history_missing", "no_outcome_check"} <= set(before["causal_reasons"]), before
+    assert not before["eligible"]
+    causal_admit.freeze(fx.stores, ep, fx.repo)
+    for bad, why in (([{"kind": "command", "argv": ["python", "-c", "0"]}], "generic"),
+                     ([{"kind": "file_absent", "path": "x"}], "")):
+        try:
+            causal_admit.register(fx.stores, ep, bad, why)
+            raise AssertionError("registration should be refused")
+        except causal.CausalError:
+            pass
+    checks = [{"kind": "file_contains", "path": "src/alpha.py", "text": "x * 3 + 2"}]
+    causal_admit.register(fx.stores, ep, checks, "the task changes alpha's constant")
+    try:
+        causal_admit.register(fx.stores, ep, checks, "again")
+        raise AssertionError("re-registration should be refused")
+    except causal.CausalError:
+        pass
+    res = causal_admit.admit(fx.stores, ep)
+    assert res["check_results"] == [{"index": 0, "kind": "file_contains", "passed": True}], res
+    assert not {"history_missing", "no_outcome_check", "end_unverified", "history_unverified"}         & set(res["causal_reasons"]), res
+    assert "registered" in git(fx.stores.meta, "log", "-1", "--format=%s")
+    sid2 = str(uuid.uuid4())
+    fx.end(sid2, turn(fx, sid2))
+    ep2 = fx.episode(sid2)["episode_id"]
+    causal_admit.replay_dir(fx.stores, ep2).mkdir(parents=True)
+    try:
+        causal_admit.register(fx.stores, ep2, checks, "late")
+        raise AssertionError("registration after replay outputs should be refused")
+    except causal.CausalError as exc:
+        assert "before replay" in str(exc)
+
+
+TESTS = [test_freeze_register_admit, test_start_end_preserved_and_attributed, test_unattributed_change_and_other_worktree,
          test_unsupported_reason_explicit, test_failures_are_explicit_and_fail_open,
          test_end_never_recorded_by_maintenance_or_twice, test_overlay_materializes_from_frozen_history,
          test_causal_states_follow_snapshot_retention]
