@@ -9,6 +9,7 @@ in it answers a few synthetic prompts.
 
     python desktop_host_probe.py setup --out DIR
     python desktop_host_probe.py arm --out DIR --a-sleep 6     # next prompt: timeout turn
+    python desktop_host_probe.py arm --out DIR --a-sleep 6 --once  # only the next prompt
     python desktop_host_probe.py disarm --out DIR
     python desktop_host_probe.py analyse --out DIR --cli EXE
 
@@ -96,7 +97,10 @@ except Exception as e:
 sleep_s = 0.0
 if name == "A":
     try:
-        sleep_s = float(json.loads(control.read_text(encoding="utf-8"))["a_sleep"])
+        ctl = json.loads(control.read_text(encoding="utf-8"))
+        sleep_s = float(ctl["a_sleep"])
+        if ctl.get("once"):  # a one-shot arm is claimed by exactly one turn
+            os.replace(control, control.with_name("control.used.json"))
     except (OSError, ValueError, KeyError):
         sleep_s = 0.3
 mark(name, "start", t_proc=t0, sleep_s=sleep_s, client=client,
@@ -257,8 +261,9 @@ def setup(out: Path) -> Path:
     return repo
 
 
-def arm(out: Path, a_sleep: float) -> None:
-    (out / "control.json").write_text(json.dumps({"a_sleep": a_sleep}) + "\n", encoding="utf-8")
+def arm(out: Path, a_sleep: float, *, once: bool = False) -> None:
+    """Set probe A's sleep for following prompts; ``once`` disarms after the next prompt claims it."""
+    (out / "control.json").write_text(json.dumps({"a_sleep": a_sleep, "once": once}) + "\n", encoding="utf-8")
 
 
 def read_events(out: Path) -> list[dict[str, Any]]:
@@ -409,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--out", type=Path, required=True)
         if name == "arm":
             p.add_argument("--a-sleep", type=float, required=True)
+            p.add_argument("--once", action="store_true", help="disarm after the next prompt claims it")
         if name == "analyse":
             p.add_argument("--cli", type=Path, required=True)
     args = ap.parse_args(argv)
@@ -424,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
         print("refusing: --out is not a host-probe directory", file=sys.stderr)
         return 2
     if args.cmd in ("arm", "disarm"):
-        arm(out, args.a_sleep if args.cmd == "arm" else A_DEFAULT_SLEEP_S)
+        arm(out, args.a_sleep if args.cmd == "arm" else A_DEFAULT_SLEEP_S, once=args.cmd == "arm" and args.once)
         return 0
     if not args.cli.is_file():
         print("refusing: --cli is not a file", file=sys.stderr)
