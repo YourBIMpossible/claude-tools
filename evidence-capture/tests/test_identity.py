@@ -126,6 +126,9 @@ class _TrippableClock:
         return getattr(time, name)
 
 
+SNAPSHOT_BUDGET_S = 60.0
+
+
 def test_over_budget_start_keeps_identity_verdict(root: Path) -> None:
     """N19, by construction: a start that runs over ``START_BUDGET_MS`` (the clock is
     tripped after the snapshot, so the snapshot itself keeps its budget) records
@@ -144,6 +147,9 @@ def test_over_budget_start_keeps_identity_verdict(root: Path) -> None:
     real_time, real_snapshot = pipeline.time, pipeline.take_snapshot
 
     def snapshot_then_trip(*args: Any, **kw: Any) -> Any:
+        # the snapshot is not under test here: a load-proof budget, so only the tripped clock
+        # (never real machine load) puts the start over budget
+        kw["budget_s"] = SNAPSHOT_BUDGET_S
         out = real_snapshot(*args, **kw)
         clock.tripped = True
         return out

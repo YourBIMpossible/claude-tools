@@ -67,7 +67,9 @@ def load_inconclusive(m: dict) -> str | None:
         return (f"over budget: start_ms={cap['start_ms']} end_ms={cap['end_ms']} "
                 f"(budget {pipeline.START_BUDGET_MS} ms / {pipeline.END_BUDGET_S:g} s)")
     snap = m.get("start_snapshot") or {}
-    if snap.get("state") == "failed" and snap.get("reason") == "timeout":
+    # Only a timeout with no other error: an unrelated failure riding along must still fail.
+    if (snap.get("state") == "failed" and snap.get("reason") == "timeout"
+            and errs <= BUDGET_ERRORS | {"start_hook_killed"}):
         return f"start snapshot timed out: {snap.get('detail')}"
     return None
 
@@ -779,6 +781,17 @@ def test_rescreen_partial_manifest_is_reported_not_fatal(root: Path) -> None:
     rec = rescreen.run_rescreen(fx.stores, fx.env)
     assert rec["manifests_malformed"] == ["cap_partial"], rec
     assert rec["outcomes"] == {"rescreened": 1}, rec
+
+
+def test_load_inconclusive_timeout_does_not_hide_other_errors(root: Path) -> None:
+    """A start-snapshot timeout alone is load; a timeout plus an unrelated error is a failure."""
+    def m(errors: list[str]) -> dict:
+        return {"capture": {"status": "failed", "errors": errors, "start_ms": 0, "end_ms": 0},
+                "start_snapshot": {"state": "failed", "reason": "timeout", "detail": "deadline"}}
+    assert load_inconclusive(m([])) is not None
+    assert load_inconclusive(m(["start_hook_killed"])) is not None
+    assert load_inconclusive(m(["root:unresolved"])) is None
+    assert load_inconclusive(m(["start_over_budget", "config:yaml_unavailable"])) is None
 
 
 def test_rescreen_records_never_share_a_name(root: Path) -> None:
