@@ -236,6 +236,9 @@ def test_snapshot_stability_and_index_untouched(root: Path) -> None:
     REPORT["index_refresh_without_optional_locks_off"] = control_changed
 
 
+BRACKET_BUDGET_S = 60.0  # the bracket is under test, not the budget (timeout: test_snapshot_failed_is_final)
+
+
 def test_concurrent_change_bracket(root: Path) -> None:
     repo, st = make_repo(root), make_stores(root)
     (repo / "notes.txt").write_text("u\n", encoding="utf-8")
@@ -250,7 +253,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
 
     snapshot._read_artifacts = tamper
     try:
-        _, snap = snapshot.take_snapshot(repo, "cap_cc1", st)
+        _, snap = snapshot.take_snapshot(repo, "cap_cc1", st, budget_s=BRACKET_BUDGET_S)
     finally:
         snapshot._read_artifacts = orig
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
@@ -267,7 +270,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
 
     snapshot._read_artifacts = add_untracked
     try:
-        _, snap = snapshot.take_snapshot(repo, "cap_cc2", st)
+        _, snap = snapshot.take_snapshot(repo, "cap_cc2", st, budget_s=BRACKET_BUDGET_S)
     finally:
         snapshot._read_artifacts = orig
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
@@ -282,7 +285,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
 
     snapshot._read_artifacts = stage
     try:
-        _, snap = snapshot.take_snapshot(repo, "cap_cc3", st)
+        _, snap = snapshot.take_snapshot(repo, "cap_cc3", st, budget_s=BRACKET_BUDGET_S)
     finally:
         snapshot._read_artifacts = orig
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
@@ -293,7 +296,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
     lock = repo / ".git" / "index.lock"
     lock.write_bytes(b"")
     try:
-        _, snap = snapshot.take_snapshot(repo, "cap_cc4", st)
+        _, snap = snapshot.take_snapshot(repo, "cap_cc4", st, budget_s=BRACKET_BUDGET_S)
     finally:
         lock.unlink()
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change" and "lock" in snap["detail"], snap
