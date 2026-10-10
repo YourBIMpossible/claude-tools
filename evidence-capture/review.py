@@ -226,6 +226,9 @@ def deny_match(rel: str, globs: list[str]) -> str | None:
         # fnmatch has no ``**``: ``**/x`` only matches through its ``/``, so a root-level
         # ``x`` needs the bare form too (``*`` already crosses ``/`` for deeper paths).
         forms = (gl, gl[3:]) if gl.startswith("**/") and len(gl) > 3 else (gl,)
+        # ``a/**/b`` also matches ``a/b``: ``**`` spans zero directories.
+        if "/**/" in gl:
+            forms += tuple(f.replace("/**/", "/") for f in forms)
         for form in forms:
             if form.endswith("/**") or form.endswith("/"):
                 prefix = form.rstrip("*").rstrip("/") + "/"

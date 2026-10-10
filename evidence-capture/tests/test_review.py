@@ -341,6 +341,9 @@ def test_privacy_scope_rejects(root: Path) -> None:
     assert review.deny_match("config/credentials.json", list(review.BUILTIN_DENY_GLOBS)) == "credentials*"
     assert review.deny_match("src/alpha.py", list(review.BUILTIN_DENY_GLOBS)) is None
     assert review.deny_match("keys/SERVER.PEM", list(review.BUILTIN_DENY_GLOBS)) == "*.pem"
+    assert review.deny_match("a/b", ["a/**/b"]) == "a/**/b"
+    assert review.deny_match("secrets/.env", ["secrets/**/.env"]) == "secrets/**/.env"
+    assert review.deny_match("ab", ["a/**/b"]) is None
     assert review.outside_paths("https://example.invalid/a/b and http://x.invalid/c", Path(root)) == []
     assert review.load_capture_config(root / "nowhere")["present"] is False
 

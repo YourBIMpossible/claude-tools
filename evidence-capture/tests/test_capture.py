@@ -1118,6 +1118,8 @@ def test_glob_pattern_outside_root_is_observed(root: Path) -> None:
     assert screen._glob_anchor("src/**/*.py", "c:/repo") == "c:/repo/src"
     assert screen._glob_anchor("**/*.py", "c:/repo") == "c:/repo"
     assert screen._glob_anchor("**/*.py", None) == "."
+    assert screen._glob_anchor("/**/*.py", "c:/repo") == "/"
+    assert screen._glob_anchor("/*", None) == "/"
     repo = make_repo(root)
     other = root / "elsewhere"
     other.mkdir()

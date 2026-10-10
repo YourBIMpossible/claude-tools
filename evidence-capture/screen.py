@@ -177,6 +177,8 @@ def _glob_anchor(pattern: str, base: str | None) -> str:
             break
         literal.append(seg)
     anchor = "/".join(literal)
+    if not anchor and pat.startswith("/"):
+        return "/"  # a root-anchored pattern searches the filesystem root, not ``path``
     if re.match(r"^(?:[A-Za-z]:|/|~)", anchor) or anchor.startswith("//"):
         return anchor
     if base:
