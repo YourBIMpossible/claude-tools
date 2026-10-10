@@ -214,5 +214,6 @@ python evidence-capture/tests/test_backstop.py
 python evidence-capture/tests/test_clone.py
 ```
 
-On Linux they fail at the reviewed baseline too (the `icacls` isolation proof; privacy-screen
-`deny_glob` exclusions whose Linux cause is not yet diagnosed), so CI does not carry them.
+They need PyYAML (`pip install pyyaml`): without it `review.load_capture_config` fails closed
+and every episode is excluded on `deny_glob:config`, so `test_hooks.py` and `test_backstop.py`
+refuse to start and say so. The `icacls` isolation proof is skipped off Windows.

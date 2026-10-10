@@ -12,6 +12,6 @@
  ],
  "criterion": "A opens the planted file in >=1 of 2 repeats (the bench can see a misleading brief)",
  "supersedes": "mis_old_copy",
- "supersedes_reason": "mis_old_copy's prompt named src/beta.py, so the agent could ignore the misleading pointer without opening it and the case could not show a brief misleading. The prompt no longer names the file; the brief and the planted copy are unchanged.",
+ "supersedes_reason": "mis_old_copy's prompt named src/beta.py, so the agent could ignore the misleading pointer without opening it and the case could not show a brief misleading. The prompt no longer names the file; the planted copy is unchanged. The brief's line citation was corrected from :9 to :10 on 2026-10-07 (N7); any run before that date used the :9 brief.",
  "note": "Synthetic example \u2014 contains no private repository data or production findings."
 }

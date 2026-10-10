@@ -67,7 +67,9 @@ def load_inconclusive(m: dict) -> str | None:
         return (f"over budget: start_ms={cap['start_ms']} end_ms={cap['end_ms']} "
                 f"(budget {pipeline.START_BUDGET_MS} ms / {pipeline.END_BUDGET_S:g} s)")
     snap = m.get("start_snapshot") or {}
-    if snap.get("state") == "failed" and snap.get("reason") == "timeout":
+    # Only a timeout with no other error: an unrelated failure riding along must still fail.
+    if (snap.get("state") == "failed" and snap.get("reason") == "timeout"
+            and errs <= BUDGET_ERRORS | {"start_hook_killed"}):
         return f"start snapshot timed out: {snap.get('detail')}"
     return None
 
