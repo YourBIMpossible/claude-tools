@@ -1,0 +1,75 @@
+{
+ "accepted": {
+  "at": "2026-09-26T21:05:00Z",
+  "by": "owner, explicit acceptance instruction of 2026-09-26 (the Step-5 execution mandate naming version 2.1.281 and SHA-256 39be063c\u2026067c); not the earlier testing mandate",
+  "note": "identity tested by run 3 of the desktop host probe on 2026-09-26; acceptance is the owner's later explicit instruction"
+ },
+ "cli_version": "2.1.281",
+ "full_result": "host-probe-result.json (kept locally with the probe run, not committed)",
+ "harness": "desktop_host_probe",
+ "identity": {
+  "cli_version": "2.1.281",
+  "host_versions": [
+   "2.9939.2"
+  ],
+  "mode": "claude-desktop",
+  "observations": 10,
+  "problem": null,
+  "sha256": "39be063c2512b43347fe7b0ab18c46f1596141701c9c5fc895ddfca9a051067c"
+ },
+ "mode_description": "desktop client session with project-local probe hooks",
+ "recorded_at": "2026-09-26T13:44:58-0700",
+ "relied_upon": [
+  "a_hooks_finish_before_first_tool",
+  "a_hooks_finish_before_first_output",
+  "c_turn_waits_for_hook_within_timeout",
+  "g_client_identity_observed"
+ ],
+ "results": {
+  "a_hooks_finish_before_first_output": {
+   "note": "first output = first assistant transcript entry of the turn (the desktop stream is not observable)",
+   "passed": true,
+   "runs": [
+    true,
+    true,
+    true,
+    true
+   ]
+  },
+  "a_hooks_finish_before_first_tool": {
+   "passed": true,
+   "runs": [
+    true,
+    true,
+    true
+   ]
+  },
+  "c_turn_waits_for_hook_within_timeout": {
+   "passed": true,
+   "timeout_s": 3,
+   "turns": [
+    {
+     "a_killed": true,
+     "first_activity_after_a_start_ms": 5630,
+     "passed": true,
+     "turn": 4,
+     "turn_completed": true
+    }
+   ]
+  },
+  "g_client_identity_observed": {
+   "modes": [
+    "claude-desktop"
+   ],
+   "observations": 10,
+   "passed": true,
+   "problem": null,
+   "problems": [
+    "None"
+   ],
+   "versions": [
+    "2.1.281"
+   ]
+  }
+ }
+}

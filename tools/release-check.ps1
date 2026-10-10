@@ -51,6 +51,15 @@ Step "graphify health-check boundary tests" { python graphify/test_health_check.
 Step "graphify adoption-funnel tests" { python graphify/test_graphify_funnel.py }
 Step "evidence-relevance tests" { python evidence-relevance/test_measure_relevance.py }
 Step "evidence-archive evacuation tests" { python evidence-archive/test_evacuate_worktree.py }
+Step "evidence-capture capture/screen tests" { python evidence-capture/tests/test_capture.py }
+Step "evidence-capture lock tests" { python evidence-capture/tests/test_locks.py }
+Step "evidence-capture identity tests" { python evidence-capture/tests/test_identity.py }
+Step "evidence-capture review tests" { python evidence-capture/tests/test_review.py }
+Step "evidence-capture snapshot tests" { python evidence-capture/tests/test_snapshot.py }
+Step "evidence-capture host-probe tests" { python evidence-capture/tests/test_host_probe.py }
+Step "evidence-footprints tests" { python evidence-footprints/test_footprints.py }
+Step "evidence-footprints blind-sheet tests" { python evidence-footprints/test_blind_sheets.py }
+Step "evidence-twin tests" { python evidence-twin/test_twin.py }
 
 Pop-Location
 if ($fail -gt 0) { Write-Host "`n$fail gate(s) FAILED." -ForegroundColor Red; exit 1 }

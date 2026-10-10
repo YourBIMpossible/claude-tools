@@ -68,6 +68,33 @@ jobs:
       - name: evidence-archive evacuation tests
         run: python evidence-archive/test_evacuate_worktree.py
 
+      - name: evidence-capture capture/screen tests
+        run: python evidence-capture/tests/test_capture.py
+
+      - name: evidence-capture lock tests
+        run: python evidence-capture/tests/test_locks.py
+
+      - name: evidence-capture identity tests
+        run: python evidence-capture/tests/test_identity.py
+
+      - name: evidence-capture review tests
+        run: python evidence-capture/tests/test_review.py
+
+      - name: evidence-capture snapshot tests
+        run: python evidence-capture/tests/test_snapshot.py
+
+      - name: evidence-capture host-probe tests
+        run: python evidence-capture/tests/test_host_probe.py
+
+      - name: evidence-footprints tests
+        run: python evidence-footprints/test_footprints.py
+
+      - name: evidence-footprints blind-sheet tests
+        run: python evidence-footprints/test_blind_sheets.py
+
+      - name: evidence-twin tests
+        run: python evidence-twin/test_twin.py
+
       - name: Install gitleaks (pinned, checksum-verified)
         run: |
           set -euo pipefail

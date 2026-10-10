@@ -16,5 +16,353 @@
     "rule": "claude-worktree-path",
     "line_sha256": "c311dd613b8dff66ddfc132b1b9c46d3cd7bc7ffe0db89aca94b307d7a7b92c3",
     "reason": "Functional regex that strips a repo-relative Claude Code worktree prefix when joining transcript paths; no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/boundary_test.py",
+    "rule": "email-address",
+    "line_sha256": "85e5d72ebadf31ce3bc6f42c7717e6984319946165260f096eabff5999ba4729",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/boundary_test.py",
+    "rule": "email-address",
+    "line_sha256": "da38f2a08a351307942ca6f3a493fc4377c6d29825b481ff4e947aa434eabae2",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/desktop_boundary_test.py",
+    "rule": "email-address",
+    "line_sha256": "154e8b1bf6e0fc2b8737cd87f80c464a9e8023a06963eb4c35cd839256bf1284",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/desktop_boundary_test.py",
+    "rule": "email-address",
+    "line_sha256": "da38f2a08a351307942ca6f3a493fc4377c6d29825b481ff4e947aa434eabae2",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/desktop_host_probe.py",
+    "rule": "email-address",
+    "line_sha256": "154e8b1bf6e0fc2b8737cd87f80c464a9e8023a06963eb4c35cd839256bf1284",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/desktop_host_probe.py",
+    "rule": "email-address",
+    "line_sha256": "da38f2a08a351307942ca6f3a493fc4377c6d29825b481ff4e947aa434eabae2",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/dryrun.py",
+    "rule": "email-address",
+    "line_sha256": "a24366558f606f8329c4b5dc6b70adb9c62c49a74fc112c31bebb93897a052b6",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/dryrun.py",
+    "rule": "email-address",
+    "line_sha256": "49097365955b517413a7152e1dacea9a95980bdb38e63a22e4936bcf452ea0f2",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/screen.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "2887c32459ffff96e3a50052f2b4c8d9b9ce737ee3f16a476f78b25cce4df398",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/screen.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "e8a62c844ba292390f96c2ea2d8bbf6eaf683c96af6ff84f4e46e48ee19ccc87",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/screen.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "c31d3e13ac3ece1437ed661a84930b556066b8c5d4a7f5fdb7fdee8bca559458",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/tests/fixture_repo.py",
+    "rule": "email-address",
+    "line_sha256": "ace31e3c843d81a9de6bc1f13b4470058bf7cc1ba6151824acbecab33145f6ac",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/fixture_repo.py",
+    "rule": "email-address",
+    "line_sha256": "30ba2ed407e0533c6a624b7cee9d976da1c62f674ef5b28aa1e5b647073f2cfb",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/fixture_repo.py",
+    "rule": "email-address",
+    "line_sha256": "22e82b682a1188d26977f299ab9b9f07d58abef3f8b5da23106cdff22930d4a7",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "email-address",
+    "line_sha256": "30ba2ed407e0533c6a624b7cee9d976da1c62f674ef5b28aa1e5b647073f2cfb",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "email-address",
+    "line_sha256": "22e82b682a1188d26977f299ab9b9f07d58abef3f8b5da23106cdff22930d4a7",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-capture/tests/test_review.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "23f05029a4eeae1bef9a1991541993582dec9fca351553805b888caea5307be9",
+    "reason": "Synthetic drive-letter path in a test fixture; not a real location on any machine."
+  },
+  {
+    "path": "evidence-capture/tests/test_review.py",
+    "rule": "unc-path",
+    "line_sha256": "7c7c567ee16d0938a3fbd51264cae6cc7080b80a77325756b42f80b132c9231f",
+    "reason": "Synthetic UNC path in a test fixture; not a real share."
+  },
+  {
+    "path": "evidence-footprints/footprints.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "c311dd613b8dff66ddfc132b1b9c46d3cd7bc7ffe0db89aca94b307d7a7b92c3",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-footprints/footprints.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "1b60cab84a3a80461c78094cfea75a68245beff61f04265e1e18d7903c75b346",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-footprints/test_blind_sheets.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "78b9c1b3473f9c7f8e917d5e48b962849ecf42a451f36a503395fd32b8c5d38f",
+    "reason": "Synthetic drive-letter path in a test fixture; not a real location on any machine."
+  },
+  {
+    "path": "evidence-footprints/test_blind_sheets.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "78b9c1b3473f9c7f8e917d5e48b962849ecf42a451f36a503395fd32b8c5d38f",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "6257840107e2f8f75afb79a23c117a6e3ce9639ab93c489b2e63e9e47817e843",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "user-home-path",
+    "line_sha256": "7f72c198f0db5e3c275f97239751a8dadacf38505b9dbe5fab513c2c6e37c6ff",
+    "reason": "Synthetic home path in a test fixture; not a real user."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "49bb92ab933e87c8329e823103577d722126b6e3a5634bf4d3205c37fc9bca66",
+    "reason": "Synthetic drive-letter path in a test fixture; not a real location on any machine."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "email-address",
+    "line_sha256": "308820e143eea1b42628e217afe7e90a6fd8fa3733b037be3d550cfcedb9e39c",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "74265353aa601b176f505d4ce12fd49f95ad0d5a5913e0fb89ea9ce9e01adec2",
+    "reason": "Functional pattern or synthetic fixture path for Claude Code worktree layout (the dot-claude worktrees segment); no machine-specific prefix."
+  },
+  {
+    "path": "evidence-twin/README.md",
+    "rule": "claude-user-home",
+    "line_sha256": "6a1c3fb1c8438c8ce26bb470dcc4adfb331db324d1728fa1f1cbda8ebbe1c8e8",
+    "reason": "Documentation of the client's projects-directory layout; no real path."
+  },
+  {
+    "path": "evidence-twin/twin.py",
+    "rule": "email-address",
+    "line_sha256": "9839a6eb20ad266a49490e844562b09cee9913d865dea6e52af79f94de6af24c",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-twin/twin.py",
+    "rule": "email-address",
+    "line_sha256": "e525f4fb7c098d0609e6a4fd74d9b92a13b0d09756fd777c5f33085fcf373fa7",
+    "reason": "Synthetic git identity for fixture commits (RFC 2606 reserved 'example.invalid' domain); not a real address."
+  },
+  {
+    "path": "evidence-twin/twin.py",
+    "rule": "claude-user-home",
+    "line_sha256": "dde46e81b8337884adfa741762313f4d24b5936fad04c6fd02af42781302307d",
+    "reason": "Documentation of the client's projects-directory layout; no real path."
+  },
+  {
+    "path": "evidence-twin/twin.py",
+    "rule": "claude-user-home",
+    "line_sha256": "d5e0d77b0fe7fc2245436123c01991d4ee18d117e70aabd198fc6855703b948d",
+    "reason": "Documentation of the client's projects-directory layout; no real path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "3e6794e06205014b1e1de2f2c6c551a92bfd8ceec34e0df74d28fc4b658b278e",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "90d5c12d38880773a186a804856fd5a281009e637c937ef466dc674b16f8f703",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "c29065e5561cd7c18f0b10f9d07202db14d60dc863e00ca0c321516ae99d4343",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "2ee8260bcbe4eb519162e0145d4628a1401a9325fa1dbccb8c7256aa385f2660",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "7017e5eef6944f67e06c41acf363067911e12743c883a8bb74637024283ee20d",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "306572f9becda2d3d5340047c89a9321ac1346b68ad287ead2d86e68ba329733",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_clone.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "7a29703dc622e5f21f2a234e10513ae7ce4985d33f20e8c7182b3943807f8162",
+    "reason": "Synthetic hostile snapshot entry paths (drive, UNC, extended-length) that reconstruction must refuse; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_clone.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "80cfd6534a7a7c1f0f4485fb1ab2bfa13292718e37d285f1e31652f06b82795d",
+    "reason": "Synthetic hostile snapshot entry paths (drive, UNC, extended-length) that reconstruction must refuse; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "c3b680cc7b1da82b6b5e00c1cb22e1d0203a7c9ea693c04a885e468392b0848b",
+    "reason": "Synthetic drive-letter path in a PowerShell parsing case; the parser's Windows behavior is what is tested; no real machine path."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "fd64d83f905cef661d6f90902374348689f75b2927c37be4dea08b8245d9b490",
+    "reason": "Synthetic drive-letter path in a PowerShell parsing case; the parser's Windows behavior is what is tested; no real machine path."
+  },
+  {
+    "path": "evidence-capture/screen.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "b6fa4c13ca8fc93132d4cf367282bc0ed939bb37f681a52a0490d3fc984caa5c",
+    "reason": "Functional regex fragment: matches the Claude Code worktree directory segment in attribution of tool paths; no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/store.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "863b954b249bceda88f966a04ecf13c642cd33bffdda60674cce00675ba4f774",
+    "reason": "Docstring/comment illustrating the drive-letter and UNC path forms the store must normalise; placeholder X: and server names, not a real location."
+  },
+  {
+    "path": "evidence-capture/store.py",
+    "rule": "unc-path",
+    "line_sha256": "863b954b249bceda88f966a04ecf13c642cd33bffdda60674cce00675ba4f774",
+    "reason": "Docstring/comment illustrating the drive-letter and UNC path forms the store must normalise; placeholder X: and server names, not a real location."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "dead51903c73bf7f78f896ed2746ad9f59b52b258366b60cea2eea3e40043642",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "6daf74fbd9d2e18f9836e36adb2779ccd56d4fe5b72bc6f5b62775fb4a6cbb07",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "unc-path",
+    "line_sha256": "df6f6e83fd76d31037010dc99cdadf7004689b294b23a5f4d580ee82b3706b05",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "e30751a66dbc97906eb95061fed07657ee24c5e40c4d917b7010437e64a6f2ab",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "f5b850e73e14551130b6a5e2e8edd7cfe573b73bbe2ba0069feb688d276bb1b2",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "f5b850e73e14551130b6a5e2e8edd7cfe573b73bbe2ba0069feb688d276bb1b2",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "2ddf9dc83d8eabb9f75daf0e4812d8999987a5a10aede0465e1ce0bcf602ee6e",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "ed89cb150fbc18fc7b81da86587a463aca0a6082f4815bb669282ead000f50e2",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "343f9c860c840a64cb8823fbe4999c328029455ba446f8b270f194f39f0fc3e2",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "d6563c76c292a3c1de981ec601aff040b8bab958800e25c320f97135c1225f7a",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "34391ddd4c237b4bf6892fd3b2386520c8ba6d6c4903dbf8f968e08377c280e0",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "0d52d826a07f4218504b6da67d900988a3cb8868c376b2d072b8141175913f1a",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "d4e2dbdea6478cb0eece4f1925bb6c8aba27662c942f207ca52687b836daee8a",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
   }
 ]

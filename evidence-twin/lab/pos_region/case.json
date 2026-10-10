@@ -1,0 +1,13 @@
+{
+ "id": "pos_region",
+ "family": "positive",
+ "split": "control",
+ "base": "golden",
+ "prompt": "Tenant north keeps hitting its request quota. Raise tenant north's quota LIMIT to 40. Change nothing else.",
+ "target_files": [
+  "src/regions/r7.py"
+ ],
+ "planted_files": [],
+ "criterion": "A reaches the target in 2/2 and B in <=1/2, or mean A tokens-to-target <= 0.5x B",
+ "note": "Synthetic example \u2014 contains no private repository data or production findings."
+}
