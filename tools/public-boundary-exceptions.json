@@ -358,5 +358,11 @@
     "rule": "windows-drive-path",
     "line_sha256": "0d52d826a07f4218504b6da67d900988a3cb8868c376b2d072b8141175913f1a",
     "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "d4e2dbdea6478cb0eece4f1925bb6c8aba27662c942f207ca52687b836daee8a",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
   }
 ]

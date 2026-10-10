@@ -218,6 +218,21 @@ def snapshot_content_paths(snapshot: Path) -> list[str]:
     return sorted(set(paths))
 
 
+def _zero_dir_forms(form: str) -> set[str]:
+    """Every way of letting each ``/**/`` span zero directories (collapse to ``/``) or more."""
+    out, todo = set(), [form]
+    while todo:
+        f = todo.pop()
+        if f in out:
+            continue
+        out.add(f)
+        i = f.find("/**/")
+        while i != -1:
+            todo.append(f[:i] + f[i + 3:])
+            i = f.find("/**/", i + 1)
+    return out
+
+
 def deny_match(rel: str, globs: list[str]) -> str | None:
     low = rel.replace("\\", "/").lower()
     base = low.rsplit("/", 1)[-1]
@@ -228,7 +243,7 @@ def deny_match(rel: str, globs: list[str]) -> str | None:
         forms = (gl, gl[3:]) if gl.startswith("**/") and len(gl) > 3 else (gl,)
         # ``a/**/b`` also matches ``a/b``: ``**`` spans zero directories.
         if "/**/" in gl:
-            forms += tuple(f.replace("/**/", "/") for f in forms)
+            forms = tuple(v for f in forms for v in _zero_dir_forms(f))
         for form in forms:
             if form.endswith("/**") or form.endswith("/"):
                 prefix = form.rstrip("*").rstrip("/") + "/"

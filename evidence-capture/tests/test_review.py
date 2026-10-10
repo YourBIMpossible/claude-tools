@@ -344,6 +344,9 @@ def test_privacy_scope_rejects(root: Path) -> None:
     assert review.deny_match("a/b", ["a/**/b"]) == "a/**/b"
     assert review.deny_match("secrets/.env", ["secrets/**/.env"]) == "secrets/**/.env"
     assert review.deny_match("ab", ["a/**/b"]) is None
+    for rel in ("a/b/c", "a/b/x/c", "a/x/b/c", "a/x/b/y/c"):
+        assert review.deny_match(rel, ["a/**/b/**/c"]) == "a/**/b/**/c"
+    assert review.deny_match("a/b", ["a/**/**/b"]) == "a/**/**/b"
     assert review.outside_paths("https://example.invalid/a/b and http://x.invalid/c", Path(root)) == []
     assert review.load_capture_config(root / "nowhere")["present"] is False
 
