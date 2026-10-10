@@ -783,6 +783,17 @@ def test_rescreen_partial_manifest_is_reported_not_fatal(root: Path) -> None:
     assert rec["outcomes"] == {"rescreened": 1}, rec
 
 
+def test_load_inconclusive_timeout_does_not_hide_other_errors(root: Path) -> None:
+    """A start-snapshot timeout alone is load; a timeout plus an unrelated error is a failure."""
+    def m(errors: list[str]) -> dict:
+        return {"capture": {"status": "failed", "errors": errors, "start_ms": 0, "end_ms": 0},
+                "start_snapshot": {"state": "failed", "reason": "timeout", "detail": "deadline"}}
+    assert load_inconclusive(m([])) is not None
+    assert load_inconclusive(m(["start_hook_killed"])) is not None
+    assert load_inconclusive(m(["root:unresolved"])) is None
+    assert load_inconclusive(m(["start_over_budget", "config:yaml_unavailable"])) is None
+
+
 def test_rescreen_records_never_share_a_name(root: Path) -> None:
     """F12: two records stamped in the same second get distinct files."""
     import rescreen
