@@ -360,6 +360,11 @@ def test_deny_glob_double_star_matches_root(root: Path) -> None:
     for rel in ("private.json.bak", "a/public.json", "vaults/k.txt"):
         assert review.deny_match(rel, globs) is None, rel
     assert review.deny_match("x", ["**/"]) is None
+    # A repeated leading ``**/`` is the same pattern; it must not lose the root-level match.
+    for rel in ("k.pem", "a/k.pem", "a/b/k.pem"):
+        assert review.deny_match(rel, ["**/**/*.pem"]) is not None, rel
+        assert review.deny_match(rel, ["**/**/**/*.pem"]) is not None, rel
+    assert review.deny_match("k.pem.bak", ["**/**/*.pem"]) is None
     st = make_stores(root)
     repo = tc.make_repo(root)
     (repo / ".evidence-compiler").mkdir()

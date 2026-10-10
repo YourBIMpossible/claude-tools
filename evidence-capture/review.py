@@ -238,6 +238,9 @@ def deny_match(rel: str, globs: list[str]) -> str | None:
     base = low.rsplit("/", 1)[-1]
     for g in globs:
         gl = g.replace("\\", "/").lower().lstrip("/")
+        # ``**/**/`` means the same as ``**/``; collapse so the root-level bare form below applies.
+        while "**/**/" in gl:
+            gl = gl.replace("**/**/", "**/")
         # fnmatch has no ``**``: ``**/x`` only matches through its ``/``, so a root-level
         # ``x`` needs the bare form too (``*`` already crosses ``/`` for deeper paths).
         forms = (gl, gl[3:]) if gl.startswith("**/") and len(gl) > 3 else (gl,)
