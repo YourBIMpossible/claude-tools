@@ -1,0 +1,240 @@
+{
+ "cli_version": "2.1.280",
+ "mode": "print (-p, stream-json); interactive Desktop turns are not exercised by this harness",
+ "model": "claude-haiku-4-5-20251001",
+ "raw": {
+  "order_runs": [
+   {
+    "events": [
+     {
+      "ev": "start",
+      "hook": "B",
+      "t": 1790414012.0447886
+     },
+     {
+      "ev": "start",
+      "hook": "A",
+      "t": 1790414012.2113965
+     },
+     {
+      "ev": "end",
+      "hook": "B",
+      "t": 1790414013.0453253
+     },
+     {
+      "ev": "end",
+      "hook": "A",
+      "t": 1790414013.2119248
+     },
+     {
+      "ev": "tool",
+      "hook": "pretool",
+      "t": 1790414015.6833847
+     }
+    ],
+    "first_output": 1790414014.8385508,
+    "first_tool_stream": 1790414015.2645118,
+    "rc": 0,
+    "stderr_tail": "",
+    "stream_kinds": [
+     "system:init",
+     "system:thinking_tokens",
+     "system:thinking_tokens",
+     "assistant:",
+     "assistant:",
+     "rate_limit_event:",
+     "system:task_summary",
+     "user:",
+     "assistant:",
+     "assistant:",
+     "system:post_turn_summary",
+     "result:success"
+    ],
+    "t_exit": 1790414021.8104708,
+    "t_submit": 1790414009.948084
+   },
+   {
+    "events": [
+     {
+      "ev": "start",
+      "hook": "A",
+      "t": 1790414023.7536633
+     },
+     {
+      "ev": "start",
+      "hook": "B",
+      "t": 1790414023.816322
+     },
+     {
+      "ev": "end",
+      "hook": "A",
+      "t": 1790414024.7540874
+     },
+     {
+      "ev": "end",
+      "hook": "B",
+      "t": 1790414024.8167238
+     },
+     {
+      "ev": "tool",
+      "hook": "pretool",
+      "t": 1790414026.8657851
+     }
+    ],
+    "first_output": 1790414026.2572794,
+    "first_tool_stream": 1790414026.5685692,
+    "rc": 0,
+    "stderr_tail": "",
+    "stream_kinds": [
+     "system:init",
+     "system:thinking_tokens",
+     "system:thinking_tokens",
+     "assistant:",
+     "assistant:",
+     "rate_limit_event:",
+     "system:task_summary",
+     "user:",
+     "assistant:",
+     "assistant:",
+     "system:post_turn_summary",
+     "result:success"
+    ],
+    "t_exit": 1790414032.369573,
+    "t_submit": 1790414022.1464715
+   },
+   {
+    "events": [
+     {
+      "ev": "start",
+      "hook": "B",
+      "t": 1790414034.340635
+     },
+     {
+      "ev": "start",
+      "hook": "A",
+      "t": 1790414034.4152408
+     },
+     {
+      "ev": "end",
+      "hook": "B",
+      "t": 1790414035.341134
+     },
+     {
+      "ev": "end",
+      "hook": "A",
+      "t": 1790414035.4157772
+     },
+     {
+      "ev": "tool",
+      "hook": "pretool",
+      "t": 1790414037.3903391
+     }
+    ],
+    "first_output": 1790414036.7035956,
+    "first_tool_stream": 1790414037.064657,
+    "rc": 0,
+    "stderr_tail": "",
+    "stream_kinds": [
+     "system:init",
+     "assistant:",
+     "assistant:",
+     "rate_limit_event:",
+     "system:task_summary",
+     "user:",
+     "assistant:",
+     "assistant:",
+     "system:post_turn_summary",
+     "result:success",
+     "system:task_summary"
+    ],
+    "t_exit": 1790414043.4843638,
+    "t_submit": 1790414032.6989174
+   }
+  ],
+  "timeout_run": {
+   "events": [
+    {
+     "ev": "start",
+     "hook": "slow",
+     "t": 1790414045.5815027
+    },
+    {
+     "ev": "tool",
+     "hook": "pretool",
+     "t": 1790414053.1067233
+    }
+   ],
+   "first_output": 1790414052.4076498,
+   "first_tool_stream": 1790414052.6980355,
+   "rc": 0,
+   "stderr_tail": "",
+   "stream_kinds": [
+    "system:init",
+    "system:thinking_tokens",
+    "system:thinking_tokens",
+    "assistant:",
+    "assistant:",
+    "rate_limit_event:",
+    "system:task_summary",
+    "user:",
+    "assistant:",
+    "assistant:",
+    "system:post_turn_summary",
+    "result:success"
+   ],
+   "t_exit": 1790414060.0902646,
+   "t_submit": 1790414043.874359,
+   "timeout_s": 3
+  }
+ },
+ "recorded_at": "2026-09-26T09:14:28Z",
+ "relied_upon": [
+  "a_hooks_finish_before_first_tool",
+  "a_hooks_finish_before_first_output",
+  "c_turn_waits_for_hook_within_timeout"
+ ],
+ "results": {
+  "a_hooks_finish_before_first_output": {
+   "passed": true,
+   "runs": [
+    true,
+    true,
+    true
+   ]
+  },
+  "a_hooks_finish_before_first_tool": {
+   "passed": true,
+   "runs": [
+    true,
+    true,
+    true
+   ]
+  },
+  "b_hooks_serial": {
+   "note": "recorded only; capture does not rely on hook ordering between hooks",
+   "passed": false,
+   "runs": [
+    false,
+    false,
+    false
+   ]
+  },
+  "c_turn_waits_for_hook_within_timeout": {
+   "hook_end_after_tool": false,
+   "hook_finished_later": false,
+   "hook_killed_or_abandoned": true,
+   "hook_started": true,
+   "note": "passed = the first tool call did not happen before the hook timeout elapsed",
+   "passed": true,
+   "tool_after_hook_start_ms": 7525
+  },
+  "d_hook_end_to_first_tool_ms": {
+   "passed": true,
+   "values": [
+    2471,
+    2049,
+    1975
+   ]
+  }
+ }
+}

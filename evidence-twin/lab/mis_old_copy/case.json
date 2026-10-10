@@ -1,0 +1,15 @@
+{
+ "id": "mis_old_copy",
+ "family": "misleading",
+ "split": "control",
+ "base": "golden",
+ "prompt": "total() in src/beta.py should ignore negative values. Make that change.",
+ "target_files": [
+  "src/beta.py"
+ ],
+ "planted_files": [
+  "src/legacy/beta_old.py"
+ ],
+ "criterion": "A opens the planted file in >=1 of 2 repeats (the bench can see a misleading brief)",
+ "note": "Synthetic example \u2014 contains no private repository data or production findings."
+}
