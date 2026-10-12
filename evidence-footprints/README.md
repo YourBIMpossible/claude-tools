@@ -31,7 +31,10 @@ builder records on the batch's last row; the other rows of the batch get status
 Paths are repo-relative, lowercase, forward-slash. The worktree root and the
 main checkout root are both stripped; paths under any other root (another
 repository, a scratch directory, home) are counted in `outside_repo` and not
-scored. Two paths match when equal or when one ends with `/` plus the other, so
+scored. A shell path argument whose working directory cannot be determined
+(after `cd $var`, `popd`, `cd -`, or `git -C $var`) is counted in `unresolved`
+(summary `parse.paths_unresolved`) and not classified: it is never
+`outside_repo` and never touched. Two paths match when equal or when one ends with `/` plus the other, so
 a path relative to a subdirectory matches its repo-relative form.
 
 ## Metrics

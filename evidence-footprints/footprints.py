@@ -201,7 +201,8 @@ class Footprint:
         self.unparsed: list[dict] = []
         self.facts: dict[str, dict] = {}
         self.delegated = False
-        self.outside = 0  # path arguments outside this repository (other repos, scratch, home)
+        self.outside = 0  # path arguments proven outside this repository (other repos, scratch, home)
+        self.unresolved = 0  # shell path arguments whose working directory could not be determined
         for idx, call in enumerate(self.calls):
             self._call(idx, call)
 
@@ -258,7 +259,8 @@ class Footprint:
                     edit = use.role == "write" and use.verb != "git"
                     target = resolve(use.path, use.base, wd)
                     if target is None:
-                        self.outside += 1
+                        # Undetermined, not known outside: never classified as outside_repo.
+                        self.unresolved += 1
                         continue
                     self._touch(idx, target, use.role, edit=edit, native=False)
                 if seg.kind == "nav":
@@ -454,7 +456,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
     pool: list[dict] = []
     status_counts: Counter = Counter()
     miss_reasons: Counter = Counter()
-    segs = pathlike = outside = 0
+    segs = pathlike = outside = unresolved = 0
     scored: list[tuple[dict, dict, Footprint, tuple]] = []
 
     for row in sorted(rows, key=lambda r: r["packet_id"]):
@@ -481,6 +483,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
         segs += fp.shell_segments
         pathlike += fp.shell_pathlike
         outside += fp.outside
+        unresolved += fp.unresolved
         for u in fp.unparsed:
             miss_reasons[str(u["reason"]).split(" ", 1)[0] if u["reason"] else "None"] += 1
             unparsed.append({"packet_id": pid, **u})
@@ -527,7 +530,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
                       "touched": len(fp.touched), "edited": len(fp.edited),
                       "searches": len(fp.queries), "calls": len(fp.calls),
                       "shell_segments": fp.shell_segments, "shell_unparsed": len(fp.unparsed),
-                      "outside_repo": fp.outside},
+                      "outside_repo": fp.outside, "unresolved": fp.unresolved},
             "metrics": m, "baseline": baseline,
             "brief_items": sum(1 for it in b["ranked"] if it["selected"]),
             "brief_items_touched": sum(1 for it in b["ranked"]
@@ -565,6 +568,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
         "status": dict(sorted(status_counts.items())),
         "parse": {"shell_segments": segs, "segments_with_paths": pathlike,
                   "unparsed": len(unparsed), "paths_outside_repo": outside,
+                  "paths_unresolved": unresolved,
                   "miss_rate": round(len(unparsed) / pathlike, 4) if pathlike else None,
                   "reasons": dict(sorted(miss_reasons.items()))},
         "overall": aggregate(scored_rows),
@@ -597,7 +601,9 @@ def render_md(s: dict) -> str:
              f"Shell parse: {s['parse']['unparsed']} of {s['parse']['segments_with_paths']} path-bearing "
              f"segments unattributed (miss rate {_fmt(s['parse']['miss_rate'])}). "
              f"{s['parse']['paths_outside_repo']} path arguments fell outside the brief's repository "
-             "(other repos, scratch, home) and are not scored.", "",
+             "(other repos, scratch, home) and are not scored. "
+             f"{s['parse'].get('paths_unresolved', 0)} path arguments could not be resolved to a working "
+             "directory and were not classified.", "",
              "Means; `n` counts episodes where the metric is defined. Lift is actual minus the "
              "shuffled same-repo baseline.", "",
              "| slice | n | " + " | ".join(cols) + " | hit lift | gap lift |",
