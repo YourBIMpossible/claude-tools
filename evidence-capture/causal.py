@@ -704,7 +704,12 @@ def shared_git_state(repo: Path) -> str:
 def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, Any]]:
     """Every OTHER worktree sharing this repository: ``{path: {"fp", "head", "paths"}}``,
     where ``fp`` is sha256(HEAD + status) and ``paths`` the paths its status names
-    (statuses run concurrently; one that cannot finish raises ``worktree_status_timeout``)."""
+    (statuses run concurrently; one that cannot finish raises ``worktree_status_timeout``).
+
+    A worktree whose status command fails (non-zero exit: broken gitdir pointer, locked
+    index, unreadable checkout) is recorded as unobservable: ``fp`` and ``paths`` are
+    ``None`` and ``status_error`` carries the exit code and stderr. Its state was not
+    observed, so it is never equal to anything, not even to itself."""
     me = os.path.normcase(os.path.realpath(_git(repo, "rev-parse", "--show-toplevel").decode().strip()))
     out: dict[str, dict[str, Any]] = {}
     procs: dict[str, tuple[bytes, subprocess.Popen[bytes]]] = {}
@@ -718,20 +723,32 @@ def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, A
             continue
         procs[path] = (fields.get(b"HEAD", b""), subprocess.Popen(
             ["git", "-C", path, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_env()))
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env()))
     for path, (head, proc) in procs.items():
         try:
-            status, _ = proc.communicate(timeout=timeout)
+            status, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
             raise CausalError("worktree_status_timeout") from None
+        if proc.returncode != 0:
+            out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
+                         "status_error": {"rc": proc.returncode,
+                                          "stderr": err.decode("utf-8", "replace").strip()[:2000]}}
+            continue
         out[path] = {"fp": sha256_bytes(head + b"\0" + status), "head": head.decode() or None,
                      "paths": _status_paths(status)}
     return out
 
 
-def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str]:
+def unobservable_worktrees(*records: dict[str, dict[str, Any]] | None) -> list[str]:
+    """Worktrees any given record set could not observe (``fp`` is ``None``: the status
+    command failed). Such a worktree has no state to compare, so it can never be unmoved."""
+    return sorted({k for recs in records if recs for k, v in recs.items() if (v or {}).get("fp") is None})
+
+
+def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str | None]:
+    """``None`` for a worktree whose status could not be observed."""
     return {k: v["fp"] for k, v in worktree_records(repo, timeout).items()}
 
 
@@ -747,7 +764,8 @@ def classify_worktrees(start: dict[str, dict[str, Any]] | None, end: dict[str, d
     """Split other-worktree movement during a turn into ``contaminating`` (it can have
     reached this task's inputs, dependencies, shared state or attribution), ``unrelated``
     (preserved evidence shows it cannot have) and ``unknown`` (the evidence to decide is
-    missing). Unknown is never unrelated.
+    missing). Unknown is never unrelated. A worktree whose status failed on either side
+    (``fp`` None, see ``worktree_records``) is unknown whether or not it appears moved.
 
     A moved worktree is unrelated only when every one of these holds: both records exist
     with path lists; the shared git state is unchanged; every tool call of the turn
@@ -761,7 +779,10 @@ def classify_worktrees(start: dict[str, dict[str, Any]] | None, end: dict[str, d
         out["shared_state_changed"] = None
     else:
         out["shared_state_changed"] = shared_start != shared_end
-    moved = sorted(k for k in set(start) | set(end) if (start.get(k) or {}).get("fp") != (end.get(k) or {}).get("fp"))
+    unobserved = set(unobservable_worktrees(start, end))
+    out["unknown"] += sorted(unobserved)  # status failed on one side: no state to compare, never unmoved
+    moved = sorted(k for k in (set(start) | set(end)) - unobserved
+                   if (start.get(k) or {}).get("fp") != (end.get(k) or {}).get("fp"))
     texts: list[str] | None = None
     if calls is not None and subagents_unresolved == 0:
         texts = [json.dumps(c.get("input") or {}, ensure_ascii=False).replace("\\\\", "/").replace("\\", "/").lower()
@@ -791,14 +812,16 @@ def classify_worktrees(start: dict[str, dict[str, Any]] | None, end: dict[str, d
 
 
 def attribute(start: dict[str, Any], end: dict[str, Any], agent_writes: list[str], *,
-              top: str | None = None, worktrees_start: dict[str, str] | None = None,
-              worktrees_end: dict[str, str] | None = None) -> dict[str, Any]:
-    """Every change must be one the agent wrote; other worktrees must not move."""
+              top: str | None = None, worktrees_start: dict[str, str | None] | None = None,
+              worktrees_end: dict[str, str | None] | None = None) -> dict[str, Any]:
+    """Every change must be one the agent wrote; other worktrees must not move. A
+    worktree fingerprint of ``None`` (status failed) is never equal: it counts as moved."""
     written = {os.path.normcase(_norm_rel(p, top)) for p in agent_writes}
     changed = changed_paths(start, end)
     unattributed = [p for p in changed if os.path.normcase(p) not in written]
-    moved = sorted(k for k in set(worktrees_start or {}) | set(worktrees_end or {})
-                   if (worktrees_start or {}).get(k) != (worktrees_end or {}).get(k))
+    ws, we = worktrees_start or {}, worktrees_end or {}
+    moved = sorted(k for k in set(ws) | set(we)
+                   if ws.get(k) is None or we.get(k) is None or ws.get(k) != we.get(k))
     return {"changed": changed, "unattributed": unattributed, "other_worktrees_moved": moved,
             "head_moved": start.get("head") != end.get("head"),
             "isolated": not unattributed and not moved}
