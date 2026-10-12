@@ -454,6 +454,55 @@ def test_worktree_status_failure_monkeypatched_rc(tmp: Path) -> None:
     assert cls["unknown"] == list(recs) and not causal.admit({"worktrees": cls})["eligible"]
 
 
+def _nested_ignored_worktree(tmp: Path) -> tuple[Path, Path, str]:
+    """House layout: a lane under ``<repo>/.claude/worktrees/`` with ``.claude/`` ignored."""
+    repo = make_repo(tmp, {"a.txt": b"a\n", ".gitignore": b".claude/\n"})
+    lane = repo / ".claude" / "worktrees" / "lane"
+    git(repo, "worktree", "add", "-q", "-b", "lane", str(lane))
+    recs = causal.worktree_records(repo)
+    (key,) = recs
+    return repo, lane, key
+
+
+def test_nested_worktree_healthy_resolves(tmp: Path) -> None:
+    repo, lane, key = _nested_ignored_worktree(tmp)
+    a = causal.worktree_records(repo)
+    assert a[key]["fp"] is not None and a[key]["paths"] == [] and "status_error" not in a[key]
+    (lane / "a.txt").write_bytes(b"edited in lane")
+    b = causal.worktree_records(repo)
+    assert b[key]["fp"] not in (None, a[key]["fp"]) and b[key]["paths"] == ["a.txt"]
+    cls = causal.classify_worktrees(a, b, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
+    assert cls["unrelated"] == [key] and cls["unknown"] == []
+
+
+def test_nested_worktree_without_marker_is_unknown(tmp: Path) -> None:
+    """Reviewer bypass (SA-1 2c): the lane's ``.git`` file removed. git walks up to the parent
+    repo, status exits 0 with no output (the lane is ignored there), so the fingerprint would
+    be stable whatever changed inside. The toplevel check must make it unobservable."""
+    repo, lane, key = _nested_ignored_worktree(tmp)
+    healthy = causal.worktree_records(repo)
+    dot_git = lane / ".git"
+    os.chmod(dot_git, stat.S_IWRITE)
+    if os.name == "nt":
+        subprocess.run(["attrib", "-h", "-r", str(dot_git)], check=False, capture_output=True)
+    dot_git.unlink()
+    probe = subprocess.run(["git", "-C", str(lane), "status", "--porcelain=v2"], capture_output=True, env=ENV)
+    assert probe.returncode == 0 and probe.stdout == b"", probe  # the bypass precondition holds
+    before = causal.worktree_records(repo)
+    (lane / "a.txt").write_bytes(b"changed while unobservable")
+    after = causal.worktree_records(repo)
+    for rec in (before[key], after[key]):
+        assert rec["fp"] is None and rec["paths"] is None, rec
+        assert rec["status_error"]["rc"] == 0 and rec["status_error"]["stderr"].startswith("toplevel mismatch: "), rec
+    for s_, e_ in ((healthy, before), (before, after), (after, healthy)):
+        cls = causal.classify_worktrees(s_, e_, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
+        assert cls["unknown"] == [key] and not cls["unrelated"], cls
+        assert not causal.admit({"worktrees": cls})["eligible"]
+    st = causal.capture_state(repo, tmp / "s", label="start")
+    fps = {k: v["fp"] for k, v in before.items()}
+    assert not causal.attribute(st, st, [], worktrees_start=fps, worktrees_end=fps)["isolated"]
+
+
 # ------------------------------------------------------------------------ runner
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

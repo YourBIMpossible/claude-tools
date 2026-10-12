@@ -707,7 +707,8 @@ def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, A
     (statuses run concurrently; one that cannot finish raises ``worktree_status_timeout``).
 
     A worktree whose status command fails (non-zero exit: broken gitdir pointer, locked
-    index, unreadable checkout) is recorded as unobservable: ``fp`` and ``paths`` are
+    index, unreadable checkout), or whose status resolved to some other repository (its
+    ``.git`` marker gone, git walked up to an enclosing checkout), is recorded as unobservable: ``fp`` and ``paths`` are
     ``None`` and ``status_error`` carries the exit code and stderr. Its state was not
     observed, so it is never equal to anything, not even to itself."""
     me = os.path.normcase(os.path.realpath(_git(repo, "rev-parse", "--show-toplevel").decode().strip()))
@@ -736,9 +737,33 @@ def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, A
                          "status_error": {"rc": proc.returncode,
                                           "stderr": err.decode("utf-8", "replace").strip()[:2000]}}
             continue
+        mismatch = _toplevel_mismatch(path, timeout)
+        if mismatch is not None:
+            out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
+                         "status_error": {"rc": 0, "stderr": mismatch}}
+            continue
         out[path] = {"fp": sha256_bytes(head + b"\0" + status), "head": head.decode() or None,
                      "paths": _status_paths(status)}
     return out
+
+
+def _toplevel_mismatch(path: str, timeout: float) -> str | None:
+    """Prove the status just taken was of ``path`` itself. A worktree whose ``.git`` marker
+    is gone makes git walk up to an enclosing repository (the house layout nests lanes
+    under ``<repo>/.claude/worktrees/``, an ignored directory): status then exits 0 with
+    no output whatever changed inside. Returns the reason when the toplevel git resolves
+    for ``path`` is not ``path``, or when it cannot be resolved; ``None`` when it matches."""
+    try:
+        res = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True,
+                             env=git_env(), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "toplevel unresolved: timeout"
+    if res.returncode != 0:
+        return f"toplevel unresolved: rc {res.returncode}: {res.stderr.decode('utf-8', 'replace').strip()[:500]}"
+    got = res.stdout.decode("utf-8", "surrogateescape").strip()
+    if os.path.normcase(os.path.realpath(got)) != os.path.normcase(os.path.realpath(path)):
+        return f"toplevel mismatch: {got}"
+    return None
 
 
 def unobservable_worktrees(*records: dict[str, dict[str, Any]] | None) -> list[str]:
