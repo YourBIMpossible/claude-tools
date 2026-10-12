@@ -277,12 +277,19 @@ def test_repo_aware_relative_paths() -> None:
     segs, _ = sp.parse_command("git -C F:/Other -C sub log -- a.py")
     check([u.base for g in segs for u in g.paths] == ["F:/Other/sub"], "git -C: successive -C compose")
 
-    def touched(cmd: str, cwd: str | None) -> tuple[list[str], int]:
+    def footprint(cmd: str, cwd: str | None) -> fpm.Footprint:
         c = call(1, "Bash", {"command": cmd})
         if cwd is not None:
             c["cwd"] = cwd
-        fp = fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def touched(cmd: str, cwd: str | None) -> tuple[list[str], int]:
+        fp = footprint(cmd, cwd)
         return [t[1] for t in fp.touches], fp.outside
+
+    def unresolved(cmd: str, cwd: str | None) -> tuple[list[str], int, int]:
+        fp = footprint(cmd, cwd)
+        return [t[1] for t in fp.touches], fp.outside, fp.unresolved
 
     check(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT) == ([], 1),
           "another repository's same-named file is outside, not a hit")
@@ -292,15 +299,38 @@ def test_repo_aware_relative_paths() -> None:
           "a relative path resolves against a subdirectory cwd")
     check(touched("git -C sub show HEAD:x.py", WT) == (["sub/x.py"], 0), "a relative -C resolves against the cwd")
     check(touched("cat CLAUDE.md", None) == (["claude.md"], 0), "no recorded cwd keeps the historical reading")
-    check(touched("$r='F:/Other'; git -C $r diff CLAUDE.md", WT) == ([], 1),
-          "git -C $variable: the directory is unknown, so the path is not attributed to the repo")
+    check(unresolved("$r='F:/Other'; git -C $r diff CLAUDE.md", WT) == ([], 0, 1),
+          "git -C $variable: the directory is unknown, so the path is unresolved, not outside")
     check(touched("cd /f/Other && cat CLAUDE.md", WT) == ([], 2), "cd to another repository moves later relative paths")
     check(touched("cd src && cat a.py", WT) == (["src/a.py"], 0), "cd into a subdirectory keeps them in the repo")
-    check(touched("cd $d; cat a.py", WT) == ([], 1), "cd to a variable leaves later relative paths unattributed")
-    check(touched("popd; cat a.py", WT) == ([], 1), "popd leaves later relative paths unattributed")
+    check(unresolved("cd $d; cat a.py", WT) == ([], 0, 1), "cd to a variable leaves later relative paths unresolved")
+    check(unresolved("popd; cat a.py", WT) == ([], 0, 1), "popd leaves later relative paths unresolved")
     check(touched("cat a.py; cd /f/Other", WT) == (["a.py"], 1), "a later cd does not move earlier segments")
     check(not fpm.overlap(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT)[0], ["claude.md"]),
           "the ckpt-7 cross-repository CLAUDE.md case no longer overlaps a cited CLAUDE.md")
+
+
+def test_unresolved_paths_are_not_outside() -> None:
+    """SA-4: an argument whose working directory is unknown is undetermined, never outside_repo."""
+    def fp(cmd: str, cwd: str | None = WT) -> fpm.Footprint:
+        c = call(1, "Bash", {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    f = fp("cd $D && cat src/app.py")
+    check((f.unresolved, f.outside, f.touches) == (1, 0, []), "unresolved cwd: unresolved=1, outside=0, no touches")
+    f = fp("cd - && cat src/app.py")
+    check((f.unresolved, f.outside, f.touches) == (1, 0, []), "cd -: unresolved, not outside")
+    f = fp("cat C:/Other/x.py")
+    check((f.unresolved, f.outside, f.touches) == (0, 1, []), "a genuinely outside absolute path is still outside")
+    f = fp("cat CLAUDE.md", "F:/Other")
+    check((f.unresolved, f.outside, f.touches) == (0, 1, []), "a relative path from an outside cwd is still outside")
+    f = fp("cat src/app.py")
+    check((f.unresolved, f.outside, [t[1] for t in f.touches]) == (0, 0, ["src/app.py"]),
+          "a resolvable relative path is still touched")
+    f = fp("cd $D && cat src/app.py && cat C:/Other/x.py")
+    check((f.unresolved, f.outside) == (1, 1), "unresolved and outside are counted in separate buckets")
 
 
 def main() -> int:
@@ -308,6 +338,7 @@ def main() -> int:
     test_powershell_assignment_and_foreach()
     test_in_place_and_find_actions()
     test_repo_aware_relative_paths()
+    test_unresolved_paths_are_not_outside()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
