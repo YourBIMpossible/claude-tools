@@ -410,7 +410,7 @@ def verify_sums(directory: Path) -> list[str]:
 def verified_delete(stores: Stores, kind: str, episode: str, reason: str) -> dict[str, Any]:
     """Delete ``<kind>/<episode>`` from the content store, verify it is gone, log it.
 
-    ``kind`` is ``snapshots`` or ``payloads``. The record is appended to
+    ``kind`` is ``snapshots``, ``payloads`` or ``causal``. The record is appended to
     ``DELETIONS.log`` in the metadata repo. Raises ``StoreError`` when verification fails.
     """
     target = stores.content / kind / episode
@@ -424,6 +424,8 @@ def verified_delete(stores: Stores, kind: str, episode: str, reason: str) -> dic
         return record
     sums_file = target / "SHA256SUMS"
     listed = list(read_sums(target))
+    for sub in sorted(p for p in target.iterdir() if p.is_dir() and (p / "SHA256SUMS").is_file()):
+        listed += [f"{sub.name}/{rel}" for rel in read_sums(sub)]  # causal: start/end/history seals
     record["listed_paths"] = len(listed)
     if sums_file.is_file():
         record["sums_sha256"] = sha256_file(sums_file)

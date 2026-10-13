@@ -39,6 +39,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import causal_hooks
 import client_identity as ci
 import manifest as mf
 from common import iso, norm_path, now_utc, parse_iso, read_json, sha256_bytes, sha256_text, write_json_atomic
@@ -738,8 +739,13 @@ def finalize(stores: Stores, m: dict[str, Any], transcript: Path, cwds: list[str
         errors.append("root:unresolved")
         status = "partial"
     else:
+        edited: list[str] = []
         screen(m, obs, sroot, cwd=cwds[-1] if cwds else str(sroot),
-               untracked_paths=_untracked_paths(stores, m["episode_id"]), complete=True)
+               untracked_paths=_untracked_paths(stores, m["episode_id"]), complete=True, edited_out=edited)
+        if by == "end" and root is not None:  # only the live Stop sees the end state; maintenance never
+            gaps = obs.get("subagent_unresolved") or 0
+            gaps = (len(gaps) if isinstance(gaps, list) else int(gaps)) + ("subagent_beyond_turn" in obs.get("causes", []))
+            causal_hooks.end(m, sroot, stores.content, edited, calls=obs.get("tool_calls"), subagent_gaps=gaps)
     if cap.get("status") == "failed":
         status = "failed"
     elif any(e.startswith("start_") for e in errors):
@@ -907,6 +913,8 @@ def run_start(payload: dict[str, Any], env: dict[str, str], *, now: str | None =
     repo_fields, snap = take_snapshot(root, ep, stores, budget_s=budget)
     m["repo"].update(repo_fields)
     m["start_snapshot"] = snap
+    m["causal"] = causal_hooks.start(root, ep, stores.content,
+                                     remaining_s=START_BUDGET_MS / 1000 - (time.perf_counter() - t0))
     m["capture"]["start_ms"] = int((time.perf_counter() - t0) * 1000)
     if m["capture"]["start_ms"] > START_BUDGET_MS:
         m["capture"]["errors"].append("start_over_budget")
