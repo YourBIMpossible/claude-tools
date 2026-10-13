@@ -750,7 +750,7 @@ def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, A
 def _toplevel_mismatch(path: str, timeout: float) -> str | None:
     """Prove the status just taken was of ``path`` itself. A worktree whose ``.git`` marker
     is gone makes git walk up to an enclosing repository (the house layout nests lanes
-    under ``<repo>/.claude/worktrees/``, an ignored directory): status then exits 0 with
+    in an ignored directory inside the repository): status then exits 0 with
     no output whatever changed inside. Returns the reason when the toplevel git resolves
     for ``path`` is not ``path``, or when it cannot be resolved; ``None`` when it matches."""
     try:

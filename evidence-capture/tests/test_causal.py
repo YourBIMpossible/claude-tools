@@ -26,8 +26,8 @@ import causal  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
-ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
-       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t",
+       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t",
        "GIT_CONFIG_NOSYSTEM": "1"}
 TOOLS = {"python": [sys.executable, "--version"]}
 
@@ -455,9 +455,9 @@ def test_worktree_status_failure_monkeypatched_rc(tmp: Path) -> None:
 
 
 def _nested_ignored_worktree(tmp: Path) -> tuple[Path, Path, str]:
-    """House layout: a lane under ``<repo>/.claude/worktrees/`` with ``.claude/`` ignored."""
-    repo = make_repo(tmp, {"a.txt": b"a\n", ".gitignore": b".claude/\n"})
-    lane = repo / ".claude" / "worktrees" / "lane"
+    """A lane nested in an ignored directory of its parent repository."""
+    repo = make_repo(tmp, {"a.txt": b"a\n", ".gitignore": b"lanes/\n"})
+    lane = repo / "lanes" / "lane"
     git(repo, "worktree", "add", "-q", "-b", "lane", str(lane))
     recs = causal.worktree_records(repo)
     (key,) = recs
