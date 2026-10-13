@@ -271,11 +271,11 @@ def test_in_place_and_find_actions() -> None:
 
 def test_repo_aware_relative_paths() -> None:
     """A relative shell path is resolved against git -C and the call's cwd before matching."""
-    segs, _ = sp.parse_command(r"git -C F:\Other diff CLAUDE.md")
-    check([(u.path, u.base) for g in segs for u in g.paths] == [("CLAUDE.md", "F:/Other")],
+    segs, _ = sp.parse_command(r"git -C \srv\other-repo diff CLAUDE.md")
+    check([(u.path, u.base) for g in segs for u in g.paths] == [("CLAUDE.md", "/srv/other-repo")],
           "git -C: the directory is carried as the path base")
-    segs, _ = sp.parse_command("git -C F:/Other -C sub log -- a.py")
-    check([u.base for g in segs for u in g.paths] == ["F:/Other/sub"], "git -C: successive -C compose")
+    segs, _ = sp.parse_command("git -C /srv/other-repo -C sub log -- a.py")
+    check([u.base for g in segs for u in g.paths] == ["/srv/other-repo/sub"], "git -C: successive -C compose")
 
     def footprint(cmd: str, cwd: str | None) -> fpm.Footprint:
         c = call(1, "Bash", {"command": cmd})
@@ -291,22 +291,22 @@ def test_repo_aware_relative_paths() -> None:
         fp = footprint(cmd, cwd)
         return [t[1] for t in fp.touches], fp.outside, fp.unresolved
 
-    check(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT) == ([], 1),
+    check(touched(r"git -C \srv\other-repo diff CLAUDE.md", WT) == ([], 1),
           "another repository's same-named file is outside, not a hit")
     check(touched("git diff CLAUDE.md", WT) == (["claude.md"], 0), "the repo's own relative file still counts")
-    check(touched("cat CLAUDE.md", "F:/Other") == ([], 1), "a relative path from a cwd outside the repo is outside")
+    check(touched("cat CLAUDE.md", "/srv/other-repo") == ([], 1), "a relative path from a cwd outside the repo is outside")
     check(touched("cat docs/CLAUDE.md", WT + "/src") == (["src/docs/claude.md"], 0),
           "a relative path resolves against a subdirectory cwd")
     check(touched("git -C sub show HEAD:x.py", WT) == (["sub/x.py"], 0), "a relative -C resolves against the cwd")
     check(touched("cat CLAUDE.md", None) == (["claude.md"], 0), "no recorded cwd keeps the historical reading")
-    check(unresolved("$r='F:/Other'; git -C $r diff CLAUDE.md", WT) == ([], 0, 1),
+    check(unresolved("$r='/srv/other-repo'; git -C $r diff CLAUDE.md", WT) == ([], 0, 1),
           "git -C $variable: the directory is unknown, so the path is unresolved, not outside")
     check(touched("cd /f/Other && cat CLAUDE.md", WT) == ([], 2), "cd to another repository moves later relative paths")
     check(touched("cd src && cat a.py", WT) == (["src/a.py"], 0), "cd into a subdirectory keeps them in the repo")
     check(unresolved("cd $d; cat a.py", WT) == ([], 0, 1), "cd to a variable leaves later relative paths unresolved")
     check(unresolved("popd; cat a.py", WT) == ([], 0, 1), "popd leaves later relative paths unresolved")
     check(touched("cat a.py; cd /f/Other", WT) == (["a.py"], 1), "a later cd does not move earlier segments")
-    check(not fpm.overlap(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT)[0], ["claude.md"]),
+    check(not fpm.overlap(touched(r"git -C \srv\other-repo diff CLAUDE.md", WT)[0], ["claude.md"]),
           "the ckpt-7 cross-repository CLAUDE.md case no longer overlaps a cited CLAUDE.md")
 
 
@@ -322,15 +322,52 @@ def test_unresolved_paths_are_not_outside() -> None:
     check((f.unresolved, f.outside, f.touches) == (1, 0, []), "unresolved cwd: unresolved=1, outside=0, no touches")
     f = fp("cd - && cat src/app.py")
     check((f.unresolved, f.outside, f.touches) == (1, 0, []), "cd -: unresolved, not outside")
-    f = fp("cat C:/Other/x.py")
+    f = fp("cat /srv/other-repo/x.py")
     check((f.unresolved, f.outside, f.touches) == (0, 1, []), "a genuinely outside absolute path is still outside")
-    f = fp("cat CLAUDE.md", "F:/Other")
+    f = fp("cat CLAUDE.md", "/srv/other-repo")
     check((f.unresolved, f.outside, f.touches) == (0, 1, []), "a relative path from an outside cwd is still outside")
     f = fp("cat src/app.py")
     check((f.unresolved, f.outside, [t[1] for t in f.touches]) == (0, 0, ["src/app.py"]),
           "a resolvable relative path is still touched")
-    f = fp("cd $D && cat src/app.py && cat C:/Other/x.py")
+    f = fp("cd $D && cat src/app.py && cat /srv/other-repo/x.py")
     check((f.unresolved, f.outside) == (1, 1), "unresolved and outside are counted in separate buckets")
+
+
+def test_env_home_and_parent_segments() -> None:
+    """Review of SA-4: $VAR, %VAR% and ~ paths are undetermined (unresolved, never outside or
+    inside); '.' and '..' collapse against a known directory, and a '..' that cannot collapse
+    is unresolved."""
+    def bash(cmd: str, cwd: str | None = WT) -> fpm.Footprint:
+        c = call(1, "Bash", {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def native(path: str) -> fpm.Footprint:
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [call(1, "Read", {"file_path": path})]))
+
+    def counts(f: fpm.Footprint) -> tuple[int, int, list[str]]:
+        return f.unresolved, f.outside, [t[1] for t in f.touches]
+
+    forms = ["$HOME/x.py", "$R/a.py", "${R}/a.py", "$env:R/a.py", "%USERPROFILE%/a.py", "~/a.py", "~",
+             "src/$name/a.py"]
+    for form in forms:
+        for cwd in (WT, None):
+            if form == "~":  # the shell parser does not extract a bare ~ as a path: no bucket at all
+                check(counts(bash("cat ~", cwd)) == (0, 0, []), "shell bare ~: never outside or inside")
+                continue
+            check(counts(bash(f"cat {form}", cwd)) == (1, 0, []),
+                  f"shell arg {form!r} (cwd {'set' if cwd else 'none'}): unresolved, not outside or inside")
+        check(counts(native(form)) == (1, 0, []), f"native Read {form!r}: unresolved, not outside or inside")
+    check(counts(bash("cat ../a.py", WT + "/src")) == (0, 0, ["a.py"]), "'..' collapses against a known cwd")
+    check(counts(bash("cat ./src/./a.py")) == (0, 0, ["src/a.py"]), "'.' segments are dropped")
+    check(counts(bash("cat ../a.py", None)) == (1, 0, []), "'..' with no cwd is unresolved, not outside")
+    check(counts(native("../a.py")) == (1, 0, []), "native '..' with no base is unresolved")
+    check(counts(bash("cat ../../../../../../../a.py")) == (1, 0, []), "'..' past the filesystem root is unresolved")
+    check(counts(bash("cat ../../../../other-repo/a.py")) == (0, 1, []),
+          "'..' that genuinely leaves the repository is outside")
+    check(counts(native(REPO + "/src/../src/a.py")) == (0, 0, ["src/a.py"]), "native absolute '..' collapses")
+    check(counts(bash("cat //server/share/a.py")) == (0, 1, []), "a UNC path stays outside")
 
 
 def main() -> int:
@@ -339,6 +376,7 @@ def main() -> int:
     test_in_place_and_find_actions()
     test_repo_aware_relative_paths()
     test_unresolved_paths_are_not_outside()
+    test_env_home_and_parent_segments()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")

@@ -136,6 +136,41 @@ def norm(raw: str, roots: Iterable[str]) -> str | None:
 
 
 UNRESOLVED = "<unresolved-dir>"  # a directory the command set but this parser cannot evaluate ($var, popd, bare cd)
+UNDETERMINED_RE = re.compile(r"\$|%[A-Za-z_][A-Za-z0-9_]*%")  # $VAR, ${VAR}, $env:VAR, %VAR%
+PATH_HEAD_RE = re.compile(r"^(?:[A-Za-z]:/|//[^/]+/[^/]+(?:/|$)|/)")
+
+
+def undetermined(raw: str) -> bool:
+    """A path whose value depends on the environment (variables, the home directory).
+
+    Footprints are computed from recorded transcripts, so the value is unknown: such a
+    path is neither inside nor outside the repository.
+    """
+    p = raw.strip().strip("'\"")
+    return p.startswith("~") or bool(UNDETERMINED_RE.search(p))
+
+
+def collapse(raw: str) -> str | None:
+    """'.' and '..' segments removed; None when a '..' climbs above the path's start.
+
+    A relative path cannot climb above its start without a known base directory, and an
+    absolute one cannot climb above its root: either way the target is undetermined.
+    """
+    p = raw.replace("\\", "/").strip().strip("'\"")
+    head = m.group(0) if (m := PATH_HEAD_RE.match(p)) else ""
+    parts: list[str] = []
+    for seg in p[len(head):].split("/"):
+        if seg in {"", "."}:
+            continue
+        if seg == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(seg)
+    if head and not head.endswith("/"):
+        head += "/"
+    return head + "/".join(parts) if head or parts else "."
 
 
 def _join_dir(d: str | None, cwd: str | None) -> str | None:
@@ -204,7 +239,7 @@ class Footprint:
         self.facts: dict[str, dict] = {}
         self.delegated = False
         self.outside = 0  # path arguments proven outside this repository (other repos, scratch, home)
-        self.unresolved = 0  # shell path arguments whose working directory could not be determined
+        self.unresolved = 0  # path arguments whose location could not be determined (cwd, $VAR, ~, '..')
         for idx, call in enumerate(self.calls):
             self._call(idx, call)
 
@@ -213,7 +248,12 @@ class Footprint:
         self.facts.setdefault(fid, {"id": fid, "kind": kind, "value": value})
 
     def _touch(self, idx: int, raw: str, role: str, *, edit: bool = False, native: bool) -> None:
-        p = norm(raw, self.roots)
+        full = None if undetermined(raw) else collapse(raw)
+        if full is None:
+            # Undetermined, not known outside: never classified as outside_repo.
+            self.unresolved += 1
+            return
+        p = norm(full, self.roots)
         if p is None:
             self.outside += 1
             return
@@ -259,7 +299,7 @@ class Footprint:
                     self.queries.append((idx, seg.text))
                 for use in seg.paths:
                     edit = use.role == "write" and use.verb != "git"
-                    target = resolve(use.path, use.base, wd)
+                    target = None if undetermined(use.path) else resolve(use.path, use.base, wd)
                     if target is None:
                         # Undetermined, not known outside: never classified as outside_repo.
                         self.unresolved += 1
