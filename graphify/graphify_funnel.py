@@ -64,7 +64,8 @@ PASS, FAIL, INSUFFICIENT = "PASS", "FAIL", "INSUFFICIENT EVIDENCE"
 # with the path as an argument), and bare graphify only counts in command position (start
 # of the command, after a shell separator, or as a path ending in graphify[.exe]).
 # Detection runs on code_part(command): heredoc/here-string bodies and multi-line quoted
-# strings (commit messages, prose) are removed first, so their line starts are not commands.
+# strings (commit messages, prose) are removed first, so their line starts are not commands,
+# and separators inside single-line quoted strings (grep patterns like "a\|b") are blanked.
 # Path components must end in / or \, which keeps test_query_reranked.py out; a quoted path
 # may contain spaces.
 _CMD_POS = r"(?:^|[;&|(\n]|\$\()\s*(?:[A-Za-z_]\w*=\S*\s+)*"   # separator, VAR=value prefixes
@@ -82,8 +83,16 @@ _HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n.*?^[ \t]*\2[ \t]*$"
 _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
 
 
-def _blank_multiline_quotes(command: str, escape: str = "\\") -> str:
-    """Replace each quoted string that spans a newline with "" (left-to-right quote pairing).
+_QUOTED_SEPARATORS = str.maketrans(";&|()", "     ")
+
+
+def _blank_quoted_code(command: str, escape: str = "\\") -> str:
+    """Replace each quoted string that spans a newline with "", and blank shell separators
+    (;&|()) inside single-line quoted strings, so a search pattern such as a\\|graphify query
+    in quotes gives `graphify` no command position. A double-quoted string containing $( keeps
+    all its separators, since that substitution runs a real command (so a pattern string that
+    also contains $( can still read as a call). Commands after a separator inside a quoted
+    `bash -c`, `pwsh -Command` or `cmd /c` argument are not counted: the string is an argument.
 
     A regex would pair one line's closing quote with the next line's opening quote and blank
     the real command between them, so quotes are paired by walking the string: `escape`
@@ -111,7 +120,11 @@ def _blank_multiline_quotes(command: str, escape: str = "\\") -> str:
                 out.append(command[i:])
                 break
             span = command[i:j + 1]
-            out.append('""' if "\n" in span else span)
+            if "\n" in span:
+                span = '""'
+            elif not (ch == '"' and "$(" in span):
+                span = span.translate(_QUOTED_SEPARATORS)
+            out.append(span)
             i = j + 1
         else:
             out.append(ch)
@@ -120,10 +133,11 @@ def _blank_multiline_quotes(command: str, escape: str = "\\") -> str:
 
 
 def code_part(command: str, tool: str = "Bash") -> str:
-    """The command with heredoc/here-string bodies and multi-line quoted strings blanked."""
+    """The command with heredoc/here-string bodies and multi-line quoted strings blanked, and
+    shell separators inside single-line quoted strings neutralised."""
     command = _HEREDOC_RE.sub("<<HEREDOC", command)
     command = _HERESTRING_RE.sub("@''@", command)
-    return _blank_multiline_quotes(command, "`" if tool == "PowerShell" else "\\")
+    return _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\")
 
 
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use

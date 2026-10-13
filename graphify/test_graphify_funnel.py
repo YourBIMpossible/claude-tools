@@ -310,6 +310,41 @@ class Execution(FunnelCase):
             .write(self.projects, "p", "s-ps-backslash")
         self.assertEqual(self.run_funnel()["execution"]["calls"], 1)
 
+    def test_separators_inside_quoted_search_patterns_are_not_command_positions(self):
+        # A `|` (or `;`, `&`, `(`) inside a quoted grep/rg pattern is regex alternation, not a
+        # pipe, so `graphify query` named in the pattern is a mention. The search output that
+        # quotes the wrapper's failure text must not count as a wrapper error either.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": r'grep -n "Telemetry\|graphify query\|BARE" src/funnel.py'},
+                  output='12: WRAPPER_FAILURE_RE = re.compile(r"graphify query failed")') \
+            .tool("Bash", {"command": r"grep -En 'a|graphify query|b' x.py"}) \
+            .tool("Bash", {"command": 'rg "x;graphify explain (y)" -n'}) \
+            .tool("PowerShell", {"command": "Select-String -Pattern 'x|python /x/query_reranked.py' f"}) \
+            .write(self.projects, "p", "s-grep-patterns")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 0)
+        self.assertEqual(ex["bare_cli_calls"], 0)
+        self.assertEqual(ex["wrapper_errors"], [])
+
+    def test_real_separators_beside_quoted_arguments_still_find_calls(self):
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'grep -c "a|b" f.txt && graphify query "q1"'}) \
+            .tool("Bash", {"command": "echo 'x;y' | python /x/query_reranked.py \"q2\""}) \
+            .tool("Bash", {"command": 'out="$(graphify query "q3" | head -1)"'}) \
+            .tool("PowerShell", {"command": "Get-Content 'a|b'; graphify explain \"q4\""}) \
+            .tool("PowerShell", {"command": r'& "C:\Program Files (x86)\python.exe" C:/x/query_reranked.py "q5"'}) \
+            .write(self.projects, "p", "s-real-separators")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 5)
+        self.assertEqual(ex["bare_cli_calls"], 3)
+
+    def test_commands_inside_a_quoted_shell_argument_are_not_counted(self):
+        # Accepted limit of the quoted-separator rule: the inner command is an argument string.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'bash -c "cd /x && graphify query q"'}) \
+            .write(self.projects, "p", "s-bash-c")
+        self.assertEqual(self.run_funnel()["execution"]["calls"], 0)
+
     def test_test_runs_are_not_calls(self):
         Transcript(self.repo) \
             .tool("Bash", {"command": "python test_query_reranked.py"}) \
