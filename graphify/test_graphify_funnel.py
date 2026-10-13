@@ -303,6 +303,13 @@ class Execution(FunnelCase):
         self.assertEqual(ex["calls"], 5)
         self.assertEqual(ex["bare_cli_calls"], 1)
 
+    def test_powershell_trailing_backslash_does_not_escape_the_quote(self):
+        # Review follow-up: PowerShell escapes with a backtick, so "x\" closes the string.
+        Transcript(self.repo) \
+            .tool("PowerShell", {"command": 'cd ".\\x\\"\npython "/x/query_reranked.py" "q"'}) \
+            .write(self.projects, "p", "s-ps-backslash")
+        self.assertEqual(self.run_funnel()["execution"]["calls"], 1)
+
     def test_test_runs_are_not_calls(self):
         Transcript(self.repo) \
             .tool("Bash", {"command": "python test_query_reranked.py"}) \

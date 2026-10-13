@@ -82,12 +82,13 @@ _HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n.*?^[ \t]*\2[ \t]*$"
 _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
 
 
-def _blank_multiline_quotes(command: str) -> str:
+def _blank_multiline_quotes(command: str, escape: str = "\\") -> str:
     """Replace each quoted string that spans a newline with "" (left-to-right quote pairing).
 
     A regex would pair one line's closing quote with the next line's opening quote and blank
-    the real command between them, so quotes are paired by walking the string: `\\` escapes
-    the next character (inside "..." and outside quotes), and a `#` comment runs to end of
+    the real command between them, so quotes are paired by walking the string: `escape`
+    (backslash for a POSIX shell, backtick for PowerShell) escapes the next character inside
+    "..." and outside quotes, and a `#` comment runs to end of
     line, so an apostrophe in it opens nothing. An unclosed quote leaves the rest as is.
     """
     out: list[str] = []
@@ -99,13 +100,13 @@ def _blank_multiline_quotes(command: str) -> str:
             end = n if end < 0 else end
             out.append(command[i:end])
             i = end
-        elif ch == "\\" and i + 1 < n:
+        elif ch == escape and i + 1 < n:
             out.append(command[i:i + 2])
             i += 2
         elif ch in "\"'":
             j = i + 1
             while j < n and command[j] != ch:
-                j += 2 if ch == '"' and command[j] == "\\" else 1
+                j += 2 if ch == '"' and command[j] == escape else 1
             if j >= n:
                 out.append(command[i:])
                 break
@@ -118,11 +119,11 @@ def _blank_multiline_quotes(command: str) -> str:
     return "".join(out)
 
 
-def code_part(command: str) -> str:
+def code_part(command: str, tool: str = "Bash") -> str:
     """The command with heredoc/here-string bodies and multi-line quoted strings blanked."""
     command = _HEREDOC_RE.sub("<<HEREDOC", command)
     command = _HERESTRING_RE.sub("@''@", command)
-    return _blank_multiline_quotes(command)
+    return _blank_multiline_quotes(command, "`" if tool == "PowerShell" else "\\")
 
 
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use
@@ -537,7 +538,7 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
                                                   or "graphify" in prompt.lower())})
     elif name in SHELL_TOOLS:
         cmd = str(inp.get("command", ""))
-        code = code_part(cmd)
+        code = code_part(cmd, name)
         if GRAPHIFY_CALL_RE.search(code):
             m = QUESTION_RE.search(cmd)
             call = Call(unit, str(block.get("id", "")), ts, cmd, m.group(1) if m else None,
