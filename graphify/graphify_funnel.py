@@ -58,10 +58,74 @@ from typing import Any, Callable, Iterable
 
 PASS, FAIL, INSUFFICIENT = "PASS", "FAIL", "INSUFFICIENT EVIDENCE"
 
-# (?<!\w) keeps test runs such as test_query_reranked.py out.
-GRAPHIFY_CALL_RE = re.compile(
-    r"(?<!\w)query_reranked\.py|(?<!\w)graphify(?:\.exe)?[\"']?\s+(?:query|path|explain)\b", re.I)
-WRAPPER_RE = re.compile(r"(?<!\w)query_reranked\.py", re.I)
+# A call is an INVOCATION, not a mention: reading, grepping, diffing, editing or committing
+# the wrapper's source names query_reranked.py too, so the wrapper only counts when a Python
+# interpreter in command position runs it as its script (not `-m <module>` or `-c <code>`
+# with the path as an argument), and bare graphify only counts in command position (start
+# of the command, after a shell separator, or as a path ending in graphify[.exe]).
+# Detection runs on code_part(command): heredoc/here-string bodies and multi-line quoted
+# strings (commit messages, prose) are removed first, so their line starts are not commands.
+# Path components must end in / or \, which keeps test_query_reranked.py out; a quoted path
+# may contain spaces.
+_CMD_POS = r"(?:^|[;&|(\n]|\$\()\s*(?:[A-Za-z_]\w*=\S*\s+)*"   # separator, VAR=value prefixes
+_ARG = r"(?:\"[^\"\n]*[\\/]|'[^'\n]*[\\/]|[\"']?[^\s\"';|&]*[\\/]|[\"'])?"
+WRAPPER_RE = re.compile(
+    _CMD_POS + _ARG + r"(?:python[\d.]*|py)(?:\.exe)?[\"']?"      # interpreter
+    r"(?:\s+(?!-[mc])-\S+(?:\s+[A-Za-z_]\w*(?:=\S*)?)?)*\s+"       # options, e.g. -3, -X utf8
+    + _ARG + r"query_reranked\.py",
+    re.I | re.M)
+BARE_CLI_RE = re.compile(
+    _CMD_POS + _ARG + r"graphify(?:\.exe)?[\"']?\s+(?:query|path|explain)\b",
+    re.I | re.M)
+GRAPHIFY_CALL_RE = re.compile(f"{WRAPPER_RE.pattern}|{BARE_CLI_RE.pattern}", re.I | re.M)
+_HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n.*?^[ \t]*\2[ \t]*$", re.S | re.M)
+_HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
+
+
+def _blank_multiline_quotes(command: str, escape: str = "\\") -> str:
+    """Replace each quoted string that spans a newline with "" (left-to-right quote pairing).
+
+    A regex would pair one line's closing quote with the next line's opening quote and blank
+    the real command between them, so quotes are paired by walking the string: `escape`
+    (backslash for a POSIX shell, backtick for PowerShell) escapes the next character inside
+    "..." and outside quotes, and a `#` comment runs to end of
+    line, so an apostrophe in it opens nothing. An unclosed quote leaves the rest as is.
+    """
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "#" and (i == 0 or command[i - 1] in " \t\n;"):
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            out.append(command[i:end])
+            i = end
+        elif ch == escape and i + 1 < n:
+            out.append(command[i:i + 2])
+            i += 2
+        elif ch in "\"'":
+            j = i + 1
+            while j < n and command[j] != ch:
+                j += 2 if ch == '"' and command[j] == escape else 1
+            if j >= n:
+                out.append(command[i:])
+                break
+            span = command[i:j + 1]
+            out.append('""' if "\n" in span else span)
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def code_part(command: str, tool: str = "Bash") -> str:
+    """The command with heredoc/here-string bodies and multi-line quoted strings blanked."""
+    command = _HEREDOC_RE.sub("<<HEREDOC", command)
+    command = _HERESTRING_RE.sub("@''@", command)
+    return _blank_multiline_quotes(command, "`" if tool == "PowerShell" else "\\")
+
+
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use
 QUESTION_RE = re.compile(r"(?:query_reranked\.py[\"']?|\s(?:query|explain))\s+\"([^\"]+)\"")
 SHELL_SEARCH_RE = re.compile(r"(?:^|[\s|;&(])(?:grep|rg|findstr|Select-String|git grep)\b", re.I)
@@ -100,6 +164,8 @@ class Call:
     is_error: bool | None = None
     output: str = ""
     record: dict | None = None
+    origin_session: str | None = None   # the transcript record's sessionId (kept on copies)
+    copy: bool = False                  # a continued/forked transcript's copy of another call
 
     @property
     def status(self) -> str:
@@ -441,7 +507,8 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
                 if tool_id and tool_id in session.seen_tool_ids:
                     continue    # resumed/forked transcripts repeat earlier records
                 session.seen_tool_ids.add(tool_id)
-                _tool_use(target, block, ts, pending)
+                origin = rec.get("sessionId")
+                _tool_use(target, block, ts, pending, origin if isinstance(origin, str) else None)
             elif block.get("type") == "tool_result":
                 call = pending.pop(block.get("tool_use_id", ""), None)
                 if call is not None:
@@ -450,7 +517,8 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
                     call.output = result_text(block.get("content"))[:4000]
 
 
-def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, Call]) -> None:
+def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, Call],
+              origin_session: str | None = None) -> None:
     name = block.get("name", "")
     inp = block.get("input") if isinstance(block.get("input"), dict) else {}
     if name in SEARCH_TOOLS:
@@ -470,10 +538,12 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
                                                   or "graphify" in prompt.lower())})
     elif name in SHELL_TOOLS:
         cmd = str(inp.get("command", ""))
-        if GRAPHIFY_CALL_RE.search(cmd):
+        code = code_part(cmd, name)
+        if GRAPHIFY_CALL_RE.search(code):
             m = QUESTION_RE.search(cmd)
             call = Call(unit, str(block.get("id", "")), ts, cmd, m.group(1) if m else None,
-                        bool(WRAPPER_RE.search(cmd)), bool(ALT_LOG_RE.search(cmd)))
+                        bool(WRAPPER_RE.search(code)), bool(ALT_LOG_RE.search(cmd)),
+                        origin_session=origin_session)
             unit.calls.append(call)
             pending[call.tool_use_id] = call
         elif SHELL_SEARCH_RE.search(cmd):
@@ -564,6 +634,36 @@ def finite_duration(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value) if math.isfinite(value) and value >= 0 else None
+
+
+def mark_copied_calls(sessions: list[Session]) -> int:
+    """Mark all but one Call per tool_use id across sessions as copies; return the count.
+
+    A continued or forked session starts a new transcript (new session id) holding a copy of
+    the earlier history, so one real invocation shows up in every copy, yet the query log has
+    one record for it. The copy kept is the one in the session named by the record's own
+    sessionId (copies keep the originating id); without that, the earliest-starting session.
+    Copies leave execution and measurement but stay in routing: the copied transcript also
+    carries the original's searches and reads, so dropping only the call would turn the
+    copying unit into a false "bypassed".
+    """
+    def rank(c: Call) -> tuple:
+        s = c.unit.session
+        return (c.origin_session != s.session_id,
+                s.first_ts or datetime.max.replace(tzinfo=timezone.utc), s.session_id)
+
+    by_id: dict[str, list[Call]] = {}
+    for s in sessions:
+        for u in s.units.values():
+            for c in u.calls:
+                if c.tool_use_id:
+                    by_id.setdefault(c.tool_use_id, []).append(c)
+    marked = 0
+    for copies in by_id.values():
+        for c in sorted(copies, key=rank)[1:]:
+            c.copy = True
+            marked += 1
+    return marked
 
 
 def match_records(calls: list[Call], records: list[dict]) -> None:
@@ -674,10 +774,13 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         s.repo = repo_of(s, resolver)
 
     organic = [s for s in sessions if not s.excluded]
-    all_calls = [c for s in sessions for u in s.units.values() for c in u.calls]
+    copied_calls = mark_copied_calls(sessions)
+    all_calls = [c for s in sessions for u in s.units.values() for c in u.calls if not c.copy]
     match_records(all_calls, records)
-    organic_calls = [c for s in organic for u in s.units.values() for c in u.calls if not c.alt_log]
-    alt_log_calls = sum(1 for s in organic for u in s.units.values() for c in u.calls if c.alt_log)
+    organic_calls = [c for s in organic for u in s.units.values() for c in u.calls
+                     if not c.alt_log and not c.copy]
+    alt_log_calls = sum(1 for s in organic for u in s.units.values() for c in u.calls
+                        if c.alt_log and not c.copy)
 
     # ---- stage 1: availability
     def post_hint(s: Session) -> bool:
@@ -749,7 +852,8 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     unlogged = [c for c in ok_calls if c.via_wrapper and c.record is None]
     wrapper_errors = [c for c in organic_calls if c.status == "wrapper-error"]
     def recovered(c: Call) -> bool:
-        return any(o.status == "ok" and o.ts and c.ts and o.ts >= c.ts for o in c.unit.calls)
+        return any(o.status == "ok" and o.ts and c.ts and o.ts >= c.ts
+                   for o in c.unit.calls if not o.copy)
 
     shell_errors = [c for c in organic_calls if c.status == "shell-error"]
     unrecovered = [c for c in shell_errors if not recovered(c)]
@@ -848,6 +952,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             "verdict": v3, "calls": len(organic_calls), "by_status": by_status,
             "logged": sum(1 for c in ok_calls if c.record is not None),
             "unlogged_ok_wrapper_calls": [c.unit.label for c in unlogged],
+            "copied_calls_excluded": copied_calls,
             "wrapper_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in wrapper_errors],
             "unrecovered_shell_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in unrecovered],
             "recovered_shell_errors": [f"{c.unit.label}: {c.command[:160]!r} -> {c.output[:160]!r}"
@@ -930,7 +1035,8 @@ def render(summary: dict) -> str:
         L += ["", f"**Bypassed (routing failures to investigate this week; largest {len(shown)} of "
                   f"{len(r['bypassed'])}, full list in the JSON summary):**", *[f"- {x}" for x in shown]]
     L += ["", "## 3 Execution", "",
-          f"- Calls: {e['calls']} by status {e['by_status']}; logged: {e['logged']}; bare CLI (outside wrapper): {e['bare_cli_calls']}",
+          f"- Calls: {e['calls']} by status {e['by_status']}; logged: {e['logged']}; bare CLI (outside wrapper): {e['bare_cli_calls']}; "
+          f"copies from continued/forked transcripts excluded: {e['copied_calls_excluded']}",
           f"- Test runs against a redirected GRAPHIFY_QUERY_LOG (not counted): {e['test_alt_log_calls']}"]
     for title, key in (("Completed wrapper calls with no log record", "unlogged_ok_wrapper_calls"),
                        ("Wrapper/query errors", "wrapper_errors"),

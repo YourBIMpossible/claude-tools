@@ -236,6 +236,80 @@ class Execution(FunnelCase):
         self.assertEqual(ex["verdict"], gf.FAIL)
         self.assertEqual(len(ex["wrapper_errors"]), 1)
 
+    def test_commands_that_only_mention_the_wrapper_are_not_calls(self):
+        # Reading, diffing, grepping, editing or committing the wrapper's source is not a
+        # graphify call; neither is prose about `graphify query` written by a heredoc.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": "sed -n 1,5p skills/graphify/scripts/query_reranked.py"}) \
+            .tool("Bash", {"command": "git diff a b -- skills/graphify/scripts/query_reranked.py"}) \
+            .tool("Bash", {"command": 'grep -n "Telemetry" skills/graphify/scripts/query_reranked.py'}) \
+            .tool("Bash", {"command": "python - <<'EOF'\ns = 'a bare `graphify query` CLI call'\nEOF"}) \
+            .tool("Bash", {"command": "pytest -q skills/graphify/scripts/test_query_reranked.py"}) \
+            .write(self.projects, "p", "s-mentions")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 0)
+        self.assertEqual(ex["unlogged_ok_wrapper_calls"], [])
+        self.assertEqual(ex["bare_cli_calls"], 0)
+
+    def test_wrapper_and_bare_cli_invocations_are_calls(self):
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'cd /x && py -3 .\\x\\query_reranked.py "q1" --budget 900'}) \
+            .tool("Bash", {"command": "/usr/bin/python3 -X utf8 '/x/query_reranked.py' \"q2\""}) \
+            .tool("Bash", {"command": 'cd backend && graphify query "q3"'}) \
+            .tool("PowerShell", {"command": '& ".\\x\\graphify.exe" explain "q4"'}) \
+            .write(self.projects, "p", "s-invocations")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 4)
+        self.assertEqual(ex["bare_cli_calls"], 2)
+        self.assertEqual(len(ex["unlogged_ok_wrapper_calls"]), 2)
+
+    def test_mentions_in_module_runs_messages_and_heredocs_are_not_calls(self):
+        # Review follow-up: `-m <module>` takes the path as an argument; prose lines inside a
+        # multi-line commit message or a heredoc body are not command positions.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": "python -m py_compile scripts/query_reranked.py"}) \
+            .tool("Bash", {"command": "python -m mypy query_reranked.py"}) \
+            .tool("Bash", {"command": 'git commit -m "run python query_reranked.py now"'}) \
+            .tool("Bash", {"command": 'git commit -m "x\n\ngraphify query is bypassed"'}) \
+            .tool("Bash", {"command": 'cat > n.md <<EOF\ngraphify query "x"\npython scripts/query_reranked.py "q"\nEOF'}) \
+            .tool("PowerShell", {"command": "$m = @'\ngraphify query \"x\"\n'@"}) \
+            .write(self.projects, "p", "s-mentions2")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 0)
+        self.assertEqual(ex["bare_cli_calls"], 0)
+
+    def test_quoted_paths_with_spaces_and_env_prefixes_are_calls(self):
+        Transcript(self.repo) \
+            .tool("Bash", {"command": r'python ".\A B\query_reranked.py" "q1"'}) \
+            .tool("PowerShell", {"command": r'& ".\Py Dir\python.exe" ".\A B\query_reranked.py" "q2"'}) \
+            .tool("Bash", {"command": 'GRAPHIFY_RERANK=1 python /x/query_reranked.py "q3"'}) \
+            .tool("Bash", {"command": 'FOO=1 graphify query "q4"'}) \
+            .write(self.projects, "p", "s-invocations2")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 4)
+        self.assertEqual(ex["bare_cli_calls"], 1)
+
+    def test_quotes_on_neighbouring_lines_do_not_hide_a_call(self):
+        # Review follow-up: a closing quote on one line and an opening quote on the next are
+        # not one multi-line string; an apostrophe in a comment opens nothing.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'cd "/x"\npython "/x/query_reranked.py" "q1"'}) \
+            .tool("Bash", {"command": "echo 'start'\npython '/x/query_reranked.py' 'q2'"}) \
+            .tool("Bash", {"command": 'Q="a"\npython /x/query_reranked.py "$Q"'}) \
+            .tool("Bash", {"command": 'echo "it\'s"\ngraphify query "q4"'}) \
+            .tool("Bash", {"command": "# don't\npython /x/query_reranked.py \"q5\"\necho 'done'"}) \
+            .write(self.projects, "p", "s-neighbours")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 5)
+        self.assertEqual(ex["bare_cli_calls"], 1)
+
+    def test_powershell_trailing_backslash_does_not_escape_the_quote(self):
+        # Review follow-up: PowerShell escapes with a backtick, so "x\" closes the string.
+        Transcript(self.repo) \
+            .tool("PowerShell", {"command": 'cd ".\\x\\"\npython "/x/query_reranked.py" "q"'}) \
+            .write(self.projects, "p", "s-ps-backslash")
+        self.assertEqual(self.run_funnel()["execution"]["calls"], 1)
+
     def test_test_runs_are_not_calls(self):
         Transcript(self.repo) \
             .tool("Bash", {"command": "python test_query_reranked.py"}) \
@@ -270,6 +344,48 @@ class OrganicSeparation(FunnelCase):
         t.write(self.projects, "p1", "s-dup")
         t.greps(1).write(self.projects, "p2", "s-dup")
         self.assertEqual(self.run_funnel()["sessions"]["total"], 1)
+
+    def _forked(self, logged: bool) -> dict:
+        # A continued/forked session copies the original's history under a new session id;
+        # the copied records keep the ORIGINAL sessionId. One invocation, one owner.
+        t = Transcript(self.repo).tool(
+            "Bash", {"command": 'python "/x/query_reranked.py" "forked q"'}, tool_id="toolu_fork")
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        # A fork sorts first by path, so path order alone would pick the wrong owner.
+        t.write(self.projects, "a-fork", "s-fork1")
+        t.write(self.projects, "b-orig", "s-orig")
+        t.write(self.projects, "c-fork", "s-fork2")
+        if logged:
+            self.log_record("forked q", T0 + timedelta(seconds=1))
+        return self.run_funnel()["execution"]
+
+    def test_call_copied_into_forked_sessions_counts_once(self):
+        ex = self._forked(logged=True)
+        self.assertEqual(ex["calls"], 1)
+        self.assertEqual(ex["logged"], 1)
+        self.assertEqual(ex["unlogged_ok_wrapper_calls"], [])
+        self.assertEqual(ex["copied_calls_excluded"], 2)
+
+    def test_copied_call_is_attributed_to_its_originating_session(self):
+        ex = self._forked(logged=False)
+        self.assertEqual(ex["unlogged_ok_wrapper_calls"], ["s-orig/main"])
+
+    def test_forked_exploration_session_is_not_a_false_bypass(self):
+        # Review follow-up: the fork also copies the original's searches and reads, so its
+        # copy of the call must still count for routing, only not for execution/measurement.
+        t = Transcript(self.repo).tool(
+            "Bash", {"command": 'python "/x/query_reranked.py" "fork q"'}, tool_id="toolu_fork2")             .greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "a-fork", "s-fork1")
+        t.write(self.projects, "b-orig", "s-orig")
+        self.log_record("fork q", T0 + timedelta(seconds=1))
+        out = self.run_funnel()
+        self.assertEqual(out["routing"]["bypassed"], [])
+        self.assertEqual(out["routing"]["verdict"], gf.PASS)
+        self.assertEqual(out["execution"]["calls"], 1)
+        self.assertEqual(out["execution"]["copied_calls_excluded"], 1)
 
     def test_repeated_tool_ids_are_counted_once(self):
         t = Transcript(self.repo)
