@@ -350,7 +350,7 @@ def test_env_home_and_parent_segments() -> None:
         return f.unresolved, f.outside, [t[1] for t in f.touches]
 
     forms = ["$HOME/x.py", "$R/a.py", "${R}/a.py", "$env:R/a.py", "%USERPROFILE%/a.py", "~/a.py", "~",
-             "src/$name/a.py"]
+             "src/$name/a.py", "C:foo.py", "D:sub/x.py"]
     for form in forms:
         for cwd in (WT, None):
             if form == "~":  # the shell parser does not extract a bare ~ as a path: no bucket at all

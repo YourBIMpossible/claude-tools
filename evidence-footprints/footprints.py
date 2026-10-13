@@ -137,6 +137,7 @@ def norm(raw: str, roots: Iterable[str]) -> str | None:
 
 UNRESOLVED = "<unresolved-dir>"  # a directory the command set but this parser cannot evaluate ($var, popd, bare cd)
 UNDETERMINED_RE = re.compile(r"\$|%[A-Za-z_][A-Za-z0-9_]*%")  # $VAR, ${VAR}, $env:VAR, %VAR%
+DRIVE_RELATIVE_RE = re.compile(r"^[A-Za-z]:(?![/\\])")  # C:foo is relative to drive C's own cwd
 PATH_HEAD_RE = re.compile(r"^(?:[A-Za-z]:/|//[^/]+/[^/]+(?:/|$)|/)")
 
 
@@ -147,7 +148,7 @@ def undetermined(raw: str) -> bool:
     path is neither inside nor outside the repository.
     """
     p = raw.strip().strip("'\"")
-    return p.startswith("~") or bool(UNDETERMINED_RE.search(p))
+    return p.startswith("~") or bool(UNDETERMINED_RE.search(p) or DRIVE_RELATIVE_RE.match(p))
 
 
 def collapse(raw: str) -> str | None:
