@@ -253,10 +253,10 @@ class Execution(FunnelCase):
 
     def test_wrapper_and_bare_cli_invocations_are_calls(self):
         Transcript(self.repo) \
-            .tool("Bash", {"command": 'cd /x && py -3 C:\\x\\query_reranked.py "q1" --budget 900'}) \
+            .tool("Bash", {"command": 'cd /x && py -3 .\\x\\query_reranked.py "q1" --budget 900'}) \
             .tool("Bash", {"command": "/usr/bin/python3 -X utf8 '/x/query_reranked.py' \"q2\""}) \
             .tool("Bash", {"command": 'cd backend && graphify query "q3"'}) \
-            .tool("PowerShell", {"command": '& "C:\\x\\graphify.exe" explain "q4"'}) \
+            .tool("PowerShell", {"command": '& ".\\x\\graphify.exe" explain "q4"'}) \
             .write(self.projects, "p", "s-invocations")
         ex = self.run_funnel()["execution"]
         self.assertEqual(ex["calls"], 4)
@@ -280,13 +280,27 @@ class Execution(FunnelCase):
 
     def test_quoted_paths_with_spaces_and_env_prefixes_are_calls(self):
         Transcript(self.repo) \
-            .tool("Bash", {"command": r'python "C:\Users\A B\query_reranked.py" "q1"'}) \
-            .tool("PowerShell", {"command": r'& "C:\Program Files\Py\python.exe" "C:\A B\query_reranked.py" "q2"'}) \
+            .tool("Bash", {"command": r'python ".\A B\query_reranked.py" "q1"'}) \
+            .tool("PowerShell", {"command": r'& ".\Py Dir\python.exe" ".\A B\query_reranked.py" "q2"'}) \
             .tool("Bash", {"command": 'GRAPHIFY_RERANK=1 python /x/query_reranked.py "q3"'}) \
             .tool("Bash", {"command": 'FOO=1 graphify query "q4"'}) \
             .write(self.projects, "p", "s-invocations2")
         ex = self.run_funnel()["execution"]
         self.assertEqual(ex["calls"], 4)
+        self.assertEqual(ex["bare_cli_calls"], 1)
+
+    def test_quotes_on_neighbouring_lines_do_not_hide_a_call(self):
+        # Review follow-up: a closing quote on one line and an opening quote on the next are
+        # not one multi-line string; an apostrophe in a comment opens nothing.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'cd "/x"\npython "/x/query_reranked.py" "q1"'}) \
+            .tool("Bash", {"command": "echo 'start'\npython '/x/query_reranked.py' 'q2'"}) \
+            .tool("Bash", {"command": 'Q="a"\npython /x/query_reranked.py "$Q"'}) \
+            .tool("Bash", {"command": 'echo "it\'s"\ngraphify query "q4"'}) \
+            .tool("Bash", {"command": "# don't\npython /x/query_reranked.py \"q5\"\necho 'done'"}) \
+            .write(self.projects, "p", "s-neighbours")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 5)
         self.assertEqual(ex["bare_cli_calls"], 1)
 
     def test_test_runs_are_not_calls(self):

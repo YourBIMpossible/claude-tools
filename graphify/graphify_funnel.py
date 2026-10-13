@@ -80,14 +80,49 @@ BARE_CLI_RE = re.compile(
 GRAPHIFY_CALL_RE = re.compile(f"{WRAPPER_RE.pattern}|{BARE_CLI_RE.pattern}", re.I | re.M)
 _HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n.*?^[ \t]*\2[ \t]*$", re.S | re.M)
 _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
-_MULTILINE_QUOTED_RE = re.compile(r"\"[^\"]*\n[^\"]*\"|'[^'\n]*\n[^']*'")
+
+
+def _blank_multiline_quotes(command: str) -> str:
+    """Replace each quoted string that spans a newline with "" (left-to-right quote pairing).
+
+    A regex would pair one line's closing quote with the next line's opening quote and blank
+    the real command between them, so quotes are paired by walking the string: `\\` escapes
+    the next character (inside "..." and outside quotes), and a `#` comment runs to end of
+    line, so an apostrophe in it opens nothing. An unclosed quote leaves the rest as is.
+    """
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "#" and (i == 0 or command[i - 1] in " \t\n;"):
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            out.append(command[i:end])
+            i = end
+        elif ch == "\\" and i + 1 < n:
+            out.append(command[i:i + 2])
+            i += 2
+        elif ch in "\"'":
+            j = i + 1
+            while j < n and command[j] != ch:
+                j += 2 if ch == '"' and command[j] == "\\" else 1
+            if j >= n:
+                out.append(command[i:])
+                break
+            span = command[i:j + 1]
+            out.append('""' if "\n" in span else span)
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def code_part(command: str) -> str:
     """The command with heredoc/here-string bodies and multi-line quoted strings blanked."""
     command = _HEREDOC_RE.sub("<<HEREDOC", command)
     command = _HERESTRING_RE.sub("@''@", command)
-    return _MULTILINE_QUOTED_RE.sub('""', command)
+    return _blank_multiline_quotes(command)
 
 
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use
