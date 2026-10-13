@@ -1,0 +1,44 @@
+#!/bin/sh
+# .githooks/pre-commit - secret scan of the STAGED diff (gitleaks), 2026-10-13.
+#
+# Closes the gap between "typed a key" and "pre-push / PR scan": a secret never enters a
+# local commit, so it never has to be purged from history. Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# Behavior:
+#   - A finding BLOCKS the commit (exit 1). Output is redacted; the value is never printed.
+#   - gitleaks not found: loud warning on stderr, commit proceeds (the pre-push / PR scan is
+#     the backstop). It is never a silent skip.
+#   - Emergency bypass, explicit and audited:  BIMP_SECRETS_BYPASS="<reason>" git commit ...
+#     appends a line to <git-common-dir>/secrets-bypass.log. `--no-verify` skips all hooks and
+#     leaves no trail; prefer the variable.
+# Resolution order for the binary: PATH, then F:\Claude-Tools\bin\gitleaks.exe.
+# Uses the repo's .gitleaks.toml when present (gitleaks also finds it by default).
+# POSIX sh, LF endings.
+
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-commit: not inside a git work tree" >&2; exit 1; }
+
+if [ -n "${BIMP_SECRETS_BYPASS:-}" ]; then
+    log="$(git rev-parse --git-common-dir)/secrets-bypass.log"
+    printf '%s pre-commit bypass: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BIMP_SECRETS_BYPASS" >> "$log"
+    echo "pre-commit: secret scan BYPASSED ($BIMP_SECRETS_BYPASS) - logged to $log" >&2
+    exit 0
+fi
+
+gl=$(command -v gitleaks 2>/dev/null || command -v gitleaks.exe 2>/dev/null || true)
+if [ -z "$gl" ]; then
+    for p in /f/Claude-Tools/bin/gitleaks.exe /mnt/f/Claude-Tools/bin/gitleaks.exe "F:/Claude-Tools/bin/gitleaks.exe"; do
+        if [ -x "$p" ]; then gl="$p"; break; fi
+    done
+fi
+if [ -z "$gl" ]; then
+    echo "pre-commit: WARNING gitleaks not found (PATH or F:/Claude-Tools/bin) - staged-secret scan SKIPPED" >&2
+    exit 0
+fi
+
+set -- git --staged --redact --no-banner --exit-code 1
+if [ -f "$repo/.gitleaks.toml" ]; then set -- "$@" --config "$repo/.gitleaks.toml"; fi
+if (cd "$repo" && "$gl" "$@") ; then exit 0; fi
+echo "pre-commit: gitleaks reported a staged secret. Unstage it and rotate the key if it was real." >&2
+echo "pre-commit: vetted false positive -> add a value-scoped allowlist entry to .gitleaks.toml, not a bypass." >&2
+exit 1
