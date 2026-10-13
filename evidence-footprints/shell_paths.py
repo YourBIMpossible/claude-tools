@@ -26,7 +26,9 @@ returned, never guessed at, so the caller can publish the miss rate.
 
 from __future__ import annotations
 
+import itertools
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 READ = {
@@ -184,6 +186,9 @@ class Segment:
     queries: list[str] = field(default_factory=list)
     miss_reason: str | None = None
     has_pathlike: bool = False
+    # Subshells enclosing the segment, outermost first, each a unique id within the command
+    # (``( ... )`` and ``$( ... )``). A cd inside one does not move segments outside it.
+    scope: tuple[int, ...] = ()
 
 
 def _is_absolute(p: str) -> bool:
@@ -621,10 +626,13 @@ def parse_segment(seg: str) -> Segment:
         git_base: str | None = None
         while j < len(args) and args[j].startswith("-"):
             if args[j] == "-C" and j + 1 < len(args):
-                # An argument the parser cannot evaluate (a variable) is kept as "$", unresolved.
-                d = _clean_arg(args[j + 1]) or "$"
-                # Successive -C options compose, as in git itself.
-                git_base = d if git_base is None or _is_absolute(d) else f"{git_base}/{d}"
+                raw_dir = args[j + 1].strip()
+                if raw_dir != ".":  # -C . leaves the directory as it is
+                    # '..' is the parent of the directory in effect; any other argument the
+                    # parser cannot evaluate (a variable, ~, /) is kept as "$", unresolved.
+                    d = ".." if raw_dir == ".." else _clean_arg(raw_dir) or "$"
+                    # Successive -C options compose, as in git itself.
+                    git_base = d if git_base is None or _is_absolute(d) else f"{git_base}/{d}"
             j += 2 if args[j] in {"-C", "-c", "--git-dir", "--work-tree"} else 1
         sub = args[j].lower() if j < len(args) else ""
         rest = args[j + 1:]
@@ -694,26 +702,61 @@ def parse_segment(seg: str) -> Segment:
     return s
 
 
+PLACEHOLDER_RE = re.compile(re.escape(SUB) + "|" + re.escape(BLOCK))
+
+
+def _parse_chunk(chunk: str, scope: tuple[int, ...], out: list[Segment], ids: Iterator[int],
+                 inherited_subs: list[str] | None = None) -> None:
+    """Append the chunk's segments to out in execution order.
+
+    A substitution or block runs where it stands: its segments come before the segment that
+    contains it, so each resolves against the working directory in effect at that position.
+    A substitution is a subshell (a scope of its own); a ``{ ... }`` block runs in the
+    current shell. ``inherited_subs`` are the substitutions already extracted from an
+    enclosing chunk whose placeholders sit inside this block."""
+    flat, subs = extract_subs(chunk)
+    if inherited_subs:
+        subs = inherited_subs  # the enclosing chunk already extracted every balanced group
+    flat, blocks, blocks_ok = extract_blocks(flat)
+    if not blocks_ok:
+        out.append(Segment(flat, None, "miss", miss_reason="unbalanced_block", has_pathlike=True, scope=scope))
+    segs, balanced = split_segments(flat)
+    parsed = [parse_segment(s) for s in segs]
+    if not balanced and parsed and parsed[-1].kind != "miss":
+        last = parsed[-1]
+        parsed[-1] = Segment(last.text, last.verb, "miss", last.paths, last.queries,
+                             "unbalanced_command", True)
+    sub_q, block_q = list(subs), list(blocks)
+
+    def run_sub(inner: str) -> None:
+        _parse_chunk(inner, scope + (next(ids),), out, ids)
+
+    def run_block(inner: str) -> None:
+        k = inner.count(SUB)
+        own, sub_q[:] = sub_q[:k], sub_q[k:]
+        _parse_chunk(inner, scope, out, ids, own)
+
+    for text, seg in zip(segs, parsed):
+        for m in PLACEHOLDER_RE.finditer(text):
+            if m.group(0) == SUB and sub_q:
+                run_sub(sub_q.pop(0))
+            elif m.group(0) == BLOCK and block_q:
+                run_block(block_q.pop(0))
+        seg.scope = scope
+        out.append(seg)
+    # Placeholders the segment split did not carry (none expected): parsed after, as before.
+    while block_q:
+        run_block(block_q.pop(0))
+    while sub_q:
+        run_sub(sub_q.pop(0))
+
+
 def parse_command(text: str) -> tuple[list[Segment], list[PathUse]]:
-    """Segments of a shell command (substitutions included), plus heredoc/here-string literals."""
+    """Segments of a shell command (substitutions included) in execution order, plus
+    heredoc/here-string literals."""
     body_free, bodies = strip_bodies(text)
     out: list[Segment] = []
-    queue = [body_free]
-    while queue:
-        chunk = queue.pop(0)
-        flat, inner = extract_subs(chunk)
-        queue.extend(inner)
-        flat, blocks, blocks_ok = extract_blocks(flat)
-        queue.extend(blocks)
-        if not blocks_ok:
-            out.append(Segment(flat, None, "miss", miss_reason="unbalanced_block", has_pathlike=True))
-        segs, balanced = split_segments(flat)
-        parsed = [parse_segment(s) for s in segs]
-        if not balanced and parsed and parsed[-1].kind != "miss":
-            last = parsed[-1]
-            parsed[-1] = Segment(last.text, last.verb, "miss", last.paths, last.queries,
-                                 "unbalanced_command", True)
-        out.extend(parsed)
+    _parse_chunk(body_free, (), out, itertools.count(1))
     script = [PathUse(lit, "script", "heredoc") for line in bodies
               for _, lit in LITERAL_RE.findall(line) if is_pathlike(lit)]
     return out, script

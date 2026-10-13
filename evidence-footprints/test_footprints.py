@@ -370,6 +370,48 @@ def test_env_home_and_parent_segments() -> None:
     check(counts(bash("cat //server/share/a.py")) == (0, 1, []), "a UNC path stays outside")
 
 
+def test_block_and_subshell_cwd_scope() -> None:
+    """SA-17: a ``{ ... }`` block's paths resolve against the cwd at the block's position, a
+    block's cd carries on (a group runs in the current shell), and a subshell's cd does not leak.
+    SA-18: ``git -C .`` is the cwd and ``git -C ..`` its parent; ``~`` and ``/`` stay unresolved."""
+    def fp(cmd: str, cwd: str | None = WT) -> fpm.Footprint:
+        c = call(1, "Bash", {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def counts(f: fpm.Footprint) -> tuple[int, int, list[str]]:
+        return f.unresolved, f.outside, [t[1] for t in f.touches]
+
+    check(paths("{ cat a.py; } && cd src") == [("read", "a.py"), ("nav", "src")],
+          "a block's paths come in command order, before a later cd")
+    check(counts(fp("{ cat a.py; } && cd /srv/other-repo")) == (0, 1, ["a.py"]),
+          "a later outer cd does not move paths inside an earlier block")
+    check(counts(fp("{ cd src; } && cat a.py")) == (0, 0, ["src/a.py"]),
+          "a cd inside a block moves later outer segments (same shell)")
+    check(counts(fp("cd src && { cat a.py; }")) == (0, 0, ["src/a.py"]),
+          "a block resolves against an earlier outer cd")
+    check(counts(fp("(cd /srv/other-repo; cat x.py) && cat a.py")) == (0, 2, ["a.py"]),
+          "a subshell's cd does not leak to later outer segments")
+    check(counts(fp("(cd /srv/other-repo) && { cat a.py; }")) == (0, 1, ["a.py"]),
+          "a subshell's cd does not leak into a later block")
+    check(counts(fp("(cd src; cat a.py); cat b.py")) == (0, 0, ["src/a.py", "b.py"]),
+          "inside the subshell its cd applies; after it, the outer cwd")
+    check(counts(fp("cd src && (cat a.py)")) == (0, 0, ["src/a.py"]),
+          "a subshell inherits the cwd in effect at its position")
+    check(counts(fp("{ cat $(cd /srv/other-repo; echo x) a.py; }")) == (0, 1, ["a.py"]),
+          "a command substitution inside a block does not leak its cd")
+    check(counts(fp("git -C . add src/a.py")) == (0, 0, ["src/a.py"]), "git -C . is the cwd")
+    check(counts(fp("git -C . add src/a.py", None)) == (0, 0, ["src/a.py"]),
+          "git -C . with no recorded cwd keeps the historical reading")
+    check(counts(fp("git -C .. add docs/n.md", WT + "/src")) == (0, 0, ["docs/n.md"]),
+          "git -C .. is the cwd's parent")
+    check(counts(fp("git -C src -C .. add a.py")) == (0, 0, ["a.py"]), "git -C .. composes with an earlier -C")
+    check(counts(fp("git -C .. add a.py", None)) == (1, 0, []), "git -C .. with no cwd is unresolved, not outside")
+    check(counts(fp("git -C ~ add a.py")) == (1, 0, []), "git -C ~ stays unresolved, never inside or outside")
+    check(counts(fp("git -C / add a.py")) == (1, 0, []), "git -C / stays unresolved, never inside or outside")
+
+
 def main() -> int:
     test_shell_paths()
     test_powershell_assignment_and_foreach()
@@ -377,6 +419,7 @@ def main() -> int:
     test_repo_aware_relative_paths()
     test_unresolved_paths_are_not_outside()
     test_env_home_and_parent_segments()
+    test_block_and_subshell_cwd_scope()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
