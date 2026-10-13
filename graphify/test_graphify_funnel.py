@@ -332,7 +332,7 @@ class Execution(FunnelCase):
             .tool("Bash", {"command": "echo 'x;y' | python /x/query_reranked.py \"q2\""}) \
             .tool("Bash", {"command": 'out="$(graphify query "q3" | head -1)"'}) \
             .tool("PowerShell", {"command": "Get-Content 'a|b'; graphify explain \"q4\""}) \
-            .tool("PowerShell", {"command": r'& "C:\Program Files (x86)\python.exe" C:/x/query_reranked.py "q5"'}) \
+            .tool("PowerShell", {"command": r'& ".\Program Files (x86)\python.exe" ./x/query_reranked.py "q5"'}) \
             .write(self.projects, "p", "s-real-separators")
         ex = self.run_funnel()["execution"]
         self.assertEqual(ex["calls"], 5)
