@@ -135,6 +135,76 @@ def norm(raw: str, roots: Iterable[str]) -> str | None:
     return p if p and p not in {".", ".."} and not p.startswith("../") else None
 
 
+UNRESOLVED = "<unresolved-dir>"  # a directory the command set but this parser cannot evaluate ($var, popd, bare cd)
+UNDETERMINED_RE = re.compile(r"\$|%[A-Za-z_][A-Za-z0-9_]*%")  # $VAR, ${VAR}, $env:VAR, %VAR%
+DRIVE_RELATIVE_RE = re.compile(r"^[A-Za-z]:(?![/\\])")  # C:foo is relative to drive C's own cwd
+PATH_HEAD_RE = re.compile(r"^(?:[A-Za-z]:/|//[^/]+/[^/]+(?:/|$)|/)")
+
+
+def undetermined(raw: str) -> bool:
+    """A path whose value depends on the environment (variables, the home directory).
+
+    Footprints are computed from recorded transcripts, so the value is unknown: such a
+    path is neither inside nor outside the repository.
+    """
+    p = raw.strip().strip("'\"")
+    return p.startswith("~") or bool(UNDETERMINED_RE.search(p) or DRIVE_RELATIVE_RE.match(p))
+
+
+def collapse(raw: str) -> str | None:
+    """'.' and '..' segments removed; None when a '..' climbs above the path's start.
+
+    A relative path cannot climb above its start without a known base directory, and an
+    absolute one cannot climb above its root: either way the target is undetermined.
+    """
+    p = raw.replace("\\", "/").strip().strip("'\"")
+    head = m.group(0) if (m := PATH_HEAD_RE.match(p)) else ""
+    parts: list[str] = []
+    for seg in p[len(head):].split("/"):
+        if seg in {"", "."}:
+            continue
+        if seg == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(seg)
+    if head and not head.endswith("/"):
+        head += "/"
+    return head + "/".join(parts) if head or parts else "."
+
+
+def _join_dir(d: str | None, cwd: str | None) -> str | None:
+    """d made absolute against cwd; UNRESOLVED when it cannot be."""
+    if d is None:
+        return cwd
+    if cwd == UNRESOLVED or "$" in d or "%" in d:
+        return UNRESOLVED if not sp._is_absolute(d) or d.startswith("$") else d
+    if sp._is_absolute(d):
+        return d
+    return f"{cwd.replace(chr(92), '/').rstrip('/')}/{d}" if cwd else UNRESOLVED
+
+
+def resolve(raw: str, base: str | None, cwd: str | None) -> str | None:
+    """A shell path argument made absolute against the directory the command ran in.
+
+    Relative arguments resolve against an explicit command base (git -C) and then the
+    working directory in effect (the call's recorded cwd as moved by earlier cd segments),
+    so a relative name under another repository is never read as this repository's file.
+    Returns None when that directory cannot be determined: such a path is not attributed
+    to the repository. Absolute arguments are returned unchanged, and with no recorded cwd
+    a relative path keeps the historical repo-relative reading.
+    """
+    if sp._is_absolute(raw):
+        return raw
+    if cwd is None and base is None:
+        return raw
+    d = _join_dir(base, cwd)
+    if d == UNRESOLVED or (d is not None and d.startswith(("$", "~"))):
+        return None
+    return f"{d.replace(chr(92), '/').rstrip('/')}/{raw}" if d else raw
+
+
 def ref_path(ref: str) -> str:
     m = REF_RE.match(ref.replace("\\", "/"))
     return m.group(1) if m else ref
@@ -169,7 +239,8 @@ class Footprint:
         self.unparsed: list[dict] = []
         self.facts: dict[str, dict] = {}
         self.delegated = False
-        self.outside = 0  # path arguments outside this repository (other repos, scratch, home)
+        self.outside = 0  # path arguments proven outside this repository (other repos, scratch, home)
+        self.unresolved = 0  # path arguments whose location could not be determined (cwd, $VAR, ~, '..')
         for idx, call in enumerate(self.calls):
             self._call(idx, call)
 
@@ -178,7 +249,12 @@ class Footprint:
         self.facts.setdefault(fid, {"id": fid, "kind": kind, "value": value})
 
     def _touch(self, idx: int, raw: str, role: str, *, edit: bool = False, native: bool) -> None:
-        p = norm(raw, self.roots)
+        full = None if undetermined(raw) else collapse(raw)
+        if full is None:
+            # Undetermined, not known outside: never classified as outside_repo.
+            self.unresolved += 1
+            return
+        p = norm(full, self.roots)
         if p is None:
             self.outside += 1
             return
@@ -210,6 +286,7 @@ class Footprint:
                 self._touch(idx, inp["path"], "search", native=True)
         elif name in SHELL_TOOLS and isinstance(inp.get("command"), str):
             segments, script = sp.parse_command(inp["command"])
+            wd: str | None = call.get("cwd")
             for seg in segments:
                 self.shell_segments += 1
                 if seg.has_pathlike or seg.kind == "miss":
@@ -223,7 +300,17 @@ class Footprint:
                     self.queries.append((idx, seg.text))
                 for use in seg.paths:
                     edit = use.role == "write" and use.verb != "git"
-                    self._touch(idx, use.path, use.role, edit=edit, native=False)
+                    target = None if undetermined(use.path) else resolve(use.path, use.base, wd)
+                    if target is None:
+                        # Undetermined, not known outside: never classified as outside_repo.
+                        self.unresolved += 1
+                        continue
+                    self._touch(idx, target, use.role, edit=edit, native=False)
+                if seg.kind == "nav":
+                    # Later segments run in the new directory; one this parser cannot evaluate
+                    # (cd -, popd, a variable) leaves later relative paths unattributed.
+                    dest = seg.paths[0].path if seg.paths and seg.verb not in {"popd", "pop-location"} else None
+                    wd = UNRESOLVED if dest is None or dest == "-" else _join_dir(dest, wd if wd is not None else UNRESOLVED)
             for use in script:
                 self._touch(idx, use.path, "script", native=False)
 
@@ -412,7 +499,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
     pool: list[dict] = []
     status_counts: Counter = Counter()
     miss_reasons: Counter = Counter()
-    segs = pathlike = outside = 0
+    segs = pathlike = outside = unresolved = 0
     scored: list[tuple[dict, dict, Footprint, tuple]] = []
 
     for row in sorted(rows, key=lambda r: r["packet_id"]):
@@ -439,6 +526,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
         segs += fp.shell_segments
         pathlike += fp.shell_pathlike
         outside += fp.outside
+        unresolved += fp.unresolved
         for u in fp.unparsed:
             miss_reasons[str(u["reason"]).split(" ", 1)[0] if u["reason"] else "None"] += 1
             unparsed.append({"packet_id": pid, **u})
@@ -485,7 +573,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
                       "touched": len(fp.touched), "edited": len(fp.edited),
                       "searches": len(fp.queries), "calls": len(fp.calls),
                       "shell_segments": fp.shell_segments, "shell_unparsed": len(fp.unparsed),
-                      "outside_repo": fp.outside},
+                      "outside_repo": fp.outside, "unresolved": fp.unresolved},
             "metrics": m, "baseline": baseline,
             "brief_items": sum(1 for it in b["ranked"] if it["selected"]),
             "brief_items_touched": sum(1 for it in b["ranked"]
@@ -523,6 +611,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
         "status": dict(sorted(status_counts.items())),
         "parse": {"shell_segments": segs, "segments_with_paths": pathlike,
                   "unparsed": len(unparsed), "paths_outside_repo": outside,
+                  "paths_unresolved": unresolved,
                   "miss_rate": round(len(unparsed) / pathlike, 4) if pathlike else None,
                   "reasons": dict(sorted(miss_reasons.items()))},
         "overall": aggregate(scored_rows),
@@ -555,7 +644,9 @@ def render_md(s: dict) -> str:
              f"Shell parse: {s['parse']['unparsed']} of {s['parse']['segments_with_paths']} path-bearing "
              f"segments unattributed (miss rate {_fmt(s['parse']['miss_rate'])}). "
              f"{s['parse']['paths_outside_repo']} path arguments fell outside the brief's repository "
-             "(other repos, scratch, home) and are not scored.", "",
+             "(other repos, scratch, home) and are not scored. "
+             f"{s['parse'].get('paths_unresolved', 0)} path arguments could not be resolved to a working "
+             "directory and were not classified.", "",
              "Means; `n` counts episodes where the metric is defined. Lift is actual minus the "
              "shuffled same-repo baseline.", "",
              "| slice | n | " + " | ".join(cols) + " | hit lift | gap lift |",

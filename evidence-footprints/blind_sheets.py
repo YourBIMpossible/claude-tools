@@ -160,7 +160,8 @@ def render_sheet(blind_id: str, row: dict, fp: fpm.Footprint, texts: list[str] |
         if p not in edited:
             first_touch.setdefault(p, (idx, role))
     out += [f"- `{p}` ({r}, {i})" for p, (i, r) in sorted(first_touch.items())] or ["- (none)"]
-    out += ["", f"Paths outside this repository (not scored): {fp.outside}", ""]
+    out += ["", f"Paths outside this repository (not scored): {fp.outside}",
+            f"Paths whose working directory could not be resolved (not classified): {fp.unresolved}", ""]
     return "\n".join(out)
 
 
