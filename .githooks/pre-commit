@@ -12,7 +12,7 @@
 #   - Emergency bypass, explicit and audited:  BIMP_SECRETS_BYPASS="<reason>" git commit ...
 #     appends a line to <git-common-dir>/secrets-bypass.log. `--no-verify` skips all hooks and
 #     leaves no trail; prefer the variable.
-# Resolution order for the binary: PATH, then F:\Claude-Tools\bin\gitleaks.exe.
+# Resolution order for the binary: $GITLEAKS_BIN, then PATH.
 # Uses the repo's .gitleaks.toml when present (gitleaks also finds it by default).
 # POSIX sh, LF endings.
 
@@ -25,14 +25,10 @@ if [ -n "${BIMP_SECRETS_BYPASS:-}" ]; then
     exit 0
 fi
 
-gl=$(command -v gitleaks 2>/dev/null || command -v gitleaks.exe 2>/dev/null || true)
+gl="${GITLEAKS_BIN:-}"
+[ -n "$gl" ] || gl=$(command -v gitleaks 2>/dev/null || command -v gitleaks.exe 2>/dev/null || true)
 if [ -z "$gl" ]; then
-    for p in /f/Claude-Tools/bin/gitleaks.exe /mnt/f/Claude-Tools/bin/gitleaks.exe "F:/Claude-Tools/bin/gitleaks.exe"; do
-        if [ -x "$p" ]; then gl="$p"; break; fi
-    done
-fi
-if [ -z "$gl" ]; then
-    echo "pre-commit: WARNING gitleaks not found (PATH or F:/Claude-Tools/bin) - staged-secret scan SKIPPED" >&2
+    echo "pre-commit: WARNING gitleaks not found (GITLEAKS_BIN or PATH) - staged-secret scan SKIPPED" >&2
     exit 0
 fi
 
