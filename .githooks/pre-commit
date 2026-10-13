@@ -7,8 +7,8 @@
 #
 # Behavior:
 #   - A finding BLOCKS the commit (exit 1). Output is redacted; the value is never printed.
-#   - gitleaks not found: loud warning on stderr, commit proceeds (the pre-push / PR scan is
-#     the backstop). It is never a silent skip.
+#   - gitleaks missing or failing to run: loud warning on stderr, commit proceeds (the pre-push /
+#     PR scan is the backstop). It is never a silent skip.
 #   - Emergency bypass, explicit and audited:  BIMP_SECRETS_BYPASS="<reason>" git commit ...
 #     appends a line to <git-common-dir>/secrets-bypass.log. `--no-verify` skips all hooks and
 #     leaves no trail; prefer the variable.
@@ -32,9 +32,21 @@ if [ -z "$gl" ]; then
     exit 0
 fi
 
-set -- git --staged --redact --no-banner --exit-code 1
+# gitleaks >= 8.19 spells it `git --staged`; the 8.18.x line (pinned by the BIMpossible repos)
+# only has `protect --staged`. Detect which one this binary has instead of assuming.
+if "$gl" git --help >/dev/null 2>&1; then set -- git --staged; else set -- protect --staged; fi
+# A finding exits 77 so it cannot be confused with a gitleaks runtime error (exit 1).
+set -- "$@" --redact --no-banner --exit-code 77
 if [ -f "$repo/.gitleaks.toml" ]; then set -- "$@" --config "$repo/.gitleaks.toml"; fi
-if (cd "$repo" && "$gl" "$@") ; then exit 0; fi
-echo "pre-commit: gitleaks reported a staged secret. Unstage it and rotate the key if it was real." >&2
-echo "pre-commit: vetted false positive -> add a value-scoped allowlist entry to .gitleaks.toml, not a bypass." >&2
-exit 1
+(cd "$repo" && "$gl" "$@")
+rc=$?
+case "$rc" in
+    0) exit 0 ;;
+    77)
+        echo "pre-commit: gitleaks reported a staged secret. Unstage it and rotate the key if it was real." >&2
+        echo "pre-commit: vetted false positive -> add a value-scoped allowlist entry to .gitleaks.toml, not a bypass." >&2
+        exit 1 ;;
+    *)
+        echo "pre-commit: WARNING gitleaks failed to run (exit $rc) - staged-secret scan SKIPPED" >&2
+        exit 0 ;;
+esac
