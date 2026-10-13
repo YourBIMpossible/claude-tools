@@ -287,7 +287,16 @@ class Footprint:
         elif name in SHELL_TOOLS and isinstance(inp.get("command"), str):
             segments, script = sp.parse_command(inp["command"])
             wd: str | None = call.get("cwd")
+            scope: tuple[int, ...] = ()
+            entered: list[tuple[tuple[int, ...], str | None]] = []  # (enclosing scope, its cwd)
             for seg in segments:
+                # A subshell starts in the directory in effect where it stands; its own cd
+                # ends with it, so the enclosing segments resume in their directory.
+                while scope and seg.scope[:len(scope)] != scope:
+                    scope, wd = entered.pop()
+                if seg.scope != scope:
+                    entered.append((scope, wd))
+                    scope = seg.scope
                 self.shell_segments += 1
                 if seg.has_pathlike or seg.kind == "miss":
                     self.shell_pathlike += 1
