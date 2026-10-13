@@ -236,6 +236,33 @@ class Execution(FunnelCase):
         self.assertEqual(ex["verdict"], gf.FAIL)
         self.assertEqual(len(ex["wrapper_errors"]), 1)
 
+    def test_commands_that_only_mention_the_wrapper_are_not_calls(self):
+        # Reading, diffing, grepping, editing or committing the wrapper's source is not a
+        # graphify call; neither is prose about `graphify query` written by a heredoc.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": "sed -n 1,5p skills/graphify/scripts/query_reranked.py"}) \
+            .tool("Bash", {"command": "git diff a b -- skills/graphify/scripts/query_reranked.py"}) \
+            .tool("Bash", {"command": 'grep -n "Telemetry" skills/graphify/scripts/query_reranked.py'}) \
+            .tool("Bash", {"command": "python - <<'EOF'\ns = 'a bare `graphify query` CLI call'\nEOF"}) \
+            .tool("Bash", {"command": "pytest -q skills/graphify/scripts/test_query_reranked.py"}) \
+            .write(self.projects, "p", "s-mentions")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 0)
+        self.assertEqual(ex["unlogged_ok_wrapper_calls"], [])
+        self.assertEqual(ex["bare_cli_calls"], 0)
+
+    def test_wrapper_and_bare_cli_invocations_are_calls(self):
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'cd /x && py -3 C:\\x\\query_reranked.py "q1" --budget 900'}) \
+            .tool("Bash", {"command": "/usr/bin/python3 -X utf8 '/x/query_reranked.py' \"q2\""}) \
+            .tool("Bash", {"command": 'cd backend && graphify query "q3"'}) \
+            .tool("PowerShell", {"command": '& "C:\\x\\graphify.exe" explain "q4"'}) \
+            .write(self.projects, "p", "s-invocations")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 4)
+        self.assertEqual(ex["bare_cli_calls"], 2)
+        self.assertEqual(len(ex["unlogged_ok_wrapper_calls"]), 2)
+
     def test_test_runs_are_not_calls(self):
         Transcript(self.repo) \
             .tool("Bash", {"command": "python test_query_reranked.py"}) \
@@ -270,6 +297,32 @@ class OrganicSeparation(FunnelCase):
         t.write(self.projects, "p1", "s-dup")
         t.greps(1).write(self.projects, "p2", "s-dup")
         self.assertEqual(self.run_funnel()["sessions"]["total"], 1)
+
+    def _forked(self, logged: bool) -> dict:
+        # A continued/forked session copies the original's history under a new session id;
+        # the copied records keep the ORIGINAL sessionId. One invocation, one owner.
+        t = Transcript(self.repo).tool(
+            "Bash", {"command": 'python "/x/query_reranked.py" "forked q"'}, tool_id="toolu_fork")
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        # A fork sorts first by path, so path order alone would pick the wrong owner.
+        t.write(self.projects, "a-fork", "s-fork1")
+        t.write(self.projects, "b-orig", "s-orig")
+        t.write(self.projects, "c-fork", "s-fork2")
+        if logged:
+            self.log_record("forked q", T0 + timedelta(seconds=1))
+        return self.run_funnel()["execution"]
+
+    def test_call_copied_into_forked_sessions_counts_once(self):
+        ex = self._forked(logged=True)
+        self.assertEqual(ex["calls"], 1)
+        self.assertEqual(ex["logged"], 1)
+        self.assertEqual(ex["unlogged_ok_wrapper_calls"], [])
+        self.assertEqual(ex["copied_calls_dropped"], 2)
+
+    def test_copied_call_is_attributed_to_its_originating_session(self):
+        ex = self._forked(logged=False)
+        self.assertEqual(ex["unlogged_ok_wrapper_calls"], ["s-orig/main"])
 
     def test_repeated_tool_ids_are_counted_once(self):
         t = Transcript(self.repo)
