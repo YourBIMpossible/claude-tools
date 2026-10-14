@@ -507,7 +507,8 @@ def review_episode(stores: Stores, m: dict[str, Any], inputs: ReviewInputs | Non
             try:
                 out["causal_deletion"] = verified_delete(stores, "causal", ep, f"excluded:{reason}")
             except StoreError as exc:
-                out["error"] = str(exc)
+                # a snapshot deletion error above is kept, never replaced
+                out["error"] = f"{out['error']}; {exc}" if out.get("error") else str(exc)
                 log_line(stores, f"review {ep}: causal state deletion not verified: {exc}")
             touched.append(stores.meta / "DELETIONS.log")
     elif state == "held":
@@ -702,8 +703,14 @@ def expire(stores: Stores, *, now: str | None = None, commit: bool = True) -> di
         counts["deletions_verified"] += int(rec["verified"])
         touched.append(stores.meta / "DELETIONS.log")
         if m is not None:
-            m.setdefault("retention", {}).update(deleted_at=rec["deleted_at"], deleted_kind=kind,
-                                                 deletion_verified=rec["verified"])
+            # one pass can delete an episode's payloads, snapshots and causal states: each is
+            # kept under ``deletions``; ``deleted_kind``/``deleted_at`` name the latest and
+            # ``deletion_verified`` holds only when every recorded deletion verified
+            ret = m.setdefault("retention", {})
+            dels = ret.setdefault("deletions", {})
+            dels[kind] = {"deleted_at": rec["deleted_at"], "verified": rec["verified"]}
+            ret.update(deleted_at=rec["deleted_at"], deleted_kind=kind,
+                       deletion_verified=all(d["verified"] for d in dels.values()))
             write_manifest(stores, m)
             touched.append(mp)
     if touched and commit:

@@ -42,9 +42,9 @@ def _hashed(fps: dict[str, str]) -> dict[str, str]:
     return {path_sha256(k): v for k, v in sorted(fps.items())}
 
 
-def _save_worktrees(base: Path, side: str, root: Path) -> dict[str, str]:
+def _save_worktrees(base: Path, side: str, root: Path, timeout: float = 30.0) -> dict[str, str]:
     """Private per-worktree evidence (paths) to the content store; hashed fingerprints back."""
-    recs = causal.worktree_records(root)
+    recs = causal.worktree_records(root, timeout=timeout)
     shared = causal.shared_git_state(root)
     base.mkdir(parents=True, exist_ok=True)
     (base / f"worktrees-{side}.json").write_bytes(
@@ -73,21 +73,31 @@ def start(root: Path, ep: str, content: Path, *, remaining_s: float) -> dict[str
         out["errors"].append("causal:start:skipped_budget")
         return out
     t0 = time.perf_counter()
+
+    def left() -> float:
+        # every step, not only the overlay, spends the hook's start budget
+        return remaining_s - (time.perf_counter() - t0)
+
     pending: dict[str, Any] = {}
     try:
         pending = causal.tool_versions_async()
         out["unsupported_start"] = causal.unsupported_state(root, lfs_scan=False)
-        out["worktrees_start"] = _save_worktrees(causal_dir(content, ep), "start", root)
+        out["worktrees_start"] = _save_worktrees(causal_dir(content, ep), "start", root,
+                                                 timeout=max(0.2, left()))
         dest = causal_dir(content, ep) / "start"
-        timeout = max(0.2, remaining_s - (time.perf_counter() - t0))
-        out["start"] = _state_summary(dest, causal.capture_overlay(
-            root, dest, label="start", timeout=timeout, bytes_deadline=time.monotonic() + timeout * 0.6))
+        if left() < START_MIN_REMAINING_S:
+            out["errors"].append("causal:start:skipped_budget")
+        else:
+            timeout = left()
+            out["start"] = _state_summary(dest, causal.capture_overlay(
+                root, dest, label="start", timeout=timeout, bytes_deadline=time.monotonic() + timeout * 0.6))
     except Exception as exc:  # noqa: BLE001 — fail-open: the reason is the record
         out["errors"].append(_reason("start", exc))
     finally:
         if pending:
             try:
-                out["tools_start"] = causal.collect_tool_versions(pending, TOOLS_WAIT_S)
+                # the probes started at t0 run beside the steps above; the wait is bounded by what is left
+                out["tools_start"] = causal.collect_tool_versions(pending, min(TOOLS_WAIT_S, max(0.1, left())))
             except Exception as exc:  # noqa: BLE001
                 out["errors"].append(_reason("tools_start", exc))
     out["start_ms"] = int((time.perf_counter() - t0) * 1000)
