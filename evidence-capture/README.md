@@ -206,13 +206,16 @@ with `HOME`, `USERPROFILE` and `TEMP` pointed into the test directory.
 The runner contract is one script per suite: `python <test file>` exits non-zero on any failure.
 The platform-neutral suites run in CI (`gates`, Ubuntu) and in `tools/release-check.ps1`:
 `tests/test_capture.py`, `tests/test_locks.py`, `tests/test_identity.py`, `tests/test_review.py`,
-`tests/test_host_probe.py`, plus `evidence-footprints/` and `evidence-twin/`.
+`tests/test_snapshot.py`, `tests/test_causal.py`, `tests/test_host_probe.py`, plus
+`evidence-footprints/` and `evidence-twin/`.
 
-Three suites are pinned to the Windows host and are run locally before a change to capture,
-hooks, backstop or clone code lands:
+Four suites are pinned to the Windows host and are run locally before a change to capture,
+hooks, backstop or clone code lands (`test_causal_hooks.py` builds on the `test_hooks.py`
+fixtures):
 
 ```
 python evidence-capture/tests/test_hooks.py
+python evidence-capture/tests/test_causal_hooks.py
 python evidence-capture/tests/test_backstop.py
 python evidence-capture/tests/test_clone.py
 ```

@@ -56,6 +56,7 @@ Step "evidence-capture lock tests" { python evidence-capture/tests/test_locks.py
 Step "evidence-capture identity tests" { python evidence-capture/tests/test_identity.py }
 Step "evidence-capture review tests" { python evidence-capture/tests/test_review.py }
 Step "evidence-capture snapshot tests" { python evidence-capture/tests/test_snapshot.py }
+Step "evidence-capture causal-state tests" { python evidence-capture/tests/test_causal.py }
 Step "evidence-capture host-probe tests" { python evidence-capture/tests/test_host_probe.py }
 Step "evidence-footprints tests" { python evidence-footprints/test_footprints.py }
 Step "evidence-footprints blind-sheet tests" { python evidence-footprints/test_blind_sheets.py }

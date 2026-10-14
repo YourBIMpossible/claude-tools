@@ -34,6 +34,27 @@ PASSED: list[str] = []
 FAILED: list[str] = []
 AGENT_ID = "a1b2c3d4e5f6a7b8c"
 
+# The hook wall-clock budgets (start 2 s, ends 20 s / 8 s) are product behaviour, asserted
+# in-process below (skipped_budget, bytes budget). Under machine load a subprocess hook can
+# overrun them, which records partial / skipped_budget errors these attribution tests never
+# meant to exercise, so here the hooks run with budgets far above any load.
+UNBUDGETED_S = 120
+_UNBUDGETED_SHIM = (
+    "import runpy, sys; sys.path.insert(0, sys.argv[1]); import causal_hooks, pipeline; "
+    "s = float(sys.argv[3]); pipeline.START_BUDGET_MS = s * 1000; pipeline.END_BUDGET_S = s; "
+    "causal_hooks.END_BUDGET_S = s; sys.argv = sys.argv[2:3]; "
+    "runpy.run_path(sys.argv[0], run_name='__main__')"
+)
+
+
+def run_hook_unbudgeted(script: str, payload: dict | bytes, env: dict[str, str]) -> tuple[int, bytes, float]:
+    """``dryrun.run_hook`` with the hook budgets raised to ``UNBUDGETED_S``."""
+    data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+    t0 = time.perf_counter()
+    proc = subprocess.run([sys.executable, "-c", _UNBUDGETED_SHIM, str(PKG), str(PKG / script), str(UNBUDGETED_S)],
+                          input=data, capture_output=True, env=env, timeout=UNBUDGETED_S * 2)
+    return proc.returncode, proc.stdout, (time.perf_counter() - t0) * 1000
+
 
 def git(repo: Path, *args: str) -> str:
     env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t",
@@ -410,6 +431,7 @@ TESTS = [test_freeze_register_admit, test_start_end_preserved_and_attributed, te
 
 def main() -> int:
     only = sys.argv[1:]
+    dryrun.run_hook = run_hook_unbudgeted  # Fixture (test_hooks) calls the hooks through it
     with tempfile.TemporaryDirectory(prefix="ec-causal-hooks-") as tmp:
         for fn in TESTS:
             if only and fn.__name__ not in only:
