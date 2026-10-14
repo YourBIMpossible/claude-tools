@@ -284,9 +284,12 @@ def _overlay_candidates(top: Path, timeout: float) -> tuple[list[str], set[str]]
 
 
 def _conversion(top: Path) -> dict[str, str | None]:
-    """The effective (last-wins) value of each ``CONVERSION_KEYS`` setting, or None."""
+    """The effective (last-wins) value of each ``CONVERSION_KEYS`` setting, or None.
+    Raises CausalError when git cannot read the configuration (rc 1 is "no match")."""
     proc = subprocess.run(["git", "-C", str(top), "config", "-z", "--get-regexp", r"^core\.(autocrlf|eol|safecrlf)$"],
                           capture_output=True, env=git_env(), timeout=10)
+    if proc.returncode not in (0, 1):
+        raise CausalError(f"git_config_unreadable: rc {proc.returncode}")
     out: dict[str, str | None] = dict.fromkeys(CONVERSION_KEYS)
     for rec in proc.stdout.decode("utf-8", "replace").split("\0"):
         key, _, value = rec.partition("\n")
@@ -622,7 +625,7 @@ def unsupported_state(repo: Path, *, lfs_scan: bool = True) -> list[str]:
         reasons.append("sparse_checkout")
     if any((gitdir / name).exists() for name in STATE_FILES):
         reasons.append("operation_in_progress")
-    lfs = False
+    lfs = unread = False
     rels = list_paths(repo) if lfs_scan else [
         name for e in entries
         if (name := e.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")).rsplit("/", 1)[-1] == ".gitattributes"]
@@ -637,9 +640,12 @@ def unsupported_state(repo: Path, *, lfs_scan: bool = True) -> list[str]:
                     lfs = True
                     break
         except OSError:
-            continue
+            # an unread small file may be an LFS pointer: the scan is incomplete, not clean
+            unread = True
     if lfs:
         reasons.append("lfs")
+    elif unread:
+        reasons.append("lfs_scan_incomplete")
     return reasons
 
 

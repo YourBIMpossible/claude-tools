@@ -813,7 +813,7 @@ def retire_open_pointers(stores: Stores, now: str) -> dict[str, Any]:
     join. Once the episode has been maintenance-joined for ``OPEN_POINTER_STALE_H`` the
     session is over; the pointer is local operational state and the manifest keeps every
     fact, so retiring it loses no evidence. Episodes never joined stay open and are counted."""
-    out: dict[str, Any] = {"retired": [], "open_unjoined": [], "dangling": 0}
+    out: dict[str, Any] = {"retired": [], "open_unjoined": [], "dangling": 0, "unreadable": 0, "retire_failed": 0}
     now_dt = parse_iso(now)
     d = stores.meta / "open"
     if now_dt is None or not d.is_dir():
@@ -823,6 +823,7 @@ def retire_open_pointers(stores: Stores, now: str) -> dict[str, Any]:
             ep = p.read_text(encoding="utf-8").strip()
             m = read_manifest(stores, ep) if manifest_path(stores, ep).is_file() else None
         except (OSError, ValueError):
+            out["unreadable"] += 1
             continue
         if m is None:
             out["dangling"] += 1
@@ -836,7 +837,7 @@ def retire_open_pointers(stores: Stores, now: str) -> dict[str, Any]:
                     p.unlink()
                     out["retired"].append(ep)
             except OSError:
-                pass
+                out["retire_failed"] += 1
         elif cap.get("phase") == "started":
             started = parse_iso(m.get("started_at") or "")
             if started is not None and now_dt - started > timedelta(hours=OPEN_POINTER_STALE_H):
@@ -1069,20 +1070,43 @@ def _is_capture_failure(m: dict[str, Any]) -> bool:
         m["start_snapshot"].get("state") == "failed" and m["start_snapshot"].get("reason") in STREAK_SNAPSHOT_REASONS)
 
 
-def capture_failure_times(stores: Stores, env: dict[str, str]) -> list[str]:
-    """Start times of every capture failure on record: failed manifests and not-yet-drained pending records."""
-    times = [m["started_at"] for m in scan_manifests(stores).manifests if _is_capture_failure(m)]
-    try:
-        for line in _pending_file(env).read_text(encoding="utf-8").splitlines():
+def capture_failure_records(stores: Stores, env: dict[str, str]) -> tuple[list[str], list[str]]:
+    """``(start times, problems)`` of every capture failure on record: failed manifests,
+    pending records and records claimed by a drain still in flight (``.draining`` files).
+
+    A record an in-flight drain already turned into a manifest is counted once. A pending
+    or claimed file that exists but cannot be read, and a record without a readable start
+    time, is a problem: the failures behind it are unknown, never zero."""
+    failed = {m.get("episode_id"): m["started_at"] for m in scan_manifests(stores).manifests
+              if _is_capture_failure(m)}
+    times = list(failed.values())
+    seen = set(failed)
+    problems: list[str] = []
+    src = _pending_file(env)
+    for f in [src, *sorted(src.parent.glob(f"{src.name}.*.draining"))]:
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            continue  # no pending failures, or the drain finished between the glob and the read
+        except (OSError, ValueError) as exc:
+            problems.append(f"pending file unreadable {f.name}: {type(exc).__name__}")
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
             try:
                 rec = json.loads(line)
             except ValueError:
+                rec = None
+            if not isinstance(rec, dict) or not isinstance(rec.get("started_at"), str):
+                problems.append(f"pending record unreadable in {f.name}")
                 continue
-            if isinstance(rec, dict) and isinstance(rec.get("started_at"), str):
-                times.append(rec["started_at"])
-    except OSError:
-        pass
-    return sorted(times)
+            ep = rec.get("episode_id")
+            if ep in seen:
+                continue
+            seen.add(ep)
+            times.append(rec["started_at"])
+    return sorted(times), problems
 
 
 def failure_streaks(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1224,7 +1248,9 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
             counts.update(expired_deleted=exp["expired_deleted"], expire_errors=exp["errors"],
                           expire_undated=exp["undated"])
         ptr = retire_open_pointers(stores, now)
-        counts.update(open_pointers_retired=len(ptr["retired"]), open_unjoined_stale=ptr["open_unjoined"][:20])
+        counts.update(open_pointers_retired=len(ptr["retired"]), open_unjoined_stale=ptr["open_unjoined"][:20],
+                      open_pointers_dangling=ptr["dangling"], open_pointers_unreadable=ptr["unreadable"],
+                      open_pointers_retire_failed=ptr["retire_failed"])
         if ptr["retired"]:
             log_line(stores, f"maintain: retired {len(ptr['retired'])} open pointer(s) past their Stop window: "
                              + ",".join(ptr["retired"][:20]))
@@ -1281,6 +1307,9 @@ def maintain_findings(counts: dict[str, Any]) -> tuple[list[str], list[str]]:
         warnings.append(f"review_errors: {counts['review_errors']}")
     if counts.get("failure_streaks"):
         warnings.append(f"capture_failure_streaks: {counts['failure_streaks']}")
+    stuck = {k: counts.get(f"open_pointers_{k}") for k in ("dangling", "unreadable", "retire_failed")}
+    if any(stuck.values()):
+        warnings.append("open_pointers_stuck: " + ", ".join(f"{k} {v}" for k, v in stuck.items() if v))
     return problems, warnings
 
 

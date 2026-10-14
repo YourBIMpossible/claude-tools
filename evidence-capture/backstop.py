@@ -134,13 +134,15 @@ def _record(rec: dict[str, Any], status: Path, stores: Stores | None) -> None:
 
 
 def health(status: Path, *, now: str | None = None, stale_after_h: float = STALE_AFTER_H,
-           failure_times: list[str] | None = None) -> dict[str, Any]:
+           failure_times: list[str] | None = None, failure_problems: list[str] | None = None) -> dict[str, Any]:
     """The backstop's standing, for the checkpoint report: ``ok``, ``warn``, ``fail``,
     ``stale`` (no success within ``stale_after_h``) or ``never_run``.
 
     ``failure_times`` are the start times of recorded capture failures. Failures after the
     last pass were never judged by it, so they cap the standing: one or more is at most
-    ``warn``, ``FAILURE_STREAK`` or more is ``fail``; a stale "ok" never hides refusals."""
+    ``warn``, ``FAILURE_STREAK`` or more is ``fail``; a stale "ok" never hides refusals.
+    ``failure_problems`` are failure records that could not be read: their count is
+    unknown, so they cap an ``ok`` at ``warn`` too."""
     now_dt = parse_iso(now or iso(now_utc()))
     assert now_dt is not None
     try:
@@ -163,6 +165,10 @@ def health(status: Path, *, now: str | None = None, stale_after_h: float = STALE
         rank = {"ok": 0, "warn": 1, "fail": 2}
         if rank.get(worst, 2) > rank.get(out["state"], 2):
             out["state"] = worst
+    if failure_problems:
+        out["capture_failure_records_unreadable"] = list(failure_problems)
+        if out["state"] == "ok":
+            out["state"] = "warn"
     return out
 
 
