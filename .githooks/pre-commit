@@ -1,0 +1,52 @@
+#!/bin/sh
+# .githooks/pre-commit - secret scan of the STAGED diff (gitleaks), 2026-10-13.
+#
+# Closes the gap between "typed a key" and "pre-push / PR scan": a secret never enters a
+# local commit, so it never has to be purged from history. Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# Behavior:
+#   - A finding BLOCKS the commit (exit 1). Output is redacted; the value is never printed.
+#   - gitleaks missing or failing to run: loud warning on stderr, commit proceeds (the pre-push /
+#     PR scan is the backstop). It is never a silent skip.
+#   - Emergency bypass, explicit and audited:  BIMP_SECRETS_BYPASS="<reason>" git commit ...
+#     appends a line to <git-common-dir>/secrets-bypass.log. `--no-verify` skips all hooks and
+#     leaves no trail; prefer the variable.
+# Resolution order for the binary: $GITLEAKS_BIN, then PATH.
+# Uses the repo's .gitleaks.toml when present (gitleaks also finds it by default).
+# POSIX sh, LF endings.
+
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-commit: not inside a git work tree" >&2; exit 1; }
+
+if [ -n "${BIMP_SECRETS_BYPASS:-}" ]; then
+    log="$(git rev-parse --git-common-dir)/secrets-bypass.log"
+    printf '%s pre-commit bypass: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BIMP_SECRETS_BYPASS" >> "$log"
+    echo "pre-commit: secret scan BYPASSED ($BIMP_SECRETS_BYPASS) - logged to $log" >&2
+    exit 0
+fi
+
+gl="${GITLEAKS_BIN:-}"
+[ -n "$gl" ] || gl=$(command -v gitleaks 2>/dev/null || command -v gitleaks.exe 2>/dev/null || true)
+if [ -z "$gl" ]; then
+    echo "pre-commit: WARNING gitleaks not found (GITLEAKS_BIN or PATH) - staged-secret scan SKIPPED" >&2
+    exit 0
+fi
+
+# gitleaks >= 8.19 spells it `git --staged`; the 8.18.x line (pinned by the BIMpossible repos)
+# only has `protect --staged`. Detect which one this binary has instead of assuming.
+if "$gl" git --help >/dev/null 2>&1; then set -- git --staged; else set -- protect --staged; fi
+# A finding exits 77 so it cannot be confused with a gitleaks runtime error (exit 1).
+set -- "$@" --redact --no-banner --exit-code 77
+if [ -f "$repo/.gitleaks.toml" ]; then set -- "$@" --config "$repo/.gitleaks.toml"; fi
+(cd "$repo" && "$gl" "$@")
+rc=$?
+case "$rc" in
+    0) exit 0 ;;
+    77)
+        echo "pre-commit: gitleaks reported a staged secret. Unstage it and rotate the key if it was real." >&2
+        echo "pre-commit: vetted false positive -> add a value-scoped allowlist entry to .gitleaks.toml, not a bypass." >&2
+        exit 1 ;;
+    *)
+        echo "pre-commit: WARNING gitleaks failed to run (exit $rc) - staged-secret scan SKIPPED" >&2
+        exit 0 ;;
+esac
