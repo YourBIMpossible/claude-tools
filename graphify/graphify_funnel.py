@@ -15,7 +15,9 @@ Stages
                    is labelled as such; a graph-backed exploration unit with no graphify call
                    is a routing FAIL to investigate, never a reason to wait for volume.
   3. Execution     graphify calls found in transcripts vs completed calls vs matched
-                   query-log records.
+                   query-log records. A completed call with no record is read as "nothing
+                   written" when the log window holds no unattributed record, else as
+                   "possibly written outside the match window".
   4. Measurement   organic records only (matched to organic transcript calls): stock vs
                    reranked counts, latency, zero-node results; sample thresholds apply here
                    and only here.
@@ -884,6 +886,10 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     organic_recs = [c.record for c in organic_calls if c.record is not None]
     matched_ids = {id(c.record) for c in all_calls if c.record is not None}
     unattributed = [r for r in records if id(r) not in matched_ids]
+    # An unlogged call beside no unattributed record means nothing was written to this log;
+    # beside some, a record may exist that fell outside the match window.
+    unlogged_reading = (None if not unlogged
+                        else "unattributed-records-present" if unattributed else "no-record-in-log")
     excluded_recs = [c.record for s in sessions if s.excluded
                      for u in s.units.values() for c in u.calls if c.record is not None]
 
@@ -966,6 +972,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             "verdict": v3, "calls": len(organic_calls), "by_status": by_status,
             "logged": sum(1 for c in ok_calls if c.record is not None),
             "unlogged_ok_wrapper_calls": [c.unit.label for c in unlogged],
+            "unlogged_reading": unlogged_reading,
             "copied_calls_excluded": copied_calls,
             "wrapper_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in wrapper_errors],
             "unrecovered_shell_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in unrecovered],
@@ -1058,6 +1065,15 @@ def render(summary: dict) -> str:
                        ("Shell errors recovered by a later call (kept as evidence)", "recovered_shell_errors")):
         if e[key]:
             L += ["", f"**{title}:**", *[f"- {x}" for x in e[key]]]
+    if e["unlogged_reading"] == "no-record-in-log":
+        L += ["", "No unattributed record sits in the log window, so these calls wrote nothing to this log: "
+                  "graphify logs only when GRAPHIFY_QUERY_LOG (or GRAPHIFY_QUERY_LOG_ENABLE) is set in the "
+                  "environment of the process that ran the call, a relative path lands in that process's cwd, "
+                  "and write errors are swallowed. Check that process's environment, not the funnel."]
+    elif e["unlogged_reading"]:
+        L += ["", f"{m['unattributed_records']} unattributed record(s) sit in the log window: some may be these "
+                  "calls, written outside the +/-5 s match window (compare timestamps). A call with no such "
+                  "record wrote nothing (same environment check as above)."]
     rr, st, ul = m["reranked"], m["stock"], m["unlabelled_bare_cli"]
     L += ["", "## 4 Measurement (organic only)", "",
           "| Arm | Records | Timed | Zero-node | Median ms | p90 ms |", "|---|---|---|---|---|---|",

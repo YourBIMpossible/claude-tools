@@ -229,6 +229,33 @@ class Execution(FunnelCase):
         self.assertEqual(ex["verdict"], gf.FAIL)
         self.assertEqual(len(ex["unlogged_ok_wrapper_calls"]), 1)
 
+    def test_unlogged_calls_with_an_empty_log_window_read_as_nothing_written(self):
+        Transcript(self.repo).query("lost").write(self.projects, "p", "s-unlogged")
+        summary = self.run_funnel()
+        self.assertEqual(summary["execution"]["unlogged_reading"], "no-record-in-log")
+        md = gf.render(summary)
+        self.assertIn("wrote nothing to this log", md)
+        self.assertIn("GRAPHIFY_QUERY_LOG", md[md.index("wrote nothing to this log"):])
+
+    def test_unlogged_calls_beside_unattributed_records_point_at_the_match_window(self):
+        Transcript(self.repo).query("lost").write(self.projects, "p", "s-late")
+        # written, but a minute after the call: outside the match window, so it matches nothing
+        self.log_record("lost", T0 + timedelta(seconds=62))
+        summary = self.run_funnel()
+        self.assertEqual(summary["execution"]["unlogged_reading"], "unattributed-records-present")
+        self.assertEqual(summary["measurement"]["unattributed_records"], 1)
+        md = gf.render(summary)
+        self.assertIn("1 unattributed record", md)
+        self.assertNotIn("wrote nothing to this log", md)
+
+    def test_fully_logged_calls_have_no_unlogged_reading(self):
+        Transcript(self.repo).query("found").write(self.projects, "p", "s-logged")
+        self.log_record("found", T0 + timedelta(seconds=1.5))
+        summary = self.run_funnel()
+        self.assertEqual(summary["execution"]["unlogged_ok_wrapper_calls"], [])
+        self.assertIsNone(summary["execution"]["unlogged_reading"])
+        self.assertNotIn("wrote nothing to this log", gf.render(summary))
+
     def test_wrapper_error_fails(self):
         Transcript(self.repo).query("bad", output="graphify query failed (exit 1)", is_error=True) \
             .write(self.projects, "p", "s-err")
