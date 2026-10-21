@@ -887,8 +887,10 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     matched_ids = {id(c.record) for c in all_calls if c.record is not None}
     unattributed = [r for r in records if id(r) not in matched_ids]
     # An unlogged call beside no unattributed record means nothing was written to this log;
-    # beside some, a record may exist that fell outside the match window.
+    # beside some, a record may exist that fell outside the match window. A log that could not
+    # be read says nothing about the calls, so it gets no reading of its own.
     unlogged_reading = (None if not unlogged
+                        else "log-unusable" if log.status != "ok"
                         else "unattributed-records-present" if unattributed else "no-record-in-log")
     excluded_recs = [c.record for s in sessions if s.excluded
                      for u in s.units.values() for c in u.calls if c.record is not None]
@@ -1065,15 +1067,19 @@ def render(summary: dict) -> str:
                        ("Shell errors recovered by a later call (kept as evidence)", "recovered_shell_errors")):
         if e[key]:
             L += ["", f"**{title}:**", *[f"- {x}" for x in e[key]]]
-    if e["unlogged_reading"] == "no-record-in-log":
-        L += ["", "No unattributed record sits in the log window, so these calls wrote nothing to this log: "
-                  "graphify logs only when GRAPHIFY_QUERY_LOG (or GRAPHIFY_QUERY_LOG_ENABLE) is set in the "
-                  "environment of the process that ran the call, a relative path lands in that process's cwd, "
-                  "and write errors are swallowed. Check that process's environment, not the funnel."]
+    if e["unlogged_reading"] == "log-unusable":
+        L += ["", "The query log could not be used (see the input problems above), so these calls say nothing "
+                  "about whether graphify wrote records: fix the log path first."]
+    elif e["unlogged_reading"] == "no-record-in-log":
+        L += ["", "No unattributed record sits in the log window, so these calls wrote nothing to this log. "
+                  "Usual cause: graphify logs only when GRAPHIFY_QUERY_LOG (or GRAPHIFY_QUERY_LOG_ENABLE) is "
+                  "set in the environment of the process that ran the call; a relative path lands in that "
+                  "process's cwd; write errors are swallowed. Check that process's environment first."]
     elif e["unlogged_reading"]:
         L += ["", f"{m['unattributed_records']} unattributed record(s) sit in the log window: some may be these "
-                  "calls, written outside the +/-5 s match window (compare timestamps). A call with no such "
-                  "record wrote nothing (same environment check as above)."]
+                  f"calls, written more than {MATCH_SLACK.total_seconds():g} s from the call (the match window "
+                  "runs from just before the call to just after its result; compare timestamps). A call with "
+                  "no such record wrote nothing (same environment check as above)."]
     rr, st, ul = m["reranked"], m["stock"], m["unlabelled_bare_cli"]
     L += ["", "## 4 Measurement (organic only)", "",
           "| Arm | Records | Timed | Zero-node | Median ms | p90 ms |", "|---|---|---|---|---|---|",

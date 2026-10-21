@@ -248,6 +248,27 @@ class Execution(FunnelCase):
         self.assertIn("1 unattributed record", md)
         self.assertNotIn("wrote nothing to this log", md)
 
+    def test_unusable_log_is_not_read_as_nothing_written(self):
+        Transcript(self.repo).query("lost").write(self.projects, "p", "s-nolog")
+        for log in (self.root / "absent.log", self.root, None):   # missing, not a file, unconfigured
+            with self.subTest(log=str(log)):
+                summary = self.run_funnel(log=log) if log is not None else self._run_unconfigured()
+                self.assertEqual(summary["execution"]["unlogged_reading"], "log-unusable")
+                md = gf.render(summary)
+                self.assertNotIn("wrote nothing to this log", md)
+                self.assertIn("query log could not be used", md)
+
+    def _run_unconfigured(self) -> dict:
+        scan = gf.discover_sessions(self.projects, SINCE, UNTIL)
+        cfg = gf.parse_config(self.cfg, self.root)
+        return gf.analyse(scan, gf.load_log(None, SINCE, UNTIL), self.resolver, cfg, SINCE, UNTIL)
+
+    def test_match_window_wording_follows_the_constant(self):
+        Transcript(self.repo).query("lost").write(self.projects, "p", "s-late2")
+        self.log_record("lost", T0 + timedelta(seconds=62))
+        md = gf.render(self.run_funnel())
+        self.assertIn(f"more than {gf.MATCH_SLACK.total_seconds():g} s from the call", md)
+
     def test_fully_logged_calls_have_no_unlogged_reading(self):
         Transcript(self.repo).query("found").write(self.projects, "p", "s-logged")
         self.log_record("found", T0 + timedelta(seconds=1.5))
