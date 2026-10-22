@@ -42,6 +42,8 @@ Step "Gitleaks (published tree only)" {
 }
 Step "Public-boundary check" { python tools/pre_publish_check.py }
 Step "Public-boundary checker tests" { python tools/test_pre_publish_check.py }
+Step "Machine-path guard self-test" { python .github/scripts/check_machine_paths.py --self-test }
+Step "Machine-path guard" { python .github/scripts/check_machine_paths.py }
 Step "ctxcheck tests"        { python ctxcheck/test_ctxcheck.py }
 Step "ctxdex secret-gate tests" { python ctxdex/test_ctxdex_gate.py }
 Step "local-audit census-only guard" { python local-audit/test_local_audit.py }
