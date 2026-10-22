@@ -10,6 +10,10 @@
 # ctxdex/data = FTS indexes built from private repos (regenerable)
 /ctxdex/data/
 
+# Claude Code worktrees made inside this public repo (git worktree add .claude/worktrees/<lane>):
+# a stray `git add -A` must never stage another session's checkout
+/.claude/worktrees/
+
 # Vendored third-party binaries (download at setup — see bin/README.md)
 /bin/*.exe
 
