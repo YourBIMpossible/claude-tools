@@ -1,0 +1,39 @@
+name: machine-paths
+
+# Fails when a tracked file holds an absolute, machine-specific path (drive-letter,
+# Git-Bash drive root, user home, UNC share). Self-contained and repo-agnostic: to adopt
+# it in another repo, copy this file and .github/scripts/check_machine_paths.py, and
+# add a .machine-paths-allow.json at the repo root only if something must be exempt.
+# Run the same check locally:  python .github/scripts/check_machine_paths.py
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: machine-paths-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  machine-paths:
+    name: no machine-specific paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Guard self-test
+        run: python .github/scripts/check_machine_paths.py --self-test
+
+      - name: Scan tracked files
+        run: python .github/scripts/check_machine_paths.py

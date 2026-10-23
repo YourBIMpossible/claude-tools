@@ -1,0 +1,30 @@
+[
+  {
+    "path": "evidence-capture/tests/*.py",
+    "reason": "Synthetic drive-letter, Git-Bash, UNC and extended-length path forms that the capture path classifier, clone reconstruction and review must resolve or refuse; test fixtures, no real location."
+  },
+  {
+    "path": "evidence-footprints/test_*.py",
+    "reason": "Synthetic path fixtures for the footprint parser's Windows, Git-Bash and POSIX path handling; no real location."
+  },
+  {
+    "path": "evidence-twin/test_twin.py",
+    "match": "\"/r/",
+    "reason": "Synthetic one-letter transcript root in a test fixture; not a drive."
+  },
+  {
+    "path": "graphify/test_graphify_funnel.py",
+    "match": "/x/",
+    "reason": "Synthetic one-letter wrapper directory in synthetic transcripts; not a drive."
+  },
+  {
+    "path": "evidence-capture/review.py",
+    "match": "# Git Bash /c/\\.\\.\\. form",
+    "reason": "Comment naming the Git-Bash path form the code converts."
+  },
+  {
+    "path": "evidence-capture/store.py",
+    "match": "however the path was given",
+    "reason": "Docstring illustrating the path forms the store normalises (placeholder drive and server)."
+  }
+]
