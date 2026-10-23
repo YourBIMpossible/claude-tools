@@ -108,8 +108,10 @@ def verify_registration(stores: Stores, ep: str) -> tuple[dict[str, Any] | None,
         probs.append("registration_not_committed")
     elif subprocess.run([*g, "diff", "--quiet", "HEAD", "--", rel], capture_output=True).returncode != 0:
         probs.append("registration_modified")
-    elif len(subprocess.run([*g, "log", "--format=%H", "--", rel], capture_output=True,
-                            text=True).stdout.split()) != 1:
+    elif (log := subprocess.run([*g, "log", "--format=%H", "--", rel], capture_output=True,
+                                text=True)).returncode != 0:
+        probs.append("registration_history_unreadable")  # git failed: the history was not seen
+    elif len(log.stdout.split()) != 1:
         probs.append("registration_rewritten")  # committed more than once
     return entry, probs
 

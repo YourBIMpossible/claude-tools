@@ -106,16 +106,20 @@ def blocker_partition(pop: list[dict[str, Any]]) -> dict[str, Any]:
     something else also fails, split by whether that is a known scope exclusion (a rule
     ``yes``) or only unresolved evidence. With a trusted boundary, ``scope_excluded``
     (a rule ``yes``) and ``unresolved`` (rule ``unknown``, insufficient observation,
-    no link, incomplete snapshot) follow. Privacy stays ``not_reached`` for every
-    episode not past the gates, never ``failed``."""
+    no link, incomplete snapshot) follow. Only the owner-resolvable screen rules (X1-X5,
+    the rules ``independent_blockers`` counts) are scope exclusions: X6 and X7 restate an
+    incomplete snapshot or capture, so any state but ``no`` there is unresolved. Privacy
+    stays ``not_reached`` for every episode not past the gates, never ``failed``."""
     out: Counter[str] = Counter()
     for m in pop:
         if mf.provisional_candidate(mf.compute_funnel(m)):
             out["candidate"] += 1
             continue
-        states = [mf.rule_state(m["exclusions"], r) for r in mf.RULES]
+        states = [mf.rule_state(m["exclusions"], r) for r in mf.OWNER_RESOLVABLE]
+        state_rules = [mf.rule_state(m["exclusions"], r) for r in mf.RULES if r not in mf.OWNER_RESOLVABLE]
         scope = "yes" in states
-        unresolved = ("unknown" in states or not m["observation"].get("sufficient", False)
+        unresolved = ("unknown" in states or any(s != "no" for s in state_rules)
+                      or not m["observation"].get("sufficient", False)
                       or m["link"].get("state") != "linked"
                       or m["start_snapshot"].get("state") != "complete")
         if not m["boundary"].get("trusted"):
