@@ -67,6 +67,12 @@
 /graphify/publish-settings.lkg.json
 *.bak-cutover-*
 
+# Local-only folders and safety copies: machine-local working data that must never be staged in this public repo
+/backups/
+/downloads/
+/fleet-setup/dist/
+*.pre-completion.bak
+
 # Secrets / local env
 .env
 **/.env
