@@ -471,6 +471,30 @@ def main():
         check(f"guard: '{name}' leak class is rejected", hits.get(name, 0) > 0, f"{hits} {p.stderr[:200]}")
     check("guard: the rejection stub passes its own guard", hits.get("stub") == 0, f"{hits}")
 
+    # -- a missing scheduled task (WIP-F-093): the alert points at the HIDDEN re-registration, never at a plain
+    #    console action (which pops a window on every run), and the action text stays free of machine paths
+    e = Env("task-missing-hidden-hint")
+    try:
+        e.write_config(valid_config())
+        e.write_health({"installed_version": FAKE_VERSION, "last_success_at": RECENT,
+                        "last_run": {"exit_code": 0, "ended_at": RECENT, "targets": []}})
+        e.run(task_result="missing")
+        alert = next((a for a in e.alerts()["alerts"] if a["code"] == "task-missing"), None)
+        check("task-missing: the alert is raised", alert is not None)
+        action = (alert or {}).get("action", "")
+        check("task-missing: the action points at the hidden launcher (wscript.exe, run-hidden.js)",
+              "run-hidden.js" in action and "wscript.exe" in action, action)
+        check("task-missing: the action no longer says a bare 'schtasks /Create'", "schtasks /Create" not in action, action)
+        check("task-missing: the action says why (a console window)", "window" in action.lower(), action)
+        check("task-missing: the action carries no drive-letter or home path",
+              not re.search(r"[A-Za-z]:[\\/]|/home/|/Users/", action), action)
+        text, doc = e.public()
+        pub = next((a for a in (doc or {}).get("alerts", []) if a["code"] == "task-missing"), None)
+        check("task-missing: the published alert carries the same hidden-launcher action",
+              bool(pub) and "run-hidden.js" in pub["action"], f"{pub}")
+    finally:
+        e.close()
+
     passed = sum(1 for _, c in results if c)
     print(f"\n{passed}/{len(results)} checks passed")
     sys.exit(0 if passed == len(results) else 1)

@@ -190,7 +190,7 @@ try {
         }
     }
 } catch {
-    Add-Alert 'error' 'task-missing' "Scheduled task '$taskName' not found - weekly refresh is not registered." 'Re-register it with schtasks /Create.' | Out-Null
+    Add-Alert 'error' 'task-missing' "Scheduled task '$taskName' not found - weekly refresh is not registered." 'Re-register it with a hidden action, or a console window opens on every run: wscript.exe running run-hidden.js from the scheduling folder, then powershell.exe and Refresh-Graphs.ps1 (the exact arguments are in scheduling/README.md).' | Out-Null
 }
 
 # -- 3. PyPI: is there a newer release? (notify only, never install) ---------
