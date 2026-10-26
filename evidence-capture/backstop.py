@@ -172,15 +172,33 @@ def health(status: Path, *, now: str | None = None, stale_after_h: float = STALE
     return out
 
 
+# The hidden launcher (scheduling/run-hidden.js in this repository). WIP-F-093: a task whose action is a console
+# program flashes a window on every run (Windows 11 hands the console to Windows Terminal), and a windowless
+# pythonw.exe parent still flashes one console per git/attrib child it starts. wscript.exe running the launcher
+# creates the whole process tree hidden and passes the exit code through (0/3/4, read by health() and by Task
+# Scheduler's LastTaskResult).
+HIDDEN_LAUNCHER = Path(__file__).resolve().parent.parent / "scheduling" / "run-hidden.js"
+
+
+def _wscript() -> Path:
+    root = os.environ.get("SystemRoot") or os.environ.get("windir")
+    return Path(root) / "System32" / "wscript.exe" if root else Path("wscript.exe")
+
+
 def task_xml(start: str = TASK_START) -> str:
     """Task Scheduler definition for the backstop: daily, catch-up after a missed run,
     the signed-in user's own token (no stored password), no elevation, one instance,
-    30-minute limit. Printed for review; this module never registers it."""
+    30-minute limit. The action is `wscript.exe //B //Nologo run-hidden.js python.exe capture.py backstop`:
+    python.exe, not pythonw.exe, so the git/attrib children share the one hidden console. Printed for
+    review; this module never registers it."""
+    if not HIDDEN_LAUNCHER.is_file():
+        raise FileNotFoundError(f"the hidden launcher is missing: {HIDDEN_LAUNCHER} (without it the task would flash a window)")
     exe = Path(sys.executable)
-    windowless = exe.with_name("pythonw.exe")
-    exe = windowless if windowless.is_file() else exe
+    if exe.name.lower() == "pythonw.exe":
+        exe = exe.with_name("python.exe")
     script = Path(__file__).resolve().with_name("capture.py")
-    args = f'"{script}" backstop'
+    command = _wscript()
+    args = f'//B //Nologo "{HIDDEN_LAUNCHER}" "{exe}" "{script}" backstop'
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -209,7 +227,7 @@ def task_xml(start: str = TASK_START) -> str:
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>{escape(str(exe))}</Command>
+      <Command>{escape(str(command))}</Command>
       <Arguments>{escape(args)}</Arguments>
       <WorkingDirectory>{escape(str(script.parent))}</WorkingDirectory>
     </Exec>

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -240,8 +241,23 @@ def test_task_xml_is_reviewable_not_registered(root: Path) -> None:
     assert tree.findtext("t:Principals/t:Principal/t:RunLevel", namespaces=ns) == "LeastPrivilege"
     assert tree.findtext("t:Settings/t:StartWhenAvailable", namespaces=ns) == "true"
     assert tree.findtext("t:Settings/t:MultipleInstancesPolicy", namespaces=ns) == "IgnoreNew"
-    assert tree.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns).endswith("capture.py\" backstop")
-    assert Path(tree.findtext("t:Actions/t:Exec/t:Command", namespaces=ns)).is_file()
+    # WIP-F-093: the action is the hidden launcher, not a console program. wscript.exe //B //Nologo run-hidden.js
+    # python.exe capture.py backstop. python.exe (not pythonw.exe) so the git/attrib children it starts share the
+    # one hidden console instead of each opening a visible one; the launcher passes the exit code through.
+    command = tree.findtext("t:Actions/t:Exec/t:Command", namespaces=ns)
+    arguments = tree.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns)
+    assert Path(command).name.lower() == "wscript.exe", command
+    if sys.platform == "win32":
+        assert Path(command).is_file(), command
+    tokens = [a or b for a, b in re.findall(r'"([^"]*)"|(\S+)', arguments)]
+    assert tokens[:2] == ["//B", "//Nologo"], arguments
+    assert len(tokens) == 6, tokens
+    launcher, interpreter, script, verb = tokens[2], tokens[3], tokens[4], tokens[5]
+    assert Path(launcher).name == "run-hidden.js" and Path(launcher).is_file(), launcher
+    assert Path(interpreter).is_file() and Path(interpreter).name.lower() != "pythonw.exe", interpreter
+    assert Path(script).name == "capture.py" and verb == "backstop", tokens
+    assert "pythonw" not in (command + arguments).lower(), "no windowless-parent interpreter"
+    assert tree.findtext("t:Actions/t:Exec/t:WorkingDirectory", namespaces=ns).endswith("evidence-capture")
     src = (PKG / "backstop.py").read_text(encoding="utf-8") + (PKG / "capture.py").read_text(encoding="utf-8")
     assert "schtasks" not in src and "Register-ScheduledTask" not in src, "nothing registers a task"
 
