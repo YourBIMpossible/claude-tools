@@ -131,7 +131,7 @@ MSYS_PATH_RE = re.compile(r"^/([A-Za-z])(?=/|$)")
 
 
 def msys_to_windows(path: str) -> str:
-    """Map an MSYS/Git-Bash drive path (``/f/x``) to its Windows form (``F:/x``); others unchanged."""
+    """Map a Git-Bash drive path (a leading one-letter segment) to its Windows drive-letter form; others unchanged."""
     return MSYS_PATH_RE.sub(lambda mt: f"{mt.group(1).upper()}:", path.replace("\\", "/"), count=1)
 
 

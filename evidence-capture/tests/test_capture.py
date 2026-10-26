@@ -1194,7 +1194,8 @@ def test_shell_repo_mutation_blocks_x2_yes(root: Path) -> None:
     cases = {
         "commit via shell": (f"cd '{repo}' && D=docs && cat >> \"$D/NOTES.md\" <<'X'\nline\nX\ngit add -A && git commit -qm n",
                              {"content_write:write:cat", "git_index:git add", "git_history:git commit"}, False),
-        "msys cd then redirect": (f"cd {msys}; echo x > out.txt", {"content_write:write:echo"}, False),
+        **({"msys cd then redirect": (f"cd {msys}; echo x > out.txt", {"content_write:write:echo"}, False)}
+           if os.name == "nt" else {}),  # the Git-Bash form of a fixture path only exists for a drive-letter root
         "unknown cd then commit": ("cd \"$SOMEWHERE\" && git commit -qm n", {"unresolved_target:git commit"}, False),
         "inline interpreter in repo": ("python - <<'PY'\nprint(1)\nPY", {"unresolved_effect:inline:python"}, False),
         "test runner in repo": ("python -m pytest tests", {"unresolved_effect:exec:python"}, False),
@@ -1230,14 +1231,15 @@ def test_msys_drive_paths_resolve_like_windows_paths(root: Path) -> None:
     def msys(p: Path) -> str:
         return "/" + str(p)[0].lower() + str(p)[2:].replace("\\", "/")
 
-    m = joined(root, repo, [{"prompt": "look", "tools": [
-        {"name": "Bash", "input": {"command": f"cat {msys(repo)}/README.md && cd {msys(repo)} && cat README.md"}}]}], 0)
-    assert m["deps"]["external_path"]["observed"] == 0, m["deps"]["external_path"]
-    assert m["deps"]["external_repository"]["observed"] == 0 and rule(m, "X2") == "yes"
-    # a genuinely external file and another repository stay external
-    m = joined(root, repo, [{"prompt": "look", "tools": [
-        {"name": "Bash", "input": {"command": f"cat {msys(other)}/README.md"}}]}], 0)
-    assert m["deps"]["external_repository"]["observed"] == 1, m["deps"]
+    if os.name == "nt":  # the Git-Bash form of a fixture path only exists for a drive-letter root
+        m = joined(root, repo, [{"prompt": "look", "tools": [
+            {"name": "Bash", "input": {"command": f"cat {msys(repo)}/README.md && cd {msys(repo)} && cat README.md"}}]}], 0)
+        assert m["deps"]["external_path"]["observed"] == 0, m["deps"]["external_path"]
+        assert m["deps"]["external_repository"]["observed"] == 0 and rule(m, "X2") == "yes"
+        # a genuinely external file and another repository stay external
+        m = joined(root, repo, [{"prompt": "look", "tools": [
+            {"name": "Bash", "input": {"command": f"cat {msys(other)}/README.md"}}]}], 0)
+        assert m["deps"]["external_repository"]["observed"] == 1, m["deps"]
     assert screen.msys_to_windows("/tmp/x") == "/tmp/x" and screen.msys_to_windows("/f/a/b") == "F:/a/b"
 
 
