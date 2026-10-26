@@ -464,6 +464,8 @@ def test_git_bash_drive_paths() -> None:
     check(counts(fp("cat /f/Repo-old/a.py")) == other, "a sibling that merely starts with the repo name is outside")
     check(counts(fp("cat /tmp/scratch.py")) == other, "/tmp is a POSIX location, not a drive")
     check(counts(fp("cat /fx/Repo/src/a.py")) == other, "a multi-letter first segment is not a drive")
+    check(counts(fp("cat /fRepo/src/a.py")) == other,
+          "a first segment that is the drive letter glued to the repository name is not the repository")
     check(counts(fp("cat /mnt/data/x.py")) == other, "/mnt/<name> is not a drive")
     check(counts(fp("cat //server/share/a.py")) == other, "a UNC path stays outside a drive repository")
     check(counts(fp("cat /f/")) == other and counts(fp("cat /f")) == other, "the drive root itself is outside the repository")
