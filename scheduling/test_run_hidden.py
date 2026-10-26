@@ -6,8 +6,11 @@ Run: python scheduling/test_run_hidden.py
 
 What is proved, each against the real launcher:
   * the child's exit code passes through (0, a small non-zero, 255, and an NTSTATUS-sized code);
-  * every argument arrives exactly as given: spaces, a trailing backslash, an empty string, a percent sign,
-    a tab (an embedded double quote cannot cross wscript.exe's own command-line parser; see the test);
+  * every argument arrives exactly as given: spaces, a trailing backslash, an empty string, a lone percent sign,
+    a tab. Two documented limits of Windows Script Host are stated rather than hidden: an embedded double
+    quote cannot cross wscript.exe's own command-line parser (explained in the test), and a %NAME% naming a SET
+    environment variable is expanded by WScript.Shell.Run (pinned by a check; an unset name and a lone % stay
+    literal);
   * a command that cannot be started exits 127, and no arguments at all exits 2 (never 0);
   * the child's console window is NOT visible (window style 0). The control run starts the same probe in
     a fresh console and must see a visible window; if the machine cannot show one (a service session)
@@ -80,8 +83,19 @@ def main():
         line = " ".join(f'"{a}"' for a in [WSCRIPT, "//B", "//Nologo", LAUNCHER, py, probe, out, *tricky])
         p = subprocess.run(line, capture_output=True, text=True, timeout=60)
         got = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else None
-        check("arguments (spaces, trailing backslash, empty, percent, a lone -c) arrive exactly", got == tricky,
+        check("arguments (spaces, trailing backslash, empty, a lone %, a lone -c) arrive exactly", got == tricky,
               f"rc={p.returncode} got={got!r}")
+
+        # -- documented limit: WScript.Shell.Run expands %NAME% when NAME is a set environment variable
+        out2 = tmp / "percent out.json"
+        pline = " ".join(f'"{a}"' for a in [WSCRIPT, "//B", "//Nologo", LAUNCHER, py, probe, out2,
+                                            "%RUN_HIDDEN_SET_VAR%", "%RUN_HIDDEN_UNSET_VAR%", "100%"])
+        penv = {k: v for k, v in os.environ.items() if k != "RUN_HIDDEN_UNSET_VAR"}
+        penv["RUN_HIDDEN_SET_VAR"] = "expanded value"
+        subprocess.run(pline, capture_output=True, text=True, timeout=60, env=penv)
+        got2 = json.loads(out2.read_text(encoding="utf-8")) if out2.is_file() else None
+        check("a %NAME% naming a set variable is expanded; an unset name and a lone % stay literal (documented limit)",
+              got2 == ["expanded value", "%RUN_HIDDEN_UNSET_VAR%", "100%"], f"got={got2!r}")
 
         # -- failure modes are never silent successes
         p = launch(str(tmp / "no such program.exe"))

@@ -27,8 +27,14 @@ path in the task. The working directory of the task is kept.
 
 Exit codes: the program's own; `2` = no program given; `127` = the program could not be started.
 
-Limit: an embedded double quote cannot be sent through `wscript.exe`'s own command line (it treats a double quote as a
-grouping character and a backslash as literal). Put such text in a file or an environment variable.
+Limits, both of Windows Script Host and not of the launcher:
+
+- An embedded double quote cannot be sent through `wscript.exe`'s own command line (it treats a double quote as a
+  grouping character and a backslash as literal). Put such text in a file or an environment variable. For the same
+  reason a program that builds the Arguments string with MSVCRT-style escaping (Python's list quoting does) sends
+  `Dir\\` for `Dir\`: write the plain-quoted string a task action holds.
+- `WScript.Shell.Run` expands `%NAME%` when `NAME` is a set environment variable (an unset name and a lone `%` stay
+  literal). Do not pass a literal `%NAME%` that must survive.
 
 ## The tasks of this repository
 
@@ -43,6 +49,6 @@ grouping character and a backslash as literal). Put such text in a file or an en
 ## Tests
 
 `python scheduling/test_run_hidden.py` (Windows only; it prints SKIP elsewhere): exit codes pass through (0, 7, 255
-and an NTSTATUS-sized one), arguments arrive intact (spaces, trailing backslash, empty, percent, tab), a program that
+and an NTSTATUS-sized one), arguments arrive intact (spaces, trailing backslash, empty, a lone percent, tab; the percent limit above is pinned), a program that
 cannot start exits 127, and the child's console window is not visible (with a control that starts the same probe in a
 visible console, so the test cannot pass on a machine that cannot show a window).

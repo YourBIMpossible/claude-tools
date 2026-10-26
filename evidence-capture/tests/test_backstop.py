@@ -258,8 +258,33 @@ def test_task_xml_is_reviewable_not_registered(root: Path) -> None:
     assert Path(script).name == "capture.py" and verb == "backstop", tokens
     assert "pythonw" not in (command + arguments).lower(), "no windowless-parent interpreter"
     assert tree.findtext("t:Actions/t:Exec/t:WorkingDirectory", namespaces=ns).endswith("evidence-capture")
+    # the trigger and the limit: daily at 03:30, 30 minutes (the action lines above are all WIP-F-093 changed)
+    assert tree.findtext("t:Triggers/t:CalendarTrigger/t:ScheduleByDay/t:DaysInterval", namespaces=ns) == "1"
+    assert tree.findtext("t:Triggers/t:CalendarTrigger/t:StartBoundary", namespaces=ns).endswith("T03:30:00")
+    assert tree.findtext("t:Settings/t:ExecutionTimeLimit", namespaces=ns) == "PT30M"
     src = (PKG / "backstop.py").read_text(encoding="utf-8") + (PKG / "capture.py").read_text(encoding="utf-8")
     assert "schtasks" not in src and "Register-ScheduledTask" not in src, "nothing registers a task"
+
+
+def test_task_xml_swaps_pythonw_for_python(root: Path) -> None:
+    """Run under pythonw.exe, the task must still name python.exe (a windowless parent flashes one console per
+    git/attrib child; under the hidden launcher they share the one hidden console). WIP-F-093."""
+    fake = root / "fake-python"
+    fake.mkdir()
+    (fake / "python.exe").write_bytes(b"")
+    (fake / "pythonw.exe").write_bytes(b"")
+    real = sys.executable
+    sys.executable = str(fake / "pythonw.exe")
+    try:
+        xml = backstop.task_xml()
+    finally:
+        sys.executable = real
+    tree = ET.fromstring(xml.split("?>", 1)[1])
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    arguments = tree.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns)
+    tokens = [a or b for a, b in re.findall(r'"([^"]*)"|(\S+)', arguments)]
+    assert tokens[3] == str(fake / "python.exe"), tokens
+    assert Path(tokens[3]).name.lower() == "python.exe", tokens
 
 
 def _started(fx: Fixture) -> dict:
@@ -497,7 +522,7 @@ def test_maintenance_relinks_through_reconcile(root: Path) -> None:
 TESTS = [test_backstop_expires_without_prompts, test_backstop_reports_failures,
          test_backstop_waits_for_maintenance_child, test_maintenance_due_probes_the_lock_not_the_file,
          test_backstop_warns_on_undated_content,
-         test_checkpoint_notes_backstop, test_task_xml_is_reviewable_not_registered,
+         test_checkpoint_notes_backstop, test_task_xml_is_reviewable_not_registered, test_task_xml_swaps_pythonw_for_python,
          test_episode_errors_fail_the_pass_and_expiry_still_runs, test_busy_episode_is_reported_not_silent,
          test_unreadable_manifest_is_counted_everywhere, test_pending_record_kept_until_its_manifest_is_written,
          test_orphaned_draining_file_is_recovered, test_live_claim_is_not_taken_by_another_store,
