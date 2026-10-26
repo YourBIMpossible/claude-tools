@@ -84,6 +84,8 @@ BASELINE_SHIFTS = (1, 2, 3, 5, 8)
 WORKTREE_RE = re.compile(r"^\.claude/worktrees/[^/]+/")
 REF_RE = re.compile(r"^(.*?)(?::\d+(?:-\d+)?)?$")
 MAIN_ROOT_RE = re.compile(r"/\.claude/worktrees/[^/]+/?$")
+# ``identity.head`` is episode data; only a full object name reaches ``git ls-tree``.
+SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 SHELL_TOOLS = {"Bash", "PowerShell"}
@@ -134,6 +136,42 @@ def norm(raw: str, roots: Iterable[str]) -> str | None:
 
 
 UNRESOLVED = "<unresolved-dir>"  # a directory the command set but this parser cannot evaluate ($var, popd, bare cd)
+UNDETERMINED_RE = re.compile(r"\$|%[A-Za-z_][A-Za-z0-9_]*%")  # $VAR, ${VAR}, $env:VAR, %VAR%
+DRIVE_RELATIVE_RE = re.compile(r"^[A-Za-z]:(?![/\\])")  # C:foo is relative to drive C's own cwd
+PATH_HEAD_RE = re.compile(r"^(?:[A-Za-z]:/|//[^/]+/[^/]+(?:/|$)|/)")
+
+
+def undetermined(raw: str) -> bool:
+    """A path whose value depends on the environment (variables, the home directory).
+
+    Footprints are computed from recorded transcripts, so the value is unknown: such a
+    path is neither inside nor outside the repository.
+    """
+    p = raw.strip().strip("'\"")
+    return p.startswith("~") or bool(UNDETERMINED_RE.search(p) or DRIVE_RELATIVE_RE.match(p))
+
+
+def collapse(raw: str) -> str | None:
+    """'.' and '..' segments removed; None when a '..' climbs above the path's start.
+
+    A relative path cannot climb above its start without a known base directory, and an
+    absolute one cannot climb above its root: either way the target is undetermined.
+    """
+    p = raw.replace("\\", "/").strip().strip("'\"")
+    head = m.group(0) if (m := PATH_HEAD_RE.match(p)) else ""
+    parts: list[str] = []
+    for seg in p[len(head):].split("/"):
+        if seg in {"", "."}:
+            continue
+        if seg == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(seg)
+    if head and not head.endswith("/"):
+        head += "/"
+    return head + "/".join(parts) if head or parts else "."
 
 
 def _join_dir(d: str | None, cwd: str | None) -> str | None:
@@ -201,7 +239,8 @@ class Footprint:
         self.unparsed: list[dict] = []
         self.facts: dict[str, dict] = {}
         self.delegated = False
-        self.outside = 0  # path arguments outside this repository (other repos, scratch, home)
+        self.outside = 0  # path arguments proven outside this repository (other repos, scratch, home)
+        self.unresolved = 0  # path arguments whose location could not be determined (cwd, $VAR, ~, '..')
         for idx, call in enumerate(self.calls):
             self._call(idx, call)
 
@@ -210,7 +249,12 @@ class Footprint:
         self.facts.setdefault(fid, {"id": fid, "kind": kind, "value": value})
 
     def _touch(self, idx: int, raw: str, role: str, *, edit: bool = False, native: bool) -> None:
-        p = norm(raw, self.roots)
+        full = None if undetermined(raw) else collapse(raw)
+        if full is None:
+            # Undetermined, not known outside: never classified as outside_repo.
+            self.unresolved += 1
+            return
+        p = norm(full, self.roots)
         if p is None:
             self.outside += 1
             return
@@ -243,7 +287,16 @@ class Footprint:
         elif name in SHELL_TOOLS and isinstance(inp.get("command"), str):
             segments, script = sp.parse_command(inp["command"])
             wd: str | None = call.get("cwd")
+            scope: tuple[int, ...] = ()
+            entered: list[tuple[tuple[int, ...], str | None]] = []  # (enclosing scope, its cwd)
             for seg in segments:
+                # A subshell starts in the directory in effect where it stands; its own cd
+                # ends with it, so the enclosing segments resume in their directory.
+                while scope and seg.scope[:len(scope)] != scope:
+                    scope, wd = entered.pop()
+                if seg.scope != scope:
+                    entered.append((scope, wd))
+                    scope = seg.scope
                 self.shell_segments += 1
                 if seg.has_pathlike or seg.kind == "miss":
                     self.shell_pathlike += 1
@@ -256,9 +309,10 @@ class Footprint:
                     self.queries.append((idx, seg.text))
                 for use in seg.paths:
                     edit = use.role == "write" and use.verb != "git"
-                    target = resolve(use.path, use.base, wd)
+                    target = None if undetermined(use.path) else resolve(use.path, use.base, wd)
                     if target is None:
-                        self.outside += 1
+                        # Undetermined, not known outside: never classified as outside_repo.
+                        self.unresolved += 1
                         continue
                     self._touch(idx, target, use.role, edit=edit, native=False)
                 if seg.kind == "nav":
@@ -357,8 +411,8 @@ class TreeIndex:
         self.enabled = enabled
         self.cache: dict[tuple[str, str], list[str] | None] = {}
 
-    def files(self, root: str, head: str | None) -> list[str] | None:
-        if not self.enabled or not head:
+    def files(self, root: str, head: Any) -> list[str] | None:
+        if not self.enabled or not isinstance(head, str) or not SHA_RE.fullmatch(head):
             return None
         key = (root.lower(), head)
         if key not in self.cache:
@@ -454,7 +508,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
     pool: list[dict] = []
     status_counts: Counter = Counter()
     miss_reasons: Counter = Counter()
-    segs = pathlike = outside = 0
+    segs = pathlike = outside = unresolved = 0
     scored: list[tuple[dict, dict, Footprint, tuple]] = []
 
     for row in sorted(rows, key=lambda r: r["packet_id"]):
@@ -481,6 +535,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
         segs += fp.shell_segments
         pathlike += fp.shell_pathlike
         outside += fp.outside
+        unresolved += fp.unresolved
         for u in fp.unparsed:
             miss_reasons[str(u["reason"]).split(" ", 1)[0] if u["reason"] else "None"] += 1
             unparsed.append({"packet_id": pid, **u})
@@ -527,7 +582,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
                       "touched": len(fp.touched), "edited": len(fp.edited),
                       "searches": len(fp.queries), "calls": len(fp.calls),
                       "shell_segments": fp.shell_segments, "shell_unparsed": len(fp.unparsed),
-                      "outside_repo": fp.outside},
+                      "outside_repo": fp.outside, "unresolved": fp.unresolved},
             "metrics": m, "baseline": baseline,
             "brief_items": sum(1 for it in b["ranked"] if it["selected"]),
             "brief_items_touched": sum(1 for it in b["ranked"]
@@ -565,6 +620,7 @@ def run(episodes_path: Path, out: Path, use_git: bool) -> dict[str, Any]:
         "status": dict(sorted(status_counts.items())),
         "parse": {"shell_segments": segs, "segments_with_paths": pathlike,
                   "unparsed": len(unparsed), "paths_outside_repo": outside,
+                  "paths_unresolved": unresolved,
                   "miss_rate": round(len(unparsed) / pathlike, 4) if pathlike else None,
                   "reasons": dict(sorted(miss_reasons.items()))},
         "overall": aggregate(scored_rows),
@@ -597,7 +653,9 @@ def render_md(s: dict) -> str:
              f"Shell parse: {s['parse']['unparsed']} of {s['parse']['segments_with_paths']} path-bearing "
              f"segments unattributed (miss rate {_fmt(s['parse']['miss_rate'])}). "
              f"{s['parse']['paths_outside_repo']} path arguments fell outside the brief's repository "
-             "(other repos, scratch, home) and are not scored.", "",
+             "(other repos, scratch, home) and are not scored. "
+             f"{s['parse'].get('paths_unresolved', 0)} path arguments could not be resolved to a working "
+             "directory and were not classified.", "",
              "Means; `n` counts episodes where the metric is defined. Lift is actual minus the "
              "shuffled same-repo baseline.", "",
              "| slice | n | " + " | ".join(cols) + " | hit lift | gap lift |",

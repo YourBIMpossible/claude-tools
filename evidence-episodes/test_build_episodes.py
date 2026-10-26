@@ -298,10 +298,38 @@ def test_build(tmp: Path) -> None:
               f"two builds are byte-identical: {name}")
 
 
+def test_root_precedence(tmp: Path) -> None:
+    """Transcript roots take precedence in command-line order, not by name."""
+    sources, troots, cohorts = fixture(tmp)
+    (_, troot), = troots
+    # A second root, named to sort BEFORE the first, holding copies of two session files:
+    # one with a brief (matched by packet_id) and one without (matched by session only).
+    other = tmp / "transcripts_copy"
+    for proj, session in (("proj-a", SESSION_A), ("proj-c", SESSION_C)):
+        (other / proj).mkdir(parents=True)
+        (other / proj / f"{session}.jsonl").write_bytes((troot / proj / f"{session}.jsonl").read_bytes())
+    roots = [("zz", troot), ("aa", other)]
+    be.build(sources, roots, cohorts, tmp / "out-rank")
+    rows = rows_by_id(tmp / "out-rank")
+    check(rows["ep_00000000000000a1"]["join_reason"] == "joined"
+          and rows["ep_00000000000000a1"]["transcript"]["source"] == "zz",
+          "a brief in two roots is taken from the first root given, not the first by name")
+    check(rows["ep_00000000000000c1"]["join_reason"] == "brief_not_found"
+          and rows["ep_00000000000000c1"]["transcript"]["source"] == "zz",
+          "a session in two roots is taken from the first root given")
+    be.build(sources, roots[::-1], cohorts, tmp / "out-rank2")
+    rows = rows_by_id(tmp / "out-rank2")
+    check(rows["ep_00000000000000a1"]["transcript"]["source"] == "aa"
+          and rows["ep_00000000000000c1"]["transcript"]["source"] == "aa",
+          "reversing the roots reverses the choice")
+
+
 def main() -> int:
     test_unit_helpers()
     with tempfile.TemporaryDirectory() as td:
         test_build(Path(td))
+    with tempfile.TemporaryDirectory() as td:
+        test_root_precedence(Path(td))
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     if FAILURES:

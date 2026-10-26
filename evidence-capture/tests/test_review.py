@@ -341,8 +341,67 @@ def test_privacy_scope_rejects(root: Path) -> None:
     assert review.deny_match("config/credentials.json", list(review.BUILTIN_DENY_GLOBS)) == "credentials*"
     assert review.deny_match("src/alpha.py", list(review.BUILTIN_DENY_GLOBS)) is None
     assert review.deny_match("keys/SERVER.PEM", list(review.BUILTIN_DENY_GLOBS)) == "*.pem"
+    assert review.deny_match("a/b", ["a/**/b"]) == "a/**/b"
+    assert review.deny_match("secrets/.env", ["secrets/**/.env"]) == "secrets/**/.env"
+    assert review.deny_match("ab", ["a/**/b"]) is None
+    for rel in ("a/b/c", "a/b/x/c", "a/x/b/c", "a/x/b/y/c"):
+        assert review.deny_match(rel, ["a/**/b/**/c"]) == "a/**/b/**/c"
+    assert review.deny_match("a/b", ["a/**/**/b"]) == "a/**/**/b"
     assert review.outside_paths("https://example.invalid/a/b and http://x.invalid/c", Path(root)) == []
     assert review.load_capture_config(root / "nowhere")["present"] is False
+
+
+def test_deny_glob_double_star_matches_root(root: Path) -> None:
+    """``**/x`` means x at any depth, the repository root included: a root-level private
+    file must not pass the screen because fnmatch has no ``**``."""
+    globs = ["**/private.json", "**/vault/**"]
+    for rel in ("private.json", "a/private.json", "a/b/private.json", "vault/k.txt", "x/vault/k.txt"):
+        assert review.deny_match(rel, globs) is not None, rel
+    for rel in ("private.json.bak", "a/public.json", "vaults/k.txt"):
+        assert review.deny_match(rel, globs) is None, rel
+    assert review.deny_match("x", ["**/"]) is None
+    # A repeated leading ``**/`` is the same pattern; it must not lose the root-level match.
+    for rel in ("k.pem", "a/k.pem", "a/b/k.pem"):
+        assert review.deny_match(rel, ["**/**/*.pem"]) is not None, rel
+        assert review.deny_match(rel, ["**/**/**/*.pem"]) is not None, rel
+    assert review.deny_match("k.pem.bak", ["**/**/*.pem"]) is None
+    st = make_stores(root)
+    repo = tc.make_repo(root)
+    (repo / ".evidence-compiler").mkdir()
+    (repo / ".evidence-compiler" / "config.yaml").write_text(
+        "capture:\n  deny_globs:\n    - '**/private.json'\n", encoding="utf-8")
+    (repo / "private.json").write_text("{\"k\": \"synthetic\"}\n", encoding="utf-8")
+    m, inputs = episode(st, repo)
+    privacy = review.privacy_check(m, st.snapshots / m["episode_id"], inputs)
+    if review.load_capture_config(repo)["error"] == "yaml_unavailable":
+        # no PyYAML on this interpreter: the config cannot be read and the check fails closed
+        want = {"check": "deny_glob", "source": "config", "error": "yaml_unavailable"}
+    else:
+        want = {"check": "deny_glob", "source": "snapshot", "glob_source": "config",
+                "sha256": common.sha256_bytes(b"private.json")}
+    assert any(all(f.get(k) == v for k, v in want.items()) for f in privacy["findings"]), privacy["findings"]
+    assert privacy["by_check"]["deny_glob"] == 1 and privacy["findings_total"] == 1, privacy
+    assert review.review_episode(st, m, inputs)["reason"] == "privacy_scope"
+
+
+def test_privacy_scope_non_ascii_root(root: Path) -> None:
+    """A repository root with non-ASCII characters is compared as written to the payload,
+    so a settings path inside it clears and one outside it is still flagged."""
+    st = make_stores(root)
+    (root / "zoë-ünï").mkdir()
+    repo = tc.make_repo(root / "zoë-ünï", "repo")
+    inside = repo.as_posix() + "/src/alpha.py"
+    m, inputs = episode(st, repo, prompt=f"fix {inside}")
+    inputs = dataclasses.replace(inputs, settings={**inputs.settings, "cwd": inside})
+    privacy = review.privacy_check(m, st.snapshots / m["episode_id"], inputs)
+    assert privacy["passed"], privacy["findings"]
+    assert review.review_episode(st, m, inputs)["state"] == "materialized"
+    assert json.loads((st.payloads / m["episode_id"] / "settings.json").read_text(encoding="utf-8"))["cwd"] == inside
+    outside = (root / "zoë-ünï" / "other" / "x.py").as_posix()
+    inputs2 = dataclasses.replace(inputs, settings={**inputs.settings, "cwd": outside})
+    m2, _ = episode(st, repo, prompt="second")
+    privacy2 = review.privacy_check(m2, st.snapshots / m2["episode_id"], inputs2)
+    assert privacy2["by_check"]["path_outside_repo"] == 1 and privacy2["findings"][0]["source"] == "settings", privacy2
 
 
 def test_review_excluded_held(root: Path) -> None:

@@ -26,7 +26,9 @@ returned, never guessed at, so the caller can publish the miss rate.
 
 from __future__ import annotations
 
+import itertools
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 READ = {
@@ -184,6 +186,9 @@ class Segment:
     queries: list[str] = field(default_factory=list)
     miss_reason: str | None = None
     has_pathlike: bool = False
+    # Subshells enclosing the segment, outermost first, each a unique id within the command
+    # (``( ... )`` and ``$( ... )``). A cd inside one does not move segments outside it.
+    scope: tuple[int, ...] = ()
 
 
 def _is_absolute(p: str) -> bool:
@@ -455,6 +460,55 @@ def flags_and_positionals(verb: str, args: list[str]) -> tuple[list[str], list[t
     return pos, flagged
 
 
+FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
+FIND_OUTFILE = {"-fprint", "-fprint0", "-fprintf", "-fls"}  # create or truncate their argument
+FIND_EXEC_END = {";", "\\;", "+"}
+
+
+def _split_find_exec(args: list[str]) -> tuple[list[str], list[list[str]], list[str], bool]:
+    """``find`` arguments without its write actions: each ``-exec``-style action's own
+    command (``{}`` dropped), the files ``-fprint``-style actions write, and whether
+    ``-delete`` removes what was found. None of these are searched paths."""
+    outer: list[str] = []
+    nested: list[list[str]] = []
+    outfiles: list[str] = []
+    delete = False
+    i = 0
+    while i < len(args):
+        low = args[i].lower()
+        if low == "-delete":
+            delete = True
+        elif low in FIND_OUTFILE and i + 1 < len(args):
+            outfiles.append(args[i + 1])
+            i += 1
+            if low == "-fprintf":
+                i += 1  # the format
+        elif low in FIND_EXEC:
+            cmd: list[str] = []
+            i += 1
+            while i < len(args) and args[i] not in FIND_EXEC_END:
+                if args[i] != "{}":
+                    cmd.append(args[i])
+                i += 1
+            if cmd:
+                nested.append(cmd)
+        else:
+            outer.append(args[i])
+        i += 1
+    return outer, nested, outfiles, delete
+
+
+def _requote(tok: str) -> str:
+    return "'" + tok.replace("'", "'\\''") + "'" if re.search(r"[\s'\"]", tok) else tok
+
+
+def _sed_in_place(flagged: list[tuple[str, str]]) -> bool:
+    """``-i``, ``-i.bak``, ``--in-place[=SUF]`` or a bundle such as ``-ni``."""
+    return any(fl == "--in-place" or (fl.startswith("-") and not fl.startswith("--")
+                                      and fl[1:2].isalpha() and "i" in fl[1:].split(".", 1)[0])
+               for fl, _ in flagged)
+
+
 def _clean_arg(a: str) -> str | None:
     a = a.strip().rstrip(",;")
     if not a or a in {"-", ".", "..", "/", "~", "*"} or SUB in a or BODY in a:
@@ -522,6 +576,11 @@ def parse_segment(seg: str) -> Segment:
     if glued != verb and glued in CONTROL:
         verb = glued
     args = words[1:]
+    nested: list[list[str]] = []
+    find_outfiles: list[str] = []
+    find_delete = False
+    if verb == "find":
+        args, nested, find_outfiles, find_delete = _split_find_exec(args)
     has_path = bool(redirects) or any(is_pathlike(a) for a in words)
     s = Segment(seg, verb, "nonfile", has_pathlike=has_path)
     s.paths.extend(redirects)
@@ -540,7 +599,8 @@ def parse_segment(seg: str) -> Segment:
         s.kind = "nonfile"
         return s
     if verb in READ:
-        s.kind = "read"
+        role = "write" if verb == "sed" and _sed_in_place(flagged) else "read"
+        s.kind = role
         for fl, val in flagged:
             if fl in PATH_FLAGS and val:
                 add([val], "read")
@@ -548,7 +608,7 @@ def parse_segment(seg: str) -> Segment:
             pos = pos[1:]  # the script
         if verb in {"cut", "tr", "sort", "uniq", "column", "join", "paste", "comm", "fold", "jq"}:
             pos = [p for p in pos if is_pathlike(p)]
-        add(pos, "read")
+        add(pos, role)
     elif verb in SEARCH:
         s.kind = "search"
         s.queries.extend(v for fl, v in flagged if fl in QUERY_FLAGS and v)
@@ -566,10 +626,13 @@ def parse_segment(seg: str) -> Segment:
         git_base: str | None = None
         while j < len(args) and args[j].startswith("-"):
             if args[j] == "-C" and j + 1 < len(args):
-                # An argument the parser cannot evaluate (a variable) is kept as "$", unresolved.
-                d = _clean_arg(args[j + 1]) or "$"
-                # Successive -C options compose, as in git itself.
-                git_base = d if git_base is None or _is_absolute(d) else f"{git_base}/{d}"
+                raw_dir = args[j + 1].strip()
+                if raw_dir != ".":  # -C . leaves the directory as it is
+                    # '..' is the parent of the directory in effect; any other argument the
+                    # parser cannot evaluate (a variable, ~, /) is kept as "$", unresolved.
+                    d = ".." if raw_dir == ".." else _clean_arg(raw_dir) or "$"
+                    # Successive -C options compose, as in git itself.
+                    git_base = d if git_base is None or _is_absolute(d) else f"{git_base}/{d}"
             j += 2 if args[j] in {"-C", "-c", "--git-dir", "--work-tree"} else 1
         sub = args[j].lower() if j < len(args) else ""
         rest = args[j + 1:]
@@ -621,29 +684,79 @@ def parse_segment(seg: str) -> Segment:
     elif s.has_pathlike:
         s.kind = "miss"
         s.miss_reason = f"unknown verb {verb}"
+    roots = [u for u in s.paths if u.role == "search"]
+    for cmd in nested:  # find -exec: the action's own roles (a nested rm is a write)
+        inner = parse_segment(" ".join(_requote(c) for c in cmd))
+        s.paths.extend(inner.paths)
+        if inner.kind in {"read", "write", "exec"}:  # the action runs on what find found under its roots
+            s.paths.extend(PathUse(u.path, inner.kind, inner.verb or verb) for u in roots)
+            s.kind = inner.kind
+        if inner.kind == "miss" and s.kind != "miss":
+            s.kind, s.miss_reason = "miss", f"find action: {inner.miss_reason}"
+    if find_delete or find_outfiles:
+        if find_delete:  # -delete removes what was found under the roots
+            s.paths.extend(PathUse(u.path, "write", verb) for u in roots)
+        add(find_outfiles, "write")
+        if s.kind != "miss":
+            s.kind = "write"
     return s
 
 
+PLACEHOLDER_RE = re.compile(re.escape(SUB) + "|" + re.escape(BLOCK))
+
+
+def _parse_chunk(chunk: str, scope: tuple[int, ...], out: list[Segment], ids: Iterator[int],
+                 inherited_subs: list[str] | None = None) -> None:
+    """Append the chunk's segments to out in execution order.
+
+    A substitution or block runs where it stands: its segments come before the segment that
+    contains it, so each resolves against the working directory in effect at that position.
+    A substitution is a subshell (a scope of its own); a ``{ ... }`` block runs in the
+    current shell. ``inherited_subs`` are the substitutions already extracted from an
+    enclosing chunk whose placeholders sit inside this block."""
+    flat, subs = extract_subs(chunk)
+    if inherited_subs:
+        subs = inherited_subs  # the enclosing chunk already extracted every balanced group
+    flat, blocks, blocks_ok = extract_blocks(flat)
+    if not blocks_ok:
+        out.append(Segment(flat, None, "miss", miss_reason="unbalanced_block", has_pathlike=True, scope=scope))
+    segs, balanced = split_segments(flat)
+    parsed = [parse_segment(s) for s in segs]
+    if not balanced and parsed and parsed[-1].kind != "miss":
+        last = parsed[-1]
+        parsed[-1] = Segment(last.text, last.verb, "miss", last.paths, last.queries,
+                             "unbalanced_command", True)
+    sub_q, block_q = list(subs), list(blocks)
+
+    def run_sub(inner: str) -> None:
+        _parse_chunk(inner, scope + (next(ids),), out, ids)
+
+    def run_block(inner: str) -> None:
+        k = inner.count(SUB)
+        own, sub_q[:] = sub_q[:k], sub_q[k:]
+        _parse_chunk(inner, scope, out, ids, own)
+
+    for text, seg in zip(segs, parsed):
+        for m in PLACEHOLDER_RE.finditer(text):
+            if m.group(0) == SUB and sub_q:
+                run_sub(sub_q.pop(0))
+            elif m.group(0) == BLOCK and block_q:
+                run_block(block_q.pop(0))
+        seg.scope = scope
+        out.append(seg)
+    # Placeholders the segment split did not carry (none expected): parsed after, as before.
+    while block_q:
+        run_block(block_q.pop(0))
+    while sub_q:
+        run_sub(sub_q.pop(0))
+
+
 def parse_command(text: str) -> tuple[list[Segment], list[PathUse]]:
-    """Segments of a shell command (substitutions included), plus heredoc/here-string literals."""
+    """Segments of a shell command (substitutions included) in execution order, plus
+    heredoc/here-string literals."""
     body_free, bodies = strip_bodies(text)
     out: list[Segment] = []
-    queue = [body_free]
-    while queue:
-        chunk = queue.pop(0)
-        flat, inner = extract_subs(chunk)
-        queue.extend(inner)
-        flat, blocks, blocks_ok = extract_blocks(flat)
-        queue.extend(blocks)
-        if not blocks_ok:
-            out.append(Segment(flat, None, "miss", miss_reason="unbalanced_block", has_pathlike=True))
-        segs, balanced = split_segments(flat)
-        parsed = [parse_segment(s) for s in segs]
-        if not balanced and parsed and parsed[-1].kind != "miss":
-            last = parsed[-1]
-            parsed[-1] = Segment(last.text, last.verb, "miss", last.paths, last.queries,
-                                 "unbalanced_command", True)
-        out.extend(parsed)
+    _parse_chunk(body_free, (), out, itertools.count(1))
     script = [PathUse(lit, "script", "heredoc") for line in bodies
               for _, lit in LITERAL_RE.findall(line) if is_pathlike(lit)]
     return out, script

@@ -61,6 +61,11 @@ HEX = re.compile(rb"^[0-9a-f]{40}([0-9a-f]{24})?$")
 OPERATION_FILES = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG")
 P7_FORBIDDEN = re.compile(r"^(remote\.|credential\.|url\.|include|core\.hookspath=|fetch\.)", re.I)
 PROOFS = ("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10")
+CORE_CONFIG_KEYS = ("core.autocrlf", "core.symlinks")
+# The only shapes these keys take (booleans and ``input``); git stops option parsing at
+# the key, so a ``-`` value is stored literally, but the value is snapshot data and
+# never reaches git unless it looks like one.
+CONFIG_VALUE = re.compile(r"[A-Za-z0-9]{1,16}")
 SABOTAGES = ("keep_tag", "keep_reflog", "add_alternates", "leave_remote", "add_hook", "hardlink_pack",
              "copy_post_start_blob", "full_fetch", "fetch_stash", "fetch_orphan")
 GIT_TIMEOUT_S = 300
@@ -121,6 +126,9 @@ def build_clone(source: Path, start_sha: str, dest: Path, *, core_config: dict[s
         raise CloneError(f"destination exists: {dest}")
     if not HEX.match(start_sha.encode()):
         raise CloneError("start_sha must be a full object name")
+    for key, value in (core_config or {}).items():
+        if key not in CORE_CONFIG_KEYS or not (value is None or isinstance(value, str) and CONFIG_VALUE.fullmatch(value)):
+            raise CloneError(f"core_config {key!r} is not a config value: {value!r}"[:300])
     log: list[dict[str, Any]] = []
     dest.parent.mkdir(parents=True, exist_ok=True)
     objects = dest.parent / (dest.name + ".objects.tmp")
@@ -389,8 +397,19 @@ class ReconstructionError(RuntimeError):
 
 
 def snapshot_core_config(snapshot: Path) -> dict[str, str | None]:
+    """The captured ``core.*`` values ``build_clone`` restores. Snapshot data: a value that
+    is not a config value (``CONFIG_VALUE``) or ``None`` is a ``CloneError``, so a crafted
+    ``git-config.json`` is a recorded failure, never an argument to git."""
     cfg = json.loads((snapshot / "git-config.json").read_text(encoding="utf-8"))
-    return {k: cfg.get(k) for k in ("core.autocrlf", "core.symlinks")}
+    if not isinstance(cfg, dict):
+        raise CloneError("git-config.json is not an object")
+    out: dict[str, str | None] = {}
+    for key in CORE_CONFIG_KEYS:
+        value = cfg.get(key)
+        if not (value is None or isinstance(value, str) and CONFIG_VALUE.fullmatch(value)):
+            raise CloneError(f"git-config.json {key} is not a config value: {value!r}"[:300])
+        out[key] = value
+    return out
 
 
 def _stage_entries(listing: bytes) -> list[tuple[str, str, str, str]]:
@@ -425,8 +444,51 @@ def _prune_empty_dirs(root: Path) -> None:
             pass
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _contained(dest: Path, rel: Any) -> Path:
+    """``dest / rel`` when ``rel`` is a plain relative path that stays inside ``dest``:
+    no absolute, drive, UNC or ``\\?\\`` form, no ``.``/``..``/empty segment, nothing
+    under ``.git`` (also as ``.git.``), no segment Windows would rewrite, and no existing ancestor that is a symlink or junction (a write must
+    never pass through an earlier link). Anything else is ``unsafe_entry_path``.
+
+    The ancestor check is check-then-use: a process that swaps an ancestor for a link
+    between it and the write already has write access to ``dest`` on this machine and
+    could as well rewrite the file afterwards; neither Windows nor POSIX offers a
+    portable no-follow directory walk from Python, so the race is accepted.
+
+    Snapshot data is not trusted for this: SHA256SUMS only shows the snapshot is
+    internally consistent, not who wrote it."""
+    if not isinstance(rel, str) or not rel or "\x00" in rel or "\\" in rel:
+        raise ReconstructionError("unsafe_entry_path", "not a plain relative path")
+    parts = rel.split("/")
+    if (rel.startswith("/") or re.match(r"[A-Za-z]:", rel)
+            or any(s in ("", ".", "..") for s in parts)
+            or parts[0].rstrip(". ").lower() == ".git"):
+        raise ReconstructionError("unsafe_entry_path", "absolute, dotted or .git path")
+    # Win32 drops a segment's trailing dots and spaces (".git." is ".git") and reads
+    # "name:stream" as an alternate data stream; neither can be a faithful file there.
+    if os.name == "nt" and any(s != s.rstrip(". ") or ":" in s for s in parts):
+        raise ReconstructionError("unsafe_entry_path", "segment Windows would rewrite")
+    cur = dest
+    for s in parts[:-1]:
+        cur = cur / s
+        if cur.is_symlink() or getattr(os.path, "isjunction", lambda _p: False)(cur):
+            raise ReconstructionError("unsafe_entry_path", "an ancestor is a link")
+    target = dest / Path(*parts)
+    try:
+        target.parent.resolve().relative_to(dest.resolve())
+    except ValueError:
+        raise ReconstructionError("unsafe_entry_path", "resolves outside the clone") from None
+    return target
+
+
 def _write_entry(dest: Path, entry: dict[str, Any], source_dir: Path, symlinks: bool) -> None:
-    target = dest / entry["path"]
+    target = _contained(dest, entry.get("path"))
+    if entry.get("symlink") is None and not (isinstance(entry.get("sha256"), str)
+                                             and _HEX64.fullmatch(entry["sha256"])):
+        raise ReconstructionError("unsafe_entry_path", "blob name is not a sha256")
     if target.is_symlink() or target.exists():
         _remove_path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -445,7 +507,11 @@ def _write_entry(dest: Path, entry: dict[str, Any], source_dir: Path, symlinks: 
 
 
 def reconstruct(dest: Path, snapshot: Path) -> dict[str, Any]:
-    """Rebuild the captured index and worktree in the clone at ``dest``."""
+    """Rebuild the captured index and worktree in the clone at ``dest``.
+
+    The SHA256SUMS check below is an integrity check against truncation or corruption,
+    not authentication: whoever can write the snapshot can rewrite its sums. Every entry
+    path is therefore confined to ``dest`` (``_contained``) on its own."""
     if (snapshot / "INCOMPLETE").exists() or verify_sums(snapshot):
         raise ReconstructionError("snapshot_unverified", "SHA256SUMS mismatch or INCOMPLETE present")
     ops = sorted(p.name for p in (snapshot / "state").glob("*") if p.name in OPERATION_FILES) \
@@ -458,7 +524,7 @@ def reconstruct(dest: Path, snapshot: Path) -> dict[str, Any]:
 
     # remove the start checkout's tracked files; the captured index decides what exists
     for rel in _tree_paths((snapshot / "ls-tree-head.z").read_bytes()):
-        _remove_path(dest / rel)
+        _remove_path(_contained(dest, rel))
     _prune_empty_dirs(dest)
 
     blobs_dir = snapshot / "blobs"
@@ -490,7 +556,7 @@ def reconstruct(dest: Path, snapshot: Path) -> dict[str, Any]:
 
     for entry in json.loads((snapshot / "worktree.json").read_text(encoding="utf-8")):
         if entry.get("deleted"):
-            _remove_path(dest / entry["path"])
+            _remove_path(_contained(dest, entry.get("path")))
         else:
             _write_entry(dest, entry, snapshot / "worktree", symlinks)
         info["worktree"] += 1

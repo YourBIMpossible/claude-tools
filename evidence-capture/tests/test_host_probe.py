@@ -74,24 +74,10 @@ def test_arm_disarm(case: Path) -> None:
     out = case / "probe-out"
     hp.setup(out)
     assert hp.main(["arm", "--out", str(out), "--a-sleep", "6"]) == 0
-    assert json.loads((out / "control.json").read_text(encoding="utf-8")) == {"a_sleep": 6.0, "once": False}
+    assert json.loads((out / "control.json").read_text(encoding="utf-8")) == {"a_sleep": 6.0}
     assert hp.main(["disarm", "--out", str(out)]) == 0
-    assert json.loads((out / "control.json").read_text(encoding="utf-8")) == {"a_sleep": hp.A_DEFAULT_SLEEP_S, "once": False}
+    assert json.loads((out / "control.json").read_text(encoding="utf-8")) == {"a_sleep": hp.A_DEFAULT_SLEEP_S}
     assert hp.main(["arm", "--out", str(case / "not-a-probe"), "--a-sleep", "1"]) == 2
-
-
-def test_one_shot_arm_claimed_by_one_turn(case: Path) -> None:
-    out = case / "probe-out"
-    repo = hp.setup(out)
-    assert hp.main(["arm", "--out", str(out), "--a-sleep", "3.5", "--once"]) == 0
-    env = _hook_env(case / "transcripts")
-    for _ in range(2):
-        sid = str(uuid.uuid4())
-        _run_hooks(out, "UserPromptSubmit", {"session_id": sid, "cwd": str(repo), "hook_event_name": "UserPromptSubmit",
-                                             "prompt": dryrun.PROMPT, "transcript_path": ""}, env)
-    sleeps = [e["sleep_s"] for e in hp.read_events(out) if e["hook"] == "A" and e["ev"] == "start"]
-    assert sleeps == [3.5, hp.A_DEFAULT_SLEEP_S], sleeps
-    assert not (out / "control.json").exists() and (out / "control.used.json").is_file()
 
 
 def test_probe_hooks_end_to_end(case: Path) -> None:
@@ -172,7 +158,7 @@ def test_analyse_turns(case: Path) -> None:
     assert not r["e_stop_sees_final_message"]["passed"] and r["e_stop_sees_final_message"]["at_stop"] == [False]
 
 
-TESTS = [test_setup_layout, test_arm_disarm, test_one_shot_arm_claimed_by_one_turn, test_probe_hooks_end_to_end, test_analyse_turns]
+TESTS = [test_setup_layout, test_arm_disarm, test_probe_hooks_end_to_end, test_analyse_turns]
 
 
 def main() -> int:

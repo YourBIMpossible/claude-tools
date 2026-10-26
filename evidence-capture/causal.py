@@ -120,15 +120,7 @@ def _scan(top: Path) -> tuple[dict[str, dict[str, Any]], dict[str, bytes]]:
     return files, blobs
 
 
-def mixed_eol(data: bytes) -> bool:
-    """CRLF together with a lone LF or CR: no checkout of any blob conversion writes this,
-    so the bytes cannot be derived from history and must be kept."""
-    crlf = data.count(b"\r\n")
-    return crlf > 0 and (data.count(b"\n") != crlf or data.count(b"\r") != crlf)
-
-
-def byte_manifest(top: Path, *, deadline: float | None = None, timeout: float = 60.0,
-                  keep: dict[str, bytes] | None = None) -> dict[str, str] | None:
+def byte_manifest(top: Path, *, deadline: float | None = None, timeout: float = 60.0) -> dict[str, str] | None:
     """``{path: sha256(raw bytes)}`` over every tracked and untracked-unignored path present
     in the worktree (symlinks hashed as their target text). ``None`` when ``deadline``
     (``time.monotonic``) passes first: fidelity is then unproven, never approximated."""
@@ -141,11 +133,7 @@ def byte_manifest(top: Path, *, deadline: float | None = None, timeout: float = 
         if deadline is not None and _time.monotonic() > deadline:
             raise TimeoutError
         got = _read_entry(top, rel)
-        if got is None:
-            return None
-        if keep is not None and got[0]["mode"] != "120000" and mixed_eol(got[1]):
-            keep[rel] = got[1]  # dict item assignment is atomic across the pool's threads
-        return rel, got[0]["sha256"]
+        return None if got is None else (rel, got[0]["sha256"])
 
     try:
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -222,12 +210,11 @@ def verify_state(dest: Path) -> list[str]:
         return ["state.json missing"]
     problems = list(verify_sums(dest))
     record = read_state(dest)
-    refs = {rel: e["sha256"] for rel, e in record["files"].items()} | dict(record.get("raw") or {})
-    for rel, digest in refs.items():
-        obj = dest / "objects" / digest
+    for rel, entry in record["files"].items():
+        obj = dest / "objects" / entry["sha256"]
         if not obj.is_file():
             problems.append(f"object missing for {rel}")
-        elif sha256_bytes(obj.read_bytes()) != digest:
+        elif sha256_bytes(obj.read_bytes()) != entry["sha256"]:
             problems.append(f"object corrupt for {rel}")
     return problems
 
@@ -297,9 +284,12 @@ def _overlay_candidates(top: Path, timeout: float) -> tuple[list[str], set[str]]
 
 
 def _conversion(top: Path) -> dict[str, str | None]:
-    """The effective (last-wins) value of each ``CONVERSION_KEYS`` setting, or None."""
+    """The effective (last-wins) value of each ``CONVERSION_KEYS`` setting, or None.
+    Raises CausalError when git cannot read the configuration (rc 1 is "no match")."""
     proc = subprocess.run(["git", "-C", str(top), "config", "-z", "--get-regexp", r"^core\.(autocrlf|eol|safecrlf)$"],
                           capture_output=True, env=git_env(), timeout=10)
+    if proc.returncode not in (0, 1):
+        raise CausalError(f"git_config_unreadable: rc {proc.returncode}")
     out: dict[str, str | None] = dict.fromkeys(CONVERSION_KEYS)
     for rec in proc.stdout.decode("utf-8", "replace").split("\0"):
         key, _, value = rec.partition("\n")
@@ -378,8 +368,7 @@ def capture_overlay(repo: Path, dest: Path, *, label: str, timeout: float = 10.0
     top_raw, head = _git(repo, "rev-parse", "--show-toplevel", "HEAD", timeout=timeout).decode().splitlines()  # top may contain spaces
     top = Path(top_raw)
     first, blobs = _read_overlay(top, timeout)  # with oids (git reads the files once more)
-    kept: dict[str, bytes] = {}
-    manifest = byte_manifest(top, deadline=bytes_deadline, timeout=timeout, keep=kept)
+    manifest = byte_manifest(top, deadline=bytes_deadline, timeout=timeout)
     second, _ = _read_overlay(top, timeout, oids=False)
     third = {rel: got[0] for rel in first["files"] if (got := _read_entry(top, rel)) is not None}
     plain = {rel: {k: v for k, v in e.items() if k != "oid"} for rel, e in first["files"].items()}
@@ -392,9 +381,7 @@ def capture_overlay(repo: Path, dest: Path, *, label: str, timeout: float = 10.0
         for rel, entry in first["files"].items():
             if manifest.get(rel) != entry["sha256"]:
                 raise CausalError("concurrent_change")
-        raw = {rel: manifest[rel] for rel in sorted(kept) if rel not in first["files"]}
-        blobs.update({manifest[rel]: kept[rel] for rel in raw})
-        record.update(bytes=manifest, bytes_sha256=manifest_digest(manifest), bytes_problem=None, raw=raw)
+        record.update(bytes=manifest, bytes_sha256=manifest_digest(manifest), bytes_problem=None)
     else:
         record.update(bytes=None, bytes_sha256=None, bytes_problem="budget")
     _seal(dest, record, blobs)
@@ -510,8 +497,6 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
     for k, v in rec["conversion"].items():
         if v is not None:
             subprocess.run(["git", "-C", str(out), "config", k, v], check=True, env=env, capture_output=True)
-    subprocess.run(["git", "-C", str(out), "config", "core.longpaths", "true"], check=True, env=env,
-                   capture_output=True)  # a deep path under a longer root; not part of the worktree bytes
     subprocess.run(["git", "-C", str(out), "remote", "remove", "origin"], env=env, capture_output=True)
     for rel in rec["deleted"]:
         (out / rel).unlink(missing_ok=True)
@@ -522,8 +507,6 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
         if entry["mode"] == "120000":
             return [f"symlink not reproducible: {rel}"]
         target.write_bytes(data)
-    for rel, digest in (rec.get("raw") or {}).items():  # clean files whose bytes history cannot produce
-        (out / rel).write_bytes((state_dest / "objects" / digest).read_bytes())
     _restore_raw_checkout_bytes(out, rec)
     paths, _ = _overlay_candidates(out, 60.0)
     expected = sorted(set(rec["files"]) | set(rec["deleted"]))
@@ -535,9 +518,8 @@ def materialize_overlay(state_dest: Path, history_dest: Path, out: Path) -> list
 def _restore_raw_checkout_bytes(out: Path, rec: dict[str, Any]) -> None:
     """A clean tracked file can hold bytes a fresh checkout would not write: it was checked
     out before the recorded conversion config was set (an LF file under ``autocrlf=true``),
-    which git still calls clean, or a CRLF file under ``eol=lf``. For each base path whose
-    checked-out bytes miss the capture-time sha256, write the unfiltered blob, or that blob
-    with LF -> CRLF, whichever matches the sha256.
+    which git still calls clean. For each base path whose checked-out bytes miss the
+    capture-time sha256, write the unfiltered blob instead when THAT matches the sha256.
     Nothing is guessed: a path matching neither stays different and ``verify_fidelity``
     reports it."""
     want = rec.get("bytes")
@@ -561,10 +543,8 @@ def _restore_raw_checkout_bytes(out: Path, rec: dict[str, Any]) -> None:
         size = int(head[2])
         data = buf[nl + 1:nl + 1 + size]
         pos = nl + 2 + size
-        for cand in (data, data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")):
-            if sha256_bytes(cand) == want[rel]:
-                (out / rel).write_bytes(cand)
-                break
+        if sha256_bytes(data) == want[rel]:
+            (out / rel).write_bytes(data)
 
 
 # ------------------------------------------------------------------ history store
@@ -645,7 +625,7 @@ def unsupported_state(repo: Path, *, lfs_scan: bool = True) -> list[str]:
         reasons.append("sparse_checkout")
     if any((gitdir / name).exists() for name in STATE_FILES):
         reasons.append("operation_in_progress")
-    lfs = False
+    lfs = unread = False
     rels = list_paths(repo) if lfs_scan else [
         name for e in entries
         if (name := e.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")).rsplit("/", 1)[-1] == ".gitattributes"]
@@ -660,9 +640,12 @@ def unsupported_state(repo: Path, *, lfs_scan: bool = True) -> list[str]:
                     lfs = True
                     break
         except OSError:
-            continue
+            # an unread small file may be an LFS pointer: the scan is incomplete, not clean
+            unread = True
     if lfs:
         reasons.append("lfs")
+    elif unread:
+        reasons.append("lfs_scan_incomplete")
     return reasons
 
 
@@ -727,7 +710,13 @@ def shared_git_state(repo: Path) -> str:
 def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, Any]]:
     """Every OTHER worktree sharing this repository: ``{path: {"fp", "head", "paths"}}``,
     where ``fp`` is sha256(HEAD + status) and ``paths`` the paths its status names
-    (statuses run concurrently; one that cannot finish raises ``worktree_status_timeout``)."""
+    (statuses run concurrently; one that cannot finish raises ``worktree_status_timeout``).
+
+    A worktree whose status command fails (non-zero exit: broken gitdir pointer, locked
+    index, unreadable checkout), or whose status resolved to some other repository (its
+    ``.git`` marker gone, git walked up to an enclosing checkout), is recorded as unobservable: ``fp`` and ``paths`` are
+    ``None`` and ``status_error`` carries the exit code and stderr. Its state was not
+    observed, so it is never equal to anything, not even to itself."""
     me = os.path.normcase(os.path.realpath(_git(repo, "rev-parse", "--show-toplevel").decode().strip()))
     out: dict[str, dict[str, Any]] = {}
     procs: dict[str, tuple[bytes, subprocess.Popen[bytes]]] = {}
@@ -741,20 +730,56 @@ def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, A
             continue
         procs[path] = (fields.get(b"HEAD", b""), subprocess.Popen(
             ["git", "-C", path, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_env()))
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env()))
     for path, (head, proc) in procs.items():
         try:
-            status, _ = proc.communicate(timeout=timeout)
+            status, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
             raise CausalError("worktree_status_timeout") from None
+        if proc.returncode != 0:
+            out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
+                         "status_error": {"rc": proc.returncode,
+                                          "stderr": err.decode("utf-8", "replace").strip()[:2000]}}
+            continue
+        mismatch = _toplevel_mismatch(path, timeout)
+        if mismatch is not None:
+            out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
+                         "status_error": {"rc": 0, "stderr": mismatch}}
+            continue
         out[path] = {"fp": sha256_bytes(head + b"\0" + status), "head": head.decode() or None,
                      "paths": _status_paths(status)}
     return out
 
 
-def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str]:
+def _toplevel_mismatch(path: str, timeout: float) -> str | None:
+    """Prove the status just taken was of ``path`` itself. A worktree whose ``.git`` marker
+    is gone makes git walk up to an enclosing repository (the house layout nests lanes
+    in an ignored directory inside the repository): status then exits 0 with
+    no output whatever changed inside. Returns the reason when the toplevel git resolves
+    for ``path`` is not ``path``, or when it cannot be resolved; ``None`` when it matches."""
+    try:
+        res = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True,
+                             env=git_env(), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "toplevel unresolved: timeout"
+    if res.returncode != 0:
+        return f"toplevel unresolved: rc {res.returncode}: {res.stderr.decode('utf-8', 'replace').strip()[:500]}"
+    got = res.stdout.decode("utf-8", "surrogateescape").strip()
+    if os.path.normcase(os.path.realpath(got)) != os.path.normcase(os.path.realpath(path)):
+        return f"toplevel mismatch: {got}"
+    return None
+
+
+def unobservable_worktrees(*records: dict[str, dict[str, Any]] | None) -> list[str]:
+    """Worktrees any given record set could not observe (``fp`` is ``None``: the status
+    command failed). Such a worktree has no state to compare, so it can never be unmoved."""
+    return sorted({k for recs in records if recs for k, v in recs.items() if (v or {}).get("fp") is None})
+
+
+def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str | None]:
+    """``None`` for a worktree whose status could not be observed."""
     return {k: v["fp"] for k, v in worktree_records(repo, timeout).items()}
 
 
@@ -770,7 +795,8 @@ def classify_worktrees(start: dict[str, dict[str, Any]] | None, end: dict[str, d
     """Split other-worktree movement during a turn into ``contaminating`` (it can have
     reached this task's inputs, dependencies, shared state or attribution), ``unrelated``
     (preserved evidence shows it cannot have) and ``unknown`` (the evidence to decide is
-    missing). Unknown is never unrelated.
+    missing). Unknown is never unrelated. A worktree whose status failed on either side
+    (``fp`` None, see ``worktree_records``) is unknown whether or not it appears moved.
 
     A moved worktree is unrelated only when every one of these holds: both records exist
     with path lists; the shared git state is unchanged; every tool call of the turn
@@ -784,7 +810,10 @@ def classify_worktrees(start: dict[str, dict[str, Any]] | None, end: dict[str, d
         out["shared_state_changed"] = None
     else:
         out["shared_state_changed"] = shared_start != shared_end
-    moved = sorted(k for k in set(start) | set(end) if (start.get(k) or {}).get("fp") != (end.get(k) or {}).get("fp"))
+    unobserved = set(unobservable_worktrees(start, end))
+    out["unknown"] += sorted(unobserved)  # status failed on one side: no state to compare, never unmoved
+    moved = sorted(k for k in (set(start) | set(end)) - unobserved
+                   if (start.get(k) or {}).get("fp") != (end.get(k) or {}).get("fp"))
     texts: list[str] | None = None
     if calls is not None and subagents_unresolved == 0:
         texts = [json.dumps(c.get("input") or {}, ensure_ascii=False).replace("\\\\", "/").replace("\\", "/").lower()
@@ -814,14 +843,16 @@ def classify_worktrees(start: dict[str, dict[str, Any]] | None, end: dict[str, d
 
 
 def attribute(start: dict[str, Any], end: dict[str, Any], agent_writes: list[str], *,
-              top: str | None = None, worktrees_start: dict[str, str] | None = None,
-              worktrees_end: dict[str, str] | None = None) -> dict[str, Any]:
-    """Every change must be one the agent wrote; other worktrees must not move."""
+              top: str | None = None, worktrees_start: dict[str, str | None] | None = None,
+              worktrees_end: dict[str, str | None] | None = None) -> dict[str, Any]:
+    """Every change must be one the agent wrote; other worktrees must not move. A
+    worktree fingerprint of ``None`` (status failed) is never equal: it counts as moved."""
     written = {os.path.normcase(_norm_rel(p, top)) for p in agent_writes}
     changed = changed_paths(start, end)
     unattributed = [p for p in changed if os.path.normcase(p) not in written]
-    moved = sorted(k for k in set(worktrees_start or {}) | set(worktrees_end or {})
-                   if (worktrees_start or {}).get(k) != (worktrees_end or {}).get(k))
+    ws, we = worktrees_start or {}, worktrees_end or {}
+    moved = sorted(k for k in set(ws) | set(we)
+                   if ws.get(k) is None or we.get(k) is None or ws.get(k) != we.get(k))
     return {"changed": changed, "unattributed": unattributed, "other_worktrees_moved": moved,
             "head_moved": start.get("head") != end.get("head"),
             "isolated": not unattributed and not moved}

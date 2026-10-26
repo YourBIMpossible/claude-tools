@@ -12,9 +12,11 @@ import os
 import re
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
@@ -27,10 +29,11 @@ import pipeline  # noqa: E402
 import report  # noqa: E402
 import store  # noqa: E402
 from common import iso, now_utc, read_json, write_json_atomic  # noqa: E402
-from test_hooks import PROMPT, Fixture  # noqa: E402
+from test_hooks import PROMPT, Fixture, Skip, load_inconclusive  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
+SKIPPED: list[str] = []
 V = dryrun.CLI_VERSION
 MODE = dryrun.SYNTHETIC_MODE
 
@@ -75,6 +78,8 @@ def test_end_to_end_trusted_and_no_path(root: Path) -> None:
     m = fx.episode(sid)
     ident = read_json(fx.boundary / ci.record_name(V, MODE))["identity"]
     assert m["client"]["sha256"] == ident["sha256"] and m["client"]["mode"] == MODE, m["client"]
+    if (why := load_inconclusive(m)) is not None:
+        raise Skip(f"inconclusive under load, {why}")
     assert m["boundary"]["trusted"] is True, m["boundary"]
     assert m["boundary"]["client"]["sha256"] == ident["sha256"]
     text = store.manifest_path(fx.stores, m["episode_id"]).read_text(encoding="utf-8")
@@ -98,11 +103,75 @@ def test_unidentified_client_fails_closed_without_failing_capture(root: Path) ->
         fx.end(sid, fx.transcript(sid, PROMPT, pid, ts), env=env)
         m = fx.episode(sid)
         assert m["client"]["problem"] == problem, (problem, m["client"])
+        if (why := load_inconclusive(m)) is not None:  # the over-budget branch: next test, by construction
+            raise Skip(f"inconclusive under load ({problem}), {why}")
         assert m["capture"]["status"] == "complete", (problem, m["capture"])
         b = m["boundary"]
         assert not b["trusted"] and b["reason"] == f"identity_unverified:{problem}", (problem, b)
         assert report._boundary_bucket(b["reason"]) == "cli_untested"
         assert not m["funnel"]["start_snapshot_complete"]
+
+
+class _TrippableClock:
+    """``time`` as pipeline sees it: ``perf_counter`` reads 0 until tripped, then a value
+    past the start budget; everything else is the real module."""
+
+    def __init__(self) -> None:
+        self.tripped = False
+
+    def perf_counter(self) -> float:
+        return (pipeline.START_BUDGET_MS + 500) / 1000 if self.tripped else 0.0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+SNAPSHOT_BUDGET_S = 60.0
+
+
+def test_over_budget_start_keeps_identity_verdict(root: Path) -> None:
+    """N19, by construction: a start that runs over ``START_BUDGET_MS`` (the clock is
+    tripped after the snapshot, so the snapshot itself keeps its budget) records
+    ``start_over_budget`` and ends ``partial``, never ``failed``; the client problem and
+    the untrusted boundary are unchanged by it, and the review is held on X7 (which is
+    what an over-budget run under load looks like to the wall-clock tests)."""
+    try:
+        import yaml  # noqa: F401
+    except ImportError as exc:  # the fixture repo carries config.yaml: every capture would add config:yaml_unavailable
+        raise Skip("PyYAML missing (pip install pyyaml): the capture errors could not be pinned to the budget") from exc
+    fx = Fixture(root)
+    env = {k: v for k, v in fx.env.items() if k != ci.ENV_PID}
+    sid = str(uuid.uuid4())
+    ts = iso(now_utc())
+    clock = _TrippableClock()
+    real_time, real_snapshot = pipeline.time, pipeline.take_snapshot
+
+    def snapshot_then_trip(*args: Any, **kw: Any) -> Any:
+        # the snapshot is not under test here: a load-proof budget, so only the tripped clock
+        # (never real machine load) puts the start over budget
+        kw["budget_s"] = SNAPSHOT_BUDGET_S
+        out = real_snapshot(*args, **kw)
+        clock.tripped = True
+        return out
+    pipeline.time, pipeline.take_snapshot = clock, snapshot_then_trip  # type: ignore[assignment]
+    try:
+        res = pipeline.run_start({"session_id": sid, "prompt": PROMPT, "cwd": str(fx.repo)}, env, now=ts)
+    finally:
+        pipeline.time, pipeline.take_snapshot = real_time, real_snapshot  # type: ignore[assignment]
+    assert res["action"] == "captured" and res["start_ms"] > pipeline.START_BUDGET_MS, res
+    m = fx.episode(sid)
+    assert m["start_snapshot"]["state"] == "complete", m["start_snapshot"]
+    assert m["capture"]["errors"] == ["start_over_budget"], m["capture"]
+    tp = fx.transcript(sid, PROMPT, None, ts)
+    res = pipeline.run_end({"session_id": sid, "transcript_path": str(tp), "cwd": str(fx.repo)}, env)
+    assert res["action"] == "ended" and res["status"] == "partial", res
+    m = fx.episode(sid)
+    assert m["capture"]["status"] == "partial" and m["capture"]["errors"] == ["start_over_budget"], m["capture"]
+    assert m["client"]["problem"] == "pid_missing", m["client"]
+    b = m["boundary"]
+    assert not b["trusted"] and b["reason"] == "identity_unverified:pid_missing", b
+    assert m["review"]["state"] == "held" and m["review"]["reason"] == "unknown:X7", m["review"]
+    assert load_inconclusive(m) is not None, "the wall-clock tests must recognise this shape as load"
 
 
 def test_observe(root: Path) -> None:
@@ -219,7 +288,7 @@ def test_no_command_line_or_secret_reads(root: Path) -> None:
 
 
 TESTS = [test_end_to_end_trusted_and_no_path, test_unidentified_client_fails_closed_without_failing_capture,
-         test_observe, test_resolve_cache_and_drift, test_load_boundary_reasons,
+         test_over_budget_start_keeps_identity_verdict, test_observe, test_resolve_cache_and_drift, test_load_boundary_reasons,
          test_acceptance_takes_effect_in_maintenance, test_tested_identity, test_no_command_line_or_secret_reads]
 
 
@@ -234,12 +303,15 @@ def main() -> int:
             try:
                 fn(case)
                 PASSED.append(fn.__name__)
+            except Skip as exc:
+                SKIPPED.append(fn.__name__)
+                print(f"SKIP {fn.__name__}: {exc}")
             except Exception:  # noqa: BLE001 — plain-check runner
                 FAILED.append(fn.__name__)
                 print(f"FAIL {fn.__name__}\n{traceback.format_exc()}")
     for name in PASSED:
         print(f"ok   {name}")
-    print(f"{len(PASSED)} passed, {len(FAILED)} failed")
+    print(f"{len(PASSED)} passed, {len(FAILED)} failed, {len(SKIPPED)} skipped")
     return 1 if FAILED else 0
 
 

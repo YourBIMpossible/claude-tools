@@ -111,7 +111,6 @@ def transcript_lines(turns: list[dict], version: str = "9.9.9") -> list[str]:
         for k, tool in enumerate(t.get("tools", [])):
             tid = f"toolu_{n}_{k}"
             lines.append(json.dumps({"type": "assistant", "timestamp": ts, "sessionId": SESSION, "version": version,
-                                     **({"cwd": tool["cwd"]} if tool.get("cwd") else {}),
                                      "message": {"id": f"msg_{n}_{k}", "role": "assistant", "content": [
                                          {"type": "tool_use", "id": tid, "name": tool["name"], "input": tool["input"]}]}}))
             result = {"type": "user", "timestamp": ts, "sessionId": SESSION,
@@ -237,6 +236,9 @@ def test_snapshot_stability_and_index_untouched(root: Path) -> None:
     REPORT["index_refresh_without_optional_locks_off"] = control_changed
 
 
+BRACKET_BUDGET_S = 60.0  # the bracket is under test, not the budget (timeout: test_snapshot_failed_is_final)
+
+
 def test_concurrent_change_bracket(root: Path) -> None:
     repo, st = make_repo(root), make_stores(root)
     (repo / "notes.txt").write_text("u\n", encoding="utf-8")
@@ -251,7 +253,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
 
     snapshot._read_artifacts = tamper
     try:
-        _, snap = snapshot.take_snapshot(repo, "cap_cc1", st)
+        _, snap = snapshot.take_snapshot(repo, "cap_cc1", st, budget_s=BRACKET_BUDGET_S)
     finally:
         snapshot._read_artifacts = orig
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
@@ -268,7 +270,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
 
     snapshot._read_artifacts = add_untracked
     try:
-        _, snap = snapshot.take_snapshot(repo, "cap_cc2", st)
+        _, snap = snapshot.take_snapshot(repo, "cap_cc2", st, budget_s=BRACKET_BUDGET_S)
     finally:
         snapshot._read_artifacts = orig
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
@@ -283,7 +285,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
 
     snapshot._read_artifacts = stage
     try:
-        _, snap = snapshot.take_snapshot(repo, "cap_cc3", st)
+        _, snap = snapshot.take_snapshot(repo, "cap_cc3", st, budget_s=BRACKET_BUDGET_S)
     finally:
         snapshot._read_artifacts = orig
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
@@ -294,7 +296,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
     lock = repo / ".git" / "index.lock"
     lock.write_bytes(b"")
     try:
-        _, snap = snapshot.take_snapshot(repo, "cap_cc4", st)
+        _, snap = snapshot.take_snapshot(repo, "cap_cc4", st, budget_s=BRACKET_BUDGET_S)
     finally:
         lock.unlink()
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change" and "lock" in snap["detail"], snap
@@ -588,10 +590,13 @@ def test_prior_context_evidence_shapes(root: Path) -> None:
     edit_other = {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}
     first = {"prompt": "read things", "tools": [{"name": "Read", "input": {"file_path": str(repo / "README.md")}, "result": line}]}
     earlier_edit = {"prompt": "write foo", "tools": [{"name": "Write", "input": {"file_path": str(repo / "docs" / "foo.md"), "content": "x"}}]}
+    dot_edit = {"prompt": "write ci", "tools": [{"name": "Write", "input": {"file_path": str(repo / ".github" / "workflows" / "ci.yml"), "content": "x"}}]}
     cases = [
         ([{"prompt": "start", "tools": [edit_other]}], 0, "first_prompt", "no"),
         ([first, {"prompt": "now write the constant", "tools": [edit_same]}], 1, "edit_depends_on_earlier_output", "yes"),
         ([earlier_edit, {"prompt": "update docs/foo.md too", "tools": [edit_other]}], 1, "prompt_names_earlier_artifact", "yes"),
+        ([dot_edit, {"prompt": "fix .github/workflows/ci.yml again", "tools": [edit_other]}], 1, "prompt_names_earlier_artifact", "yes"),
+        ([dot_edit, {"prompt": "fix ./.github/workflows/ci.yml again", "tools": [edit_other]}], 1, "prompt_names_earlier_artifact", "yes"),
         ([first, {"prompt": "continue with that file", "tools": [edit_other]}], 1, "prompt_reference", "unknown"),
         ([first, {"prompt": "ok", "tools": [edit_other]}], 1, "prompt_reference", "unknown"),
         ([first, {"prompt": "in src/alpha.py rename x", "tools": [edit_other]}], 1, None, "no"),
@@ -958,6 +963,59 @@ def test_report_stage_status_and_human_yield(root: Path) -> None:
     assert part["total"] == len(pop) and part["classes"] == {
         "boundary_only:cli_untested": 1, "boundary_plus_scope_excluded:cli_untested": 1,
         "boundary_plus_unresolved:cli_untested": 2, "scope_excluded": 1, "unresolved": 1}, part
+    # F11: candidacy is one rule set. X7 (capture incomplete) or an insufficient observation
+    # stops the funnel exactly where the partition stops counting a candidate, even when an
+    # older tool recorded the funnel as passed.
+    for x7, sufficient in (("unknown", True), ("yes", True), ("no", False)):
+        x = shaped("no", True, sufficient)
+        x["exclusions"] = [{"rule": r, "state": x7 if r == "X7" else "no"} for r in mf.RULES]
+        x["funnel"] = {k: True for k in mf.FUNNEL}  # stale stored funnel
+        f = mf.compute_funnel(x)
+        assert not mf.provisional_candidate(f), (x7, sufficient, f)
+        assert "candidate" not in report.blocker_partition([x])["classes"], (x7, sufficient)
+    clear = shaped("no", True)
+    clear["funnel"] = mf.compute_funnel(clear)
+    assert clear["funnel"]["dependency_screen_clear"], clear["funnel"]
+
+
+def test_checkpoint_one_classification_and_malformed_manifests(root: Path) -> None:
+    """F10/F11: the checkpoint classifies every episode from the recomputed funnel, never a
+    stale stored one, and a manifest missing fields it reads is counted and named, not fatal."""
+    import report
+    import rescreen
+    repo = make_repo(root)
+    edit = {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}
+    st = make_stores(root)
+    stale = joined(root, repo, [{"prompt": "fix alpha", "origin": "human", "tools": [edit]}], 0)
+    stale["observation"]["sufficient"] = False
+    stale["exclusions"] = [{"rule": r, "state": "no"} for r in mf.RULES]
+    stale["funnel"] = {k: True for k in mf.FUNNEL}  # recorded by an older tool
+    store.write_manifest(st, stale)
+    no_link = copy.deepcopy(stale)
+    no_link["episode_id"] = "cap_nolink"
+    del no_link["link"]
+    store.write_manifest(st, no_link)
+    store.write_manifest(st, {"episode_id": "cap_partial"})
+    assert mf.shape_problem(stale) is None
+    assert mf.shape_problem(no_link) and mf.shape_problem({"episode_id": "cap_partial"})
+    assert not rescreen._well_formed(no_link), "a manifest without link reached refresh"
+    ck = report.build_checkpoint(st, 1, tool_commit="0" * 40)
+    assert ck["denominator"]["episodes_total"] == 1 and ck["denominator"]["manifests_malformed"] == 2, ck["denominator"]
+    assert any("cap_nolink" in n and "cap_partial" in n for n in ck["notes"]), ck["notes"]
+    hy = ck["human_yield"]
+    assert hy["provisional_candidates"] == 0 and "candidate" not in hy["partition"]["classes"], hy
+    assert hy["cumulative"]["dependency_screen_clear"] == 0, hy["cumulative"]
+    assert ck["task_mix"]["provisional_candidates_by_task_class"] == {}, ck["task_mix"]
+    # stale stored exclusions are re-evaluated (X7 is a function of capture status), and an
+    # out-of-order stored funnel is still reported
+    fresh = joined(root, repo, [{"prompt": "fix alpha", "origin": "human", "tools": [edit]}], 0)
+    fresh["exclusions"] = [{"rule": r, "state": "yes"} for r in mf.RULES]
+    fresh["funnel"] = {k: k == "privacy_cleared" for k in mf.FUNNEL}
+    st2 = make_stores(root, "st2")
+    store.write_manifest(st2, fresh)
+    ck = report.build_checkpoint(st2, 1, tool_commit="0" * 40)
+    assert "scope_excluded" not in ck["human_yield"]["partition"]["classes"], ck["human_yield"]["partition"]
+    assert any("funnel order violated in 1" in n for n in ck["notes"]), ck["notes"]
 
 
 def test_dot_segments_terminate(root: Path) -> None:
@@ -965,6 +1023,24 @@ def test_dot_segments_terminate(root: Path) -> None:
     assert screen._resolve_dots("f:/../x") == "f:/x"
     assert screen._resolve_dots("/a/../../b/./c") == "/b/c"
     assert screen._resolve_dots("c:/a/b/../c") == "c:/a/c"
+    assert screen._resolve_dots("//srv/share/a/../../../b") == "//srv/share/b"  # UNC anchor holds
+    assert screen._resolve_dots("//srv/share") == "//srv/share"
+
+
+def test_windows_path_forms(root: Path) -> None:
+    """Extended (``\\\\?\\``, ``\\\\.\\``), UNC and drive-relative forms classify by where
+    they point: an extended path into the repo is in it; a path on another drive is not."""
+    class Idx:
+        root = main_root = "c:/repo"
+
+        def owner(self, p: str) -> None:
+            return None
+    cwd, cls = "c:/repo/sub", lambda p: screen.classify_path(p, Idx(), cwd, [])
+    for p in ("\\\\?\\C:\\repo\\a.txt", "\\\\.\\C:\\repo\\a.txt", "//?/c:/repo/a.txt", "C:a.txt", "C:..\\x"):
+        assert cls(p) is None, p
+    for p in ("D:a.txt", "d:..\\repo\\a", "\\\\srv\\share\\a", "\\\\?\\UNC\\srv\\share\\a",
+              "//srv/share/../../c:/repo/a", "C:..\\..\\x"):
+        assert cls(p) == "external_path", (p, cls(p))
 
 
 def test_root_resolution_without_marker_and_gone(root: Path) -> None:
@@ -995,81 +1071,119 @@ def test_invalidate_replaces_prior_rescreen_cause(root: Path) -> None:
     assert all(m["deps"][c]["required"] == "unknown" for c in mf.DEP_CATEGORIES)
 
 
-def test_shell_repo_mutation_blocks_x2_yes(root: Path) -> None:
-    """A shell write or git mutation inside the repository is not 'no repository edit' (X2)."""
+def test_attrib_flags_parse_any_path_form(root: Path) -> None:
+    """Regression (N12): ``attrib`` prints the canonical ``X:\\`` path whatever form it was
+    given; the flags are the letters before it, never a slice up to the first character of
+    the caller's path (a lowercase drive or relative name landed inside the path text)."""
+    tail = r"C:\Users\someone\store\Sub"
+    assert store.parse_attrib_flags(" " * 21 + tail) == ""
+    assert store.parse_attrib_flags("A" + " " * 20 + tail) == "A"
+    assert store.parse_attrib_flags("             P       " + tail) == "P"
+    assert store.parse_attrib_flags("A    SH      P  U    " + tail) == "ASHPU"
+    assert store.parse_attrib_flags(r"A            \\srv\share\Sub") == "A"
+    assert store.parse_attrib_flags("File not found - " + tail) is None
+    assert store.parse_attrib_flags("") is None
+    if os.name == "nt":
+        d = root / "Users" / "Sub"
+        d.mkdir(parents=True)
+        for form in (str(d), str(d)[0].lower() + str(d)[1:]):
+            assert store._windows_attrib_flags(Path(form)) == "", form
+        assert store._windows_attrib_flags(root / "absent") is None
+
+
+def test_lane_worktree_inside_root_is_other_session(root: Path) -> None:
+    """Regression (N13): a lane's worktree sits inside the main checkout, so it passed the
+    in-root test and counted as this repository's own edit."""
+    class Idx:
+        root = main_root = "c:/repo"
+
+        def owner(self, p: str) -> None:
+            return None
+    cls = lambda p: screen.classify_path(p, Idx(), "c:/repo", [])
+    assert cls("c:/repo/.claude/worktrees/lane-b/src/a.py") == "other_session"
+    assert cls(".claude/worktrees/lane-b/src/a.py") == "other_session"
+    assert cls("c:/repo/src/a.py") is None
+    assert cls("c:/repo/.claude/settings.json") is None
     repo = make_repo(root)
-    other = make_repo(root, "other")
-    msys = "/" + str(repo)[0].lower() + str(repo)[2:].replace("\\", "/")
-    cases = {
-        "commit via shell": (f"cd '{repo}' && D=docs && cat >> \"$D/NOTES.md\" <<'X'\nline\nX\ngit add -A && git commit -qm n",
-                             {"content_write:write:cat", "git_index:git add", "git_history:git commit"}, False),
-        "msys cd then redirect": (f"cd {msys}; echo x > out.txt", {"content_write:write:echo"}, False),
-        "unknown cd then commit": ("cd \"$SOMEWHERE\" && git commit -qm n", {"unresolved_target:git commit"}, False),
-        "inline interpreter in repo": ("python - <<'PY'\nprint(1)\nPY", {"unresolved_effect:inline:python"}, False),
-        "test runner in repo": ("python -m pytest tests", {"unresolved_effect:exec:python"}, False),
-        "repo script": ("node scripts/build.mjs", {"unresolved_effect:exec:node"}, False),
-        "checkout": ("git switch -c topic", {"git_worktree:git switch"}, False),
-        "failed commit": ("git commit -qm n", {"git_history:git commit:failed"}, True),
-        "call operator on a variable": ("& $exe --version", {"unresolved_effect:exec:$exe"}, False),
-    }
-    for label, (cmd, want, err) in cases.items():
-        turns = [{"prompt": f"task {label}", "tools": [{"name": "Bash", "input": {"command": cmd}, "error": err}]}]
-        m = joined(root, repo, turns, 0)
-        got = set(m["observation"]["shell_repo_mutations"])
-        assert want <= got, (label, got)
-        assert rule(m, "X2") == "unknown", (label, m["exclusions"])
-        assert m["edited_files"] == []  # the file set is not invented from a shell command
-    # pre-classification record entries map to a class conservatively
-    assert [screen.mutation_class(e) for e in ("git commit", "write:cat", "unresolved:git add", "unresolved:inline:py")] \
-        == ["git_history", "content_write", "unresolved_target", "unresolved_effect"]
-    # mutations in another repository, temp files and plain reads leave X2 = yes
-    for cmd in (f"cd '{other}' && git add -A && git commit -qm n", "git status && git log -3 > /dev/null",
-                "echo x > /tmp/scratch.txt", f"git -C '{other}' switch main", f"cd '{other}' && python -m pytest",
-                "Get-ChildItem | ForEach-Object { $_.FullName }; $i++; $false"):
-        m = joined(root, repo, [{"prompt": "look only", "tools": [{"name": "Bash", "input": {"command": cmd}}]}], 0)
-        assert m["observation"]["shell_repo_mutations"] == [], (cmd, m["observation"])
-        assert rule(m, "X2") == "yes", (cmd, m["exclusions"], m["observation"])
+    lane = repo / ".claude" / "worktrees" / "lane-b" / "src"
+    lane.mkdir(parents=True)
+    turns = [{"prompt": "fix alpha", "tools": [
+        {"name": "Edit", "input": {"file_path": str(lane / "alpha.py"), "old_string": "1", "new_string": "2"}}]}]
+    m = joined(root, repo, turns, 0)
+    assert m["edited_files"] == [] and m["deps"]["other_session"]["observed"] == 1, m["deps"]["other_session"]
 
 
-def test_msys_drive_paths_resolve_like_windows_paths(root: Path) -> None:
-    """A Git-Bash ``/f/...`` path to a repository file is in-repo, not an external dependency."""
+def test_glob_pattern_outside_root_is_observed(root: Path) -> None:
+    """Regression (N14): a Glob whose ``pattern`` is absolute (or climbs out) searched
+    outside the repository with nothing observed, so the screen called that sufficient."""
+    assert screen._glob_anchor("C:/other/**/*.py", None) == "C:/other"
+    assert screen._glob_anchor("../../other/*.md", None) == "../../other"
+    assert screen._glob_anchor("src/**/*.py", "c:/repo") == "c:/repo/src"
+    assert screen._glob_anchor("**/*.py", "c:/repo") == "c:/repo"
+    assert screen._glob_anchor("**/*.py", None) == "."
+    assert screen._glob_anchor("/**/*.py", "c:/repo") == "/"
+    assert screen._glob_anchor("/*", None) == "/"
     repo = make_repo(root)
-    other = make_repo(root, "other")
-
-    def msys(p: Path) -> str:
-        return "/" + str(p)[0].lower() + str(p)[2:].replace("\\", "/")
-
-    m = joined(root, repo, [{"prompt": "look", "tools": [
-        {"name": "Bash", "input": {"command": f"cat {msys(repo)}/README.md && cd {msys(repo)} && cat README.md"}}]}], 0)
-    assert m["deps"]["external_path"]["observed"] == 0, m["deps"]["external_path"]
-    assert m["deps"]["external_repository"]["observed"] == 0 and rule(m, "X2") == "yes"
-    # a genuinely external file and another repository stay external
-    m = joined(root, repo, [{"prompt": "look", "tools": [
-        {"name": "Bash", "input": {"command": f"cat {msys(other)}/README.md"}}]}], 0)
-    assert m["deps"]["external_repository"]["observed"] == 1, m["deps"]
-    assert screen.msys_to_windows("/tmp/x") == "/tmp/x" and screen.msys_to_windows("/f/a/b") == "F:/a/b"
+    other = root / "elsewhere"
+    other.mkdir()
+    for pattern, path in ((str(other / "**" / "*.py"), None), ("../elsewhere/*.py", None), ("**/*.py", str(other))):
+        inp = {"pattern": pattern, **({"path": path} if path else {})}
+        m = joined(root, repo, [{"prompt": "list files", "tools": [{"name": "Glob", "input": inp}]}], 0)
+        assert m["deps"]["external_path"]["observed"] >= 1, (pattern, path, m["deps"]["external_path"])
+        assert m["deps"]["external_path"]["required"] == "unknown"
+    m = joined(root, repo, [{"prompt": "list files", "tools": [{"name": "Glob", "input": {"pattern": "src/**/*.py"}}]}], 0)
+    assert m["deps"]["external_path"]["observed"] == 0 and m["deps"]["external_path"]["required"] == "no"
 
 
+def test_exact_match_outside_window_is_not_joined(root: Path) -> None:
+    """Regression (N15): the exact hash match had no time bound, so when the hook's own
+    prompt was not in the transcript an older identical prompt was joined instead."""
+    h = common.sha256_text
+    ev = lambda i, ts: join.Event(i, "prompt", ts, {"sha256": h("continue"), "text": "continue", "uuid": str(i),
+                                                   "origin": "human", "attachment": False})
+    tr = join.Transcript(root / "t.jsonl", [ev(0, "2026-10-01T00:00:00Z")], 0, [], "s")
+    assert join.find_turn(tr, h("continue"), "2026-10-01T00:00:30Z") == (0, "exact")
+    assert join.find_turn(tr, h("continue"), "2026-10-01T03:00:00Z") is None
+    tr.events.append(ev(1, "2026-10-01T02:59:00Z"))
+    assert join.find_turn(tr, h("continue"), "2026-10-01T03:00:00Z") == (1, "exact")
+    tr.events.append(ev(2, None))  # no timestamp: distance unknown, kept
+    assert join.find_turn(tr, h("continue"), "2026-10-01T09:00:00Z") == (2, "exact")
+    tr.events.append(ev(3, "2026-10-01T09:00:00Z"))
+    assert join.find_turn(tr, h("continue"), "2026-10-01T09:00:00Z") == (3, "exact")
 
-def test_shell_call_uses_its_own_recorded_cwd(root: Path) -> None:
-    """A call's recorded cwd wins over the episode fallback (the transcript's last cwd, which
-    may come from a later turn in another directory)."""
+
+def test_isolation_write_success_survives_failed_cleanup(root: Path) -> None:
+    """Regression (N16): a probe file that was created but could not be removed made the
+    write attempt report ``denied`` — a successful forbidden write read as a pass."""
+    import isolation
+
+    class StickyPath(type(Path())):
+        def unlink(self, missing_ok: bool = False) -> None:
+            raise PermissionError(13, "cleanup denied")
+    target = root / "tmp"
+    target.mkdir()
+    outcome = isolation._attempt("write", StickyPath(target))
+    assert outcome.startswith("succeeded"), outcome
+    left = list(target.iterdir())
+    assert len(left) == 1 and left[0].name.startswith("isolation-probe-"), left
+    left[0].unlink()
+    assert isolation._attempt("write", target) == "succeeded" and list(target.iterdir()) == []
+
+
+def test_prior_context_artifact_match_is_whole_segment(root: Path) -> None:
+    """Regression (N17): ``a.py`` in the prompt matched an earlier edit of ``data.py`` by
+    substring and flagged prior context as required."""
     repo = make_repo(root)
-    other = make_repo(root, "other")
-    turns = [{"prompt": "run", "tools": [{"name": "Bash", "cwd": str(repo),
-                                           "input": {"command": "node -e \"require('fs')\"; ./build.sh"}}]}]
-    tr = write_transcript(root, turns)
-    m = base_manifest("run", started="2026-09-26T10:01:00.000000Z")
-    m["repo"]["head"] = head(repo)
-    obs = join.join(m, tr)
-    assert obs is not None and obs["tool_calls"][0]["cwd"] == str(repo)
-    screen.screen(m, obs, repo, cwd=str(other))
-    muts = m["observation"]["shell_repo_mutations"]
-    assert "unresolved_effect:inline:node" in muts and "unresolved_effect:exec:build.sh" in muts, muts
-    # without a recorded cwd the episode fallback still applies
-    del obs["tool_calls"][0]["cwd"]
-    screen.screen(m, obs, repo, cwd=str(other))
-    assert m["observation"]["shell_repo_mutations"] == [], m["observation"]
+    (repo / "src" / "data.py").write_text("x = 1\n", encoding="utf-8")
+    earlier = {"prompt": "write data", "tools": [{"name": "Write", "input": {"file_path": str(repo / "src" / "data.py"), "content": "x = 1\n"}}]}
+    edit = {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}
+    for prompt, want in (("in a.py rename x", "no"), ("in src/a.py rename x", "no"), ("in ata.py rename x", "no"),
+                         ("in data.py rename x", "yes"), ("in src/data.py rename x", "yes"), ("in ./src/data.py rename x", "yes")):
+        m = joined(root, repo, [earlier, {"prompt": prompt, "tools": [edit]}], 1)
+        kinds = {e["kind"] for e in m["prior_context"]["prior_context_evidence"]}
+        assert ("prompt_names_earlier_artifact" in kinds) == (want == "yes"), (prompt, kinds)
+        assert m["prior_context"]["prior_conversation_required"] == want, (prompt, m["prior_context"])
+
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 

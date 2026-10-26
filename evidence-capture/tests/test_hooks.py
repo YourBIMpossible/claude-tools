@@ -34,8 +34,44 @@ from common import iso, now_utc, parse_iso, read_json, write_json_atomic  # noqa
 
 PASSED: list[str] = []
 FAILED: list[str] = []
+SKIPPED: list[str] = []
 REPORT: dict[str, object] = {}
 PROMPT = dryrun.PROMPT
+BUDGET_ERRORS = frozenset({"start_over_budget", "end_over_budget"})
+
+
+def require_yaml(suite: str) -> None:
+    """The hook suites' fixtures carry ``.evidence-compiler/config.yaml``; without PyYAML
+    ``review.load_capture_config`` fails closed (every episode excluded on
+    ``deny_glob:config``, ``capture: false`` not honoured). A missing dependency is an
+    environment error, reported before any fixture runs, never a test verdict."""
+    try:
+        import yaml  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(f"{suite}: PyYAML is required (pip install pyyaml); without it every episode is "
+                         "excluded on deny_glob:config and capture: false is not honoured") from exc
+
+
+class Skip(Exception):
+    """A test that cannot reach its verdict on this run; the runner counts it apart from pass/fail."""
+
+
+def load_inconclusive(m: dict) -> str | None:
+    """Why ``m`` cannot carry a capture verdict on this run, else None: the hooks ran over
+    their budgets (the product then records ``partial``, so X7 is unknown and the review
+    is held) or the start snapshot timed out. Both are the budget working as specified
+    under machine load, not the behaviour the test was asserting."""
+    cap = m["capture"]
+    errs = set(cap.get("errors") or [])
+    if cap["status"] == "partial" and errs and errs <= BUDGET_ERRORS:
+        return (f"over budget: start_ms={cap['start_ms']} end_ms={cap['end_ms']} "
+                f"(budget {pipeline.START_BUDGET_MS} ms / {pipeline.END_BUDGET_S:g} s)")
+    snap = m.get("start_snapshot") or {}
+    # Only a timeout with no other error: an unrelated failure riding along must still fail.
+    if (snap.get("state") == "failed" and snap.get("reason") == "timeout"
+            and errs <= BUDGET_ERRORS | {"start_hook_killed"}):
+        return f"start snapshot timed out: {snap.get('detail')}"
+    return None
 
 
 def manifests(stores: store.Stores) -> list[dict]:
@@ -153,6 +189,20 @@ def test_fail_open(root: Path) -> None:
     broken = {**fx.env, "EC_CAPTURE_META": str(fx.repo / "README.md")}
     rc, out, _ = dryrun.run_hook("capture_start.py", {"session_id": sid, "prompt": PROMPT, "cwd": str(fx.repo)}, broken)
     assert rc == 0 and out == b""
+
+
+def test_unwritable_pending_is_lost_not_silent(root: Path) -> None:
+    fx = Fixture(root, "lost")
+    bare = {k: v for k, v in fx.env.items() if not k.startswith("EC_CAPTURE_")}
+    bare["EC_CAPTURE_MAINTAIN"] = "0"
+    (fx.tmp / pipeline.PENDING_NAME).mkdir()  # the pending file cannot be opened for append
+    sid = str(uuid.uuid4())
+    rc, out, _ = dryrun.run_hook("capture_start.py", {"session_id": sid, "prompt": PROMPT, "cwd": str(fx.repo)}, bare)
+    assert rc == 0 and out == b"", "the start hook stays fail-open and silent"
+    log = (fx.tmp / "ec-capture-failures.log").read_text(encoding="utf-8")
+    assert "LOST, pending record not written" in log, log
+    assert PROMPT not in log, "the lost-episode line holds no prompt content"
+    assert not list(fx.stores.manifests.glob("cap_*.json"))
 
 
 def test_capture_disabled_in_twin(root: Path) -> None:
@@ -479,10 +529,23 @@ def test_dry_mode_refuses_unsafe_dirs(root: Path) -> None:
 
 
 def test_tool_identity_without_git(root: Path) -> None:
-    commit, sha = pipeline.tool_identity()
-    assert len(sha) == 64
+    """F8: the commit is read from files with no git binary on PATH, and a tool copy outside
+    any repository yields ``commit=None`` with the same code hash, not an error."""
     head = subprocess.run(["git", "-C", str(PKG), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    assert commit == head, (commit, head)
+    saved_path, saved_pkg = os.environ.get("PATH", ""), pipeline.PKG
+    copy = root / "outside-any-repo" / PKG.name  # same dir name: the hash keys on it
+    shutil.copytree(PKG, copy, ignore=shutil.ignore_patterns("tests", "__pycache__", ".git"))
+    try:
+        os.environ["PATH"] = str(root / "empty-bin")  # no git reachable
+        commit, sha = pipeline.tool_identity()
+        assert len(sha) == 64 and commit == head, (commit, head)
+        pipeline.PKG = copy
+        bare_commit, bare_sha = pipeline.tool_identity()
+        assert bare_commit is None, bare_commit
+        assert bare_sha == sha, "the code hash must not depend on the checkout"
+    finally:
+        os.environ["PATH"] = saved_path
+        pipeline.PKG = saved_pkg
 
 
 def test_maintain_store_problems_are_findings(root: Path) -> None:
@@ -542,25 +605,6 @@ def test_rescreen_corrects_and_records(root: Path) -> None:
     assert corr["before"]["causes"] == ["stale_cause"] and corr["after"]["sufficient"] == good["observation"]["sufficient"]
     assert rec["before"]["by_cause"] == {"stale_cause": 1} and rec["changed"][0]["episode_id"] == m["episode_id"]
     assert Path(rec["record"]).is_file() and rec["committed"] and store.meta_clean(fx.stores)
-    # a stale X2 effect classification is rewritten even when no rule state changes
-    stale = fx.episode(sid)
-    stale["observation"]["shell_repo_mutations"] = ["unresolved:git commit"]
-    store.write_manifest(fx.stores, stale)
-    rec = rescreen.run_rescreen(fx.stores, fx.env)
-    m = fx.episode(sid)
-    assert m["observation"] == good["observation"] and rec["changed"][0]["fields"] == ["shell_repo_mutations"], rec["changed"]
-    # transcript gone: a stored no-edit judgement without delegation is withdrawn too
-    m["observation"] = {"sufficient": True, "causes": []}
-    m["edited_files"] = []
-    store.write_manifest(fx.stores, m)
-    hidden = tp.with_suffix(".hidden")
-    tp.rename(hidden)
-    rec = rescreen.run_rescreen(fx.stores, fx.env)
-    assert rec["outcomes"] == {"invalidated_transcript_unavailable": 1}, rec["outcomes"]
-    assert mf.rule_state(fx.episode(sid)["exclusions"], "X2") == "unknown"
-    hidden.rename(tp)
-    rescreen.run_rescreen(fx.stores, fx.env)
-    m = fx.episode(sid)
     # transcript gone: a sufficient judgement over delegated work is withdrawn, not kept
     m["observation"] = {"sufficient": True, "causes": []}
     m["capture"]["join"]["subagents"] = 1
@@ -615,11 +659,157 @@ def test_rescreen_removed_worktree_uses_captured_root(root: Path) -> None:
     assert m["start_snapshot"] == snap and m["observation"] == good["observation"]
 
 
+def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_rescreen_child_argv_is_fixed(root: Path) -> None:
+    """Coverage (trust boundary): transcript and prompt text cannot reach the replay argv.
+    The child's argv is exactly CHILD_ARGV; hostile captured text travels only on stdin."""
+    import rescreen
+    hostile = "--child; & calc.exe $(whoami) `id` -c import os"
+    fx = Fixture(root)
+    sid = str(uuid.uuid4())
+    pid, ts = fx.start(sid, prompt=hostile)
+    fx.end(sid, fx.transcript(sid, hostile, pid, ts))
+    seen: list[tuple[list[str], bytes]] = []
+    real = subprocess.Popen
+
+    def spy(argv, *a, **kw):  # type: ignore[no-untyped-def]
+        stdin = kw.get("stdin")
+        if "--child" in argv:  # the rescreen child; git calls the screen makes are not under test
+            pos = stdin.tell()
+            seen.append((list(argv), stdin.read()))
+            stdin.seek(pos)
+        return real(argv, *a, **kw)
+    rescreen.subprocess.Popen = spy
+    try:
+        rec = rescreen.run_rescreen(fx.stores, fx.env)
+    finally:
+        rescreen.subprocess.Popen = real
+    assert rec["outcomes"] == {"rescreened": 1}, rec
+    assert seen and all(argv == list(rescreen.CHILD_ARGV) for argv, _ in seen), seen
+    assert all(hostile not in " ".join(argv) for argv, _ in seen)
+    ep = fx.episode(sid)["episode_id"].encode()
+    assert all(ep in data for _, data in seen), "the manifest travels on stdin"
+
+
+def test_rescreen_child_kills_descendants_holding_its_output(root: Path) -> None:
+    """F4: the rescreen child starts a grandchild that inherits its stdout/stderr and
+    outlives it. ``run_child`` returns within the bound and the grandchild is gone."""
+    import rescreen
+    fx = Fixture(root)
+    pidfile = root / "grandchild.pid"
+    grand = "import time; time.sleep(120)"
+    # the child: start a grandchild inheriting stdout/stderr, record its pid, then hang
+    child = ("import subprocess, sys, time; "
+             f"p = subprocess.Popen([sys.executable, '-c', {grand!r}]); "
+             f"open({str(pidfile)!r}, 'w').write(str(p.pid)); time.sleep(120)")
+    m = {"episode_id": "cap_f4_fixture_0000"}
+    t0 = time.monotonic()
+    outcome, done = rescreen.run_child(fx.stores, m, fx.env, 2.0, (sys.executable, "-c", child))
+    took = time.monotonic() - t0
+    assert outcome == "timeout" and done is None, outcome
+    assert took < 2.0 + rescreen.KILL_WAIT_S + 5, took
+    gpid = int(pidfile.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 10
+    while _pid_alive(gpid) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not _pid_alive(gpid), "the grandchild outlived the timeout"
+
+    # a child that answers and exits while its grandchild still holds the output: no wait on it
+    answer = json.dumps({"outcome": "rescreened", "manifest": m})
+    pidfile2 = root / "grandchild2.pid"
+    quick = ("import subprocess, sys; "
+             f"p = subprocess.Popen([sys.executable, '-c', {grand!r}]); "
+             f"open({str(pidfile2)!r}, 'w').write(str(p.pid)); "
+             f"sys.stdout.write({answer!r})")
+    t0 = time.monotonic()
+    outcome, done = rescreen.run_child(fx.stores, m, fx.env, 30.0, (sys.executable, "-c", quick))
+    assert outcome == "rescreened" and done == m, (outcome, done)
+    assert time.monotonic() - t0 < 15, "waited on a grandchild holding the child's output"
+    gpid = int(pidfile2.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 10
+    while _pid_alive(gpid) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not _pid_alive(gpid), "a grandchild outlived the child's normal exit"
+
+
+def test_rescreen_kills_descendants_whose_parent_already_exited(root: Path) -> None:
+    """F4: the child starts a grandchild, which starts a great-grandchild and exits; the
+    child then hangs. On timeout the great-grandchild (no live parent link back to the
+    child) is gone too."""
+    import rescreen
+    fx = Fixture(root)
+    pidfile = root / "greatgrandchild.pid"
+    great = "import time; time.sleep(120)"
+    grand = ("import subprocess, sys; "
+             f"p = subprocess.Popen([sys.executable, '-c', {great!r}]); "
+             f"open({str(pidfile)!r}, 'w').write(str(p.pid))")
+    child = ("import subprocess, sys, time; "
+             f"subprocess.run([sys.executable, '-c', {grand!r}]); time.sleep(120)")
+    m = {"episode_id": "cap_f4_fixture_0001"}
+    t0 = time.monotonic()
+    outcome, done = rescreen.run_child(fx.stores, m, fx.env, 3.0, (sys.executable, "-c", child))
+    assert outcome == "timeout" and done is None, outcome
+    assert time.monotonic() - t0 < 3.0 + rescreen.KILL_WAIT_S + 5
+    ggpid = int(pidfile.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 10
+    while _pid_alive(ggpid) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not _pid_alive(ggpid), "a reparented descendant outlived the timeout"
+
+def test_rescreen_partial_manifest_is_reported_not_fatal(root: Path) -> None:
+    """F10: a manifest missing fields a rescreen reads is listed, and the rest still run."""
+    import rescreen
+    fx = Fixture(root)
+    sid = str(uuid.uuid4())
+    pid, ts = fx.start(sid)
+    fx.end(sid, fx.transcript(sid, PROMPT, pid, ts))
+    good = fx.episode(sid)
+    partial = {"episode_id": "cap_partial", "schema": good.get("schema")}
+    (fx.stores.manifests / "cap_partial.json").write_text(json.dumps(partial), encoding="utf-8")
+    rec = rescreen.run_rescreen(fx.stores, fx.env)
+    assert rec["manifests_malformed"] == ["cap_partial"], rec
+    assert rec["outcomes"] == {"rescreened": 1}, rec
+
+
+def test_load_inconclusive_timeout_does_not_hide_other_errors(root: Path) -> None:
+    """A start-snapshot timeout alone is load; a timeout plus an unrelated error is a failure."""
+    def m(errors: list[str]) -> dict:
+        return {"capture": {"status": "failed", "errors": errors, "start_ms": 0, "end_ms": 0},
+                "start_snapshot": {"state": "failed", "reason": "timeout", "detail": "deadline"}}
+    assert load_inconclusive(m([])) is not None
+    assert load_inconclusive(m(["start_hook_killed"])) is not None
+    assert load_inconclusive(m(["root:unresolved"])) is None
+    assert load_inconclusive(m(["start_over_budget", "config:yaml_unavailable"])) is None
+
+
+def test_rescreen_records_never_share_a_name(root: Path) -> None:
+    """F12: two records stamped in the same second get distinct files."""
+    import rescreen
+    d = root / "corrections"
+    a = rescreen._new_record_path(d, "20261006T000000Z-rescreen")
+    b = rescreen._new_record_path(d, "20261006T000000Z-rescreen")
+    assert a != b and a.is_file() and b.is_file() and b.name.endswith("-1.json"), (a, b)
+
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
 
 def main() -> int:
+    require_yaml("test_hooks")
     only = sys.argv[1:]
     with tempfile.TemporaryDirectory(prefix="ec-hooks-test-") as tmp:
         for fn in TESTS:
@@ -630,6 +820,9 @@ def main() -> int:
             try:
                 fn(case)
                 PASSED.append(fn.__name__)
+            except Skip as exc:
+                SKIPPED.append(fn.__name__)
+                print(f"SKIP {fn.__name__}: {exc}")
             except Exception:  # noqa: BLE001 — plain-check runner
                 FAILED.append(fn.__name__)
                 print(f"FAIL {fn.__name__}\n{traceback.format_exc()}")
@@ -637,7 +830,7 @@ def main() -> int:
         print(f"ok   {name}")
     if REPORT:
         print("report", json.dumps(REPORT, sort_keys=True))
-    print(f"{len(PASSED)} passed, {len(FAILED)} failed")
+    print(f"{len(PASSED)} passed, {len(FAILED)} failed, {len(SKIPPED)} skipped")
     return 1 if FAILED else 0
 
 

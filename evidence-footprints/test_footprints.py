@@ -209,6 +209,12 @@ def test_footprints(tmp: Path) -> None:
     check(all((out1 / n).read_bytes() == (out2 / n).read_bytes()
               for n in ("footprints.jsonl", "unparsed.jsonl", "pool.jsonl", "summary.json", "distributions.md")),
           "two runs are byte-identical")
+    trees = fpm.TreeIndex(True)
+    check(trees.files(root, head) is not None and trees.files(root, head) == sorted(f"src/{n}" for n in ("a.py", "b.py", "c.py")),
+          "tree index: a full object name lists the commit")
+    check(all(trees.files(root, h) is None for h in ("HEAD", "--name-only", head[:12], "main", 7, "HEAD:src"))
+          and all(h not in {k[1] for k in trees.cache} for h in ("HEAD", "--name-only", "main", "HEAD:src")),
+          "N2: a head that is not a full object name is unknown and never reaches git")
     fpm.run(episodes, tmp / "out3", False)
     p3 = json.loads((tmp / "out3" / "pool.jsonl").read_text("utf-8").splitlines()[0])
     check(p3["verdicts"]["dependencies_tracked"] is None and p3["eligible"] is False,
@@ -238,44 +244,182 @@ def test_powershell_assignment_and_foreach() -> None:
           "ps: ForEach-Object script block parses")
 
 
+def test_in_place_and_find_actions() -> None:
+    """Review F6/F7: sed -i edits its files; a find action is its own command."""
+    for cmd in ("sed -i s/a/b/ src/x.txt", "sed -i.bak -e s/a/b/ src/x.txt",
+                "sed --in-place=.b s/a/b/ src/x.txt", "sed -ni p src/x.txt"):
+        check(paths(cmd) == [("write", "src/x.txt")] and kinds(cmd) == ["write"], f"sed in place is a write: {cmd}")
+    check(paths("sed -n p src/x.txt") == [("read", "src/x.txt")], "sed without -i stays a read")
+    check(paths("sed s/i/j/ src/x.txt") == [("read", "src/x.txt")], "an i in the script is not -i")
+    rm = r"find build -name '*.log' -exec rm {} \;"
+    check(("write", "build") in paths(rm) and kinds(rm) == ["write"], "find -exec rm writes under its roots")
+    check(("rm", "write") not in [(p, r) for r, p in paths(rm)] and "rm" not in [p for _, p in paths(rm)],
+          "the action verb is not a searched path")
+    dl = "find build -name '*.tmp' -delete"
+    check(("write", "build") in paths(dl) and kinds(dl) == ["write"], "find -delete writes under its roots")
+    fp = "find src -name '*.py' -fprint out/list.txt"
+    check(("write", "out/list.txt") in paths(fp) and ("search", "out/list.txt") not in paths(fp)
+          and kinds(fp) == ["write"], "find -fprint writes its file")
+    fpf = "find src -fprintf out/l.txt '%p'"
+    check(("write", "out/l.txt") in paths(fpf), "find -fprintf: the file, not the format")
+    tail = "find logs -exec tail -n 5 {} +"
+    check(sorted(paths(tail)) == [("read", "logs"), ("search", "logs")], "find -exec tail: no '5', '+' or 'tail' paths")
+    sed = "find src -type f -exec sed -i 's/a/b/' {} ';'"
+    check(("write", "src") in paths(sed), "find -exec sed -i writes under its roots")
+    check(paths("find src -name '*.py'") == [("search", "src")], "plain find is unchanged")
+
+
 def test_repo_aware_relative_paths() -> None:
     """A relative shell path is resolved against git -C and the call's cwd before matching."""
-    segs, _ = sp.parse_command(r"git -C F:\Other diff CLAUDE.md")
-    check([(u.path, u.base) for g in segs for u in g.paths] == [("CLAUDE.md", "F:/Other")],
+    segs, _ = sp.parse_command(r"git -C \srv\other-repo diff CLAUDE.md")
+    check([(u.path, u.base) for g in segs for u in g.paths] == [("CLAUDE.md", "/srv/other-repo")],
           "git -C: the directory is carried as the path base")
-    segs, _ = sp.parse_command("git -C F:/Other -C sub log -- a.py")
-    check([u.base for g in segs for u in g.paths] == ["F:/Other/sub"], "git -C: successive -C compose")
+    segs, _ = sp.parse_command("git -C /srv/other-repo -C sub log -- a.py")
+    check([u.base for g in segs for u in g.paths] == ["/srv/other-repo/sub"], "git -C: successive -C compose")
 
-    def touched(cmd: str, cwd: str | None) -> tuple[list[str], int]:
+    def footprint(cmd: str, cwd: str | None) -> fpm.Footprint:
         c = call(1, "Bash", {"command": cmd})
         if cwd is not None:
             c["cwd"] = cwd
-        fp = fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def touched(cmd: str, cwd: str | None) -> tuple[list[str], int]:
+        fp = footprint(cmd, cwd)
         return [t[1] for t in fp.touches], fp.outside
 
-    check(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT) == ([], 1),
+    def unresolved(cmd: str, cwd: str | None) -> tuple[list[str], int, int]:
+        fp = footprint(cmd, cwd)
+        return [t[1] for t in fp.touches], fp.outside, fp.unresolved
+
+    check(touched(r"git -C \srv\other-repo diff CLAUDE.md", WT) == ([], 1),
           "another repository's same-named file is outside, not a hit")
     check(touched("git diff CLAUDE.md", WT) == (["claude.md"], 0), "the repo's own relative file still counts")
-    check(touched("cat CLAUDE.md", "F:/Other") == ([], 1), "a relative path from a cwd outside the repo is outside")
+    check(touched("cat CLAUDE.md", "/srv/other-repo") == ([], 1), "a relative path from a cwd outside the repo is outside")
     check(touched("cat docs/CLAUDE.md", WT + "/src") == (["src/docs/claude.md"], 0),
           "a relative path resolves against a subdirectory cwd")
     check(touched("git -C sub show HEAD:x.py", WT) == (["sub/x.py"], 0), "a relative -C resolves against the cwd")
     check(touched("cat CLAUDE.md", None) == (["claude.md"], 0), "no recorded cwd keeps the historical reading")
-    check(touched("$r='F:/Other'; git -C $r diff CLAUDE.md", WT) == ([], 1),
-          "git -C $variable: the directory is unknown, so the path is not attributed to the repo")
+    check(unresolved("$r='/srv/other-repo'; git -C $r diff CLAUDE.md", WT) == ([], 0, 1),
+          "git -C $variable: the directory is unknown, so the path is unresolved, not outside")
     check(touched("cd /f/Other && cat CLAUDE.md", WT) == ([], 2), "cd to another repository moves later relative paths")
     check(touched("cd src && cat a.py", WT) == (["src/a.py"], 0), "cd into a subdirectory keeps them in the repo")
-    check(touched("cd $d; cat a.py", WT) == ([], 1), "cd to a variable leaves later relative paths unattributed")
-    check(touched("popd; cat a.py", WT) == ([], 1), "popd leaves later relative paths unattributed")
+    check(unresolved("cd $d; cat a.py", WT) == ([], 0, 1), "cd to a variable leaves later relative paths unresolved")
+    check(unresolved("popd; cat a.py", WT) == ([], 0, 1), "popd leaves later relative paths unresolved")
     check(touched("cat a.py; cd /f/Other", WT) == (["a.py"], 1), "a later cd does not move earlier segments")
-    check(not fpm.overlap(touched(r"git -C F:\Claude-Profile diff CLAUDE.md", WT)[0], ["claude.md"]),
+    check(not fpm.overlap(touched(r"git -C \srv\other-repo diff CLAUDE.md", WT)[0], ["claude.md"]),
           "the ckpt-7 cross-repository CLAUDE.md case no longer overlaps a cited CLAUDE.md")
+
+
+def test_unresolved_paths_are_not_outside() -> None:
+    """SA-4: an argument whose working directory is unknown is undetermined, never outside_repo."""
+    def fp(cmd: str, cwd: str | None = WT) -> fpm.Footprint:
+        c = call(1, "Bash", {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    f = fp("cd $D && cat src/app.py")
+    check((f.unresolved, f.outside, f.touches) == (1, 0, []), "unresolved cwd: unresolved=1, outside=0, no touches")
+    f = fp("cd - && cat src/app.py")
+    check((f.unresolved, f.outside, f.touches) == (1, 0, []), "cd -: unresolved, not outside")
+    f = fp("cat /srv/other-repo/x.py")
+    check((f.unresolved, f.outside, f.touches) == (0, 1, []), "a genuinely outside absolute path is still outside")
+    f = fp("cat CLAUDE.md", "/srv/other-repo")
+    check((f.unresolved, f.outside, f.touches) == (0, 1, []), "a relative path from an outside cwd is still outside")
+    f = fp("cat src/app.py")
+    check((f.unresolved, f.outside, [t[1] for t in f.touches]) == (0, 0, ["src/app.py"]),
+          "a resolvable relative path is still touched")
+    f = fp("cd $D && cat src/app.py && cat /srv/other-repo/x.py")
+    check((f.unresolved, f.outside) == (1, 1), "unresolved and outside are counted in separate buckets")
+
+
+def test_env_home_and_parent_segments() -> None:
+    """Review of SA-4: $VAR, %VAR% and ~ paths are undetermined (unresolved, never outside or
+    inside); '.' and '..' collapse against a known directory, and a '..' that cannot collapse
+    is unresolved."""
+    def bash(cmd: str, cwd: str | None = WT) -> fpm.Footprint:
+        c = call(1, "Bash", {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def native(path: str) -> fpm.Footprint:
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [call(1, "Read", {"file_path": path})]))
+
+    def counts(f: fpm.Footprint) -> tuple[int, int, list[str]]:
+        return f.unresolved, f.outside, [t[1] for t in f.touches]
+
+    forms = ["$HOME/x.py", "$R/a.py", "${R}/a.py", "$env:R/a.py", "%USERPROFILE%/a.py", "~/a.py", "~",
+             "src/$name/a.py", "C:foo.py", "D:sub/x.py"]
+    for form in forms:
+        for cwd in (WT, None):
+            if form == "~":  # the shell parser does not extract a bare ~ as a path: no bucket at all
+                check(counts(bash("cat ~", cwd)) == (0, 0, []), "shell bare ~: never outside or inside")
+                continue
+            check(counts(bash(f"cat {form}", cwd)) == (1, 0, []),
+                  f"shell arg {form!r} (cwd {'set' if cwd else 'none'}): unresolved, not outside or inside")
+        check(counts(native(form)) == (1, 0, []), f"native Read {form!r}: unresolved, not outside or inside")
+    check(counts(bash("cat ../a.py", WT + "/src")) == (0, 0, ["a.py"]), "'..' collapses against a known cwd")
+    check(counts(bash("cat ./src/./a.py")) == (0, 0, ["src/a.py"]), "'.' segments are dropped")
+    check(counts(bash("cat ../a.py", None)) == (1, 0, []), "'..' with no cwd is unresolved, not outside")
+    check(counts(native("../a.py")) == (1, 0, []), "native '..' with no base is unresolved")
+    check(counts(bash("cat ../../../../../../../a.py")) == (1, 0, []), "'..' past the filesystem root is unresolved")
+    check(counts(bash("cat ../../../../other-repo/a.py")) == (0, 1, []),
+          "'..' that genuinely leaves the repository is outside")
+    check(counts(native(REPO + "/src/../src/a.py")) == (0, 0, ["src/a.py"]), "native absolute '..' collapses")
+    check(counts(bash("cat //server/share/a.py")) == (0, 1, []), "a UNC path stays outside")
+
+
+def test_block_and_subshell_cwd_scope() -> None:
+    """SA-17: a ``{ ... }`` block's paths resolve against the cwd at the block's position, a
+    block's cd carries on (a group runs in the current shell), and a subshell's cd does not leak.
+    SA-18: ``git -C .`` is the cwd and ``git -C ..`` its parent; ``~`` and ``/`` stay unresolved."""
+    def fp(cmd: str, cwd: str | None = WT) -> fpm.Footprint:
+        c = call(1, "Bash", {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def counts(f: fpm.Footprint) -> tuple[int, int, list[str]]:
+        return f.unresolved, f.outside, [t[1] for t in f.touches]
+
+    check(paths("{ cat a.py; } && cd src") == [("read", "a.py"), ("nav", "src")],
+          "a block's paths come in command order, before a later cd")
+    check(counts(fp("{ cat a.py; } && cd /srv/other-repo")) == (0, 1, ["a.py"]),
+          "a later outer cd does not move paths inside an earlier block")
+    check(counts(fp("{ cd src; } && cat a.py")) == (0, 0, ["src/a.py"]),
+          "a cd inside a block moves later outer segments (same shell)")
+    check(counts(fp("cd src && { cat a.py; }")) == (0, 0, ["src/a.py"]),
+          "a block resolves against an earlier outer cd")
+    check(counts(fp("(cd /srv/other-repo; cat x.py) && cat a.py")) == (0, 2, ["a.py"]),
+          "a subshell's cd does not leak to later outer segments")
+    check(counts(fp("(cd /srv/other-repo) && { cat a.py; }")) == (0, 1, ["a.py"]),
+          "a subshell's cd does not leak into a later block")
+    check(counts(fp("(cd src; cat a.py); cat b.py")) == (0, 0, ["src/a.py", "b.py"]),
+          "inside the subshell its cd applies; after it, the outer cwd")
+    check(counts(fp("cd src && (cat a.py)")) == (0, 0, ["src/a.py"]),
+          "a subshell inherits the cwd in effect at its position")
+    check(counts(fp("{ cat $(cd /srv/other-repo; echo x) a.py; }")) == (0, 1, ["a.py"]),
+          "a command substitution inside a block does not leak its cd")
+    check(counts(fp("git -C . add src/a.py")) == (0, 0, ["src/a.py"]), "git -C . is the cwd")
+    check(counts(fp("git -C . add src/a.py", None)) == (0, 0, ["src/a.py"]),
+          "git -C . with no recorded cwd keeps the historical reading")
+    check(counts(fp("git -C .. add docs/n.md", WT + "/src")) == (0, 0, ["docs/n.md"]),
+          "git -C .. is the cwd's parent")
+    check(counts(fp("git -C src -C .. add a.py")) == (0, 0, ["a.py"]), "git -C .. composes with an earlier -C")
+    check(counts(fp("git -C .. add a.py", None)) == (1, 0, []), "git -C .. with no cwd is unresolved, not outside")
+    check(counts(fp("git -C ~ add a.py")) == (1, 0, []), "git -C ~ stays unresolved, never inside or outside")
+    check(counts(fp("git -C / add a.py")) == (1, 0, []), "git -C / stays unresolved, never inside or outside")
 
 
 def main() -> int:
     test_shell_paths()
     test_powershell_assignment_and_foreach()
+    test_in_place_and_find_actions()
     test_repo_aware_relative_paths()
+    test_unresolved_paths_are_not_outside()
+    test_env_home_and_parent_segments()
+    test_block_and_subshell_cwd_scope()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")

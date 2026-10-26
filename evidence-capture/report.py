@@ -17,6 +17,7 @@ independent blocker counted on its own) and ``notes``.
 """
 from __future__ import annotations
 
+import copy
 import math
 from collections import Counter
 from pathlib import Path
@@ -105,16 +106,20 @@ def blocker_partition(pop: list[dict[str, Any]]) -> dict[str, Any]:
     something else also fails, split by whether that is a known scope exclusion (a rule
     ``yes``) or only unresolved evidence. With a trusted boundary, ``scope_excluded``
     (a rule ``yes``) and ``unresolved`` (rule ``unknown``, insufficient observation,
-    no link, incomplete snapshot) follow. Privacy stays ``not_reached`` for every
-    episode not past the gates, never ``failed``."""
+    no link, incomplete snapshot) follow. Only the owner-resolvable screen rules (X1-X5,
+    the rules ``independent_blockers`` counts) are scope exclusions: X6 and X7 restate an
+    incomplete snapshot or capture, so any state but ``no`` there is unresolved. Privacy
+    stays ``not_reached`` for every episode not past the gates, never ``failed``."""
     out: Counter[str] = Counter()
     for m in pop:
-        if mf.provisional_candidate(m["funnel"]):
+        if mf.provisional_candidate(mf.compute_funnel(m)):
             out["candidate"] += 1
             continue
-        states = [mf.rule_state(m["exclusions"], r) for r in mf.RULES]
+        states = [mf.rule_state(m["exclusions"], r) for r in mf.OWNER_RESOLVABLE]
+        state_rules = [mf.rule_state(m["exclusions"], r) for r in mf.RULES if r not in mf.OWNER_RESOLVABLE]
         scope = "yes" in states
-        unresolved = ("unknown" in states or not m["observation"].get("sufficient", False)
+        unresolved = ("unknown" in states or any(s != "no" for s in state_rules)
+                      or not m["observation"].get("sufficient", False)
                       or m["link"].get("state") != "linked"
                       or m["start_snapshot"].get("state") != "complete")
         if not m["boundary"].get("trusted"):
@@ -222,8 +227,20 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
                      backstop: dict[str, Any] | None = None) -> dict[str, Any]:
     now = now or iso(now_utc())
     scan = scan_manifests(stores)
-    ms = sorted(scan.manifests, key=lambda m: m["started_at"])
-    owners = {m["episode_id"]: load_owner_review(stores, m["episode_id"]) for m in ms}
+    # One classification for every count: each well-formed manifest is read refreshed (rules
+    # with its owner review, then the funnel), never as an older tool stored it (review F11). Malformed ones are
+    # named and kept out of every count, never fatal (review F10). Stored manifests stay untouched.
+    views, malformed = [], []
+    for m in scan.manifests:
+        problem = mf.shape_problem(m)
+        if problem is not None:
+            malformed.append(f"{m['episode_id']} ({problem})")
+            continue
+        views.append(m)
+    owners = {m["episode_id"]: load_owner_review(stores, m["episode_id"]) for m in views}
+    stored_funnel = {m["episode_id"]: m["funnel"] for m in views}
+    ms = sorted((mf.refresh(copy.deepcopy(m), (owners[m["episode_id"]] or {}).get("rules"))
+                 for m in views), key=lambda m: m["started_at"])
     maint = maintenance or {}
     notes: list[str] = []
     if backstop is not None and backstop.get("state") != "ok":
@@ -232,6 +249,9 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
     if scan.unreadable:
         notes.append(f"{len(scan.unreadable)} manifest(s) unreadable and outside every count below: "
                      + ", ".join(scan.unreadable[:20]))
+    if malformed:
+        notes.append(f"{len(malformed)} manifest(s) malformed and outside every count below: "
+                     + ", ".join(sorted(malformed)[:20]))
 
     # window
     ended = [m["ended_at"] for m in ms if m.get("ended_at")]
@@ -310,7 +330,7 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
                          "replay_verified": dict(sorted(Counter(
                              later_stage_status(m, "replay_verified") for m in ms).items()))},
     }
-    violations = [m["episode_id"] for m in ms if mf.validate_funnel(m["funnel"])]
+    violations = [m["episode_id"] for m in ms if mf.validate_funnel(stored_funnel[m["episode_id"]])]
     if violations:
         notes.append(f"funnel order violated in {len(violations)} manifest(s)")
 
@@ -332,7 +352,7 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
             cooc[tuple(yes)] += 1
 
     # screen
-    suff = [m for m in ms if m["capture"].get("join", {}).get("state") == "joined"]
+    suff = [m for m in ms if (m["capture"].get("join") or {}).get("state") == "joined"]
     causes = Counter(c for m in suff if not m["observation"]["sufficient"] for c in m["observation"]["causes"])
     deps: dict[str, dict[str, int]] = {}
     for cat in mf.DEP_CATEGORIES:
@@ -411,7 +431,8 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
         "window": {"first_started_at": first, "last_ended_at": last,
                    "days": round((b - a).total_seconds() / 86400, 2) if a and b else None,
                    "repos": [{"main_root_sha256": k, "episodes": v} for k, v in sorted(repos.items())]},
-        "denominator": {"episodes_total": len(ms), "manifests_unreadable": len(scan.unreadable), "by_origin": by_origin,
+        "denominator": {"episodes_total": len(ms), "manifests_unreadable": len(scan.unreadable),
+                        "manifests_malformed": len(malformed), "by_origin": by_origin,
                         "by_capture_status": {k: by_status.get(k, 0) for k in ("complete", "partial", "failed")}},
         "funnel": funnel,
         "human_yield": human_yield(ms),

@@ -11,7 +11,7 @@ reconciliation, review, expiry and the failure-streak flag. The start hook launc
 detached, so a prompt never waits for housekeeping.
 
 Concurrency. Every manifest write after the start happens under that episode's lock
-(``locks/<episode_id>.lock``, created exclusively); maintenance additionally holds
+(``locks/<episode_id>.lock``, an OS advisory lock the OS drops when its holder dies); maintenance additionally holds
 ``maintain.lock`` so only one maintenance run exists. The end hook and maintenance
 therefore never interleave writes to one manifest. Maintenance only finalises an episode
 whose turn is over (a later episode of the same session exists, or its transcript has
@@ -63,7 +63,6 @@ REJOIN_WINDOW_H = 24
 IDLE_S = 1800
 KILLED_AFTER_S = 120
 STORE_CHECK_TTL_S = 24 * 3600
-LOCK_STALE_S = 600
 MAINTAIN_MIN_INTERVAL_S = 60
 FAILURE_STREAK = 3
 STREAK_SNAPSHOT_REASONS = ("timeout", "write_error", "store_unusable", "stores_not_configured")
@@ -182,33 +181,115 @@ def _pending_file(env: dict[str, str]) -> Path:
 
 
 # ---------------------------------------------------------------------- locks
+#
+# A lock is an OS advisory lock on an open handle to the lock file (``msvcrt.locking``
+# on Windows, ``fcntl.flock`` elsewhere), not the file's existence. The OS drops it when
+# the holder's process dies, so there is no staleness rule and no steal: a live holder
+# keeps its lock however long it runs, and a dead holder's lock is free at once. The file
+# itself only carries "pid time" for diagnostics. A contender re-checks after locking that
+# the path still names the file it locked, else it retries. On POSIX release unlinks while
+# still locked, then unlocks: unlinking after the unlock would let a contender lock the old
+# file in between while a third process creates and locks a new one. On Windows the holder
+# cannot unlink its open file, so release unlocks and closes first; the unlink then fails
+# while any contender has the file open, so the path keeps naming the file it locks.
 
-def _try_lock(path: Path, stale_s: float = LOCK_STALE_S) -> bool:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    for _ in range(2):
+_HELD: dict[str, int] = {}
+
+
+def _os_lock(fd: int) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _os_unlock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _try_lock(path: Path) -> bool:
+    """Take ``path``'s lock without waiting. False while any holder (this process
+    included) has it, or when the lock file cannot be opened."""
+    key = str(path)
+    if key in _HELD:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    for _ in range(3):
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                if time.time() - path.stat().st_mtime > stale_s:
-                    path.unlink()
-                    continue
-            except OSError:
-                pass
-            return False
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0))
         except OSError:
             return False
-        os.write(fd, f"{os.getpid()} {iso(now_utc())}\n".encode())
-        os.close(fd)
+        if not _os_lock(fd):
+            os.close(fd)
+            return False
+        try:
+            same = _same_file(os.fstat(fd), os.stat(path))
+        except OSError:
+            same = False
+        if not same:  # released and unlinked between our open and our lock
+            _os_unlock(fd)
+            os.close(fd)
+            continue
+        try:
+            # diagnostics after byte 0 so the locked byte (Windows) is never written
+            os.lseek(fd, 1, os.SEEK_SET)
+            os.write(fd, f"{os.getpid()} {iso(now_utc())}\n".encode())
+        except OSError:
+            pass
+        _HELD[key] = fd
         return True
     return False
 
 
 def _unlock(path: Path) -> None:
-    try:
-        path.unlink()
-    except OSError:
-        pass
+    fd = _HELD.pop(str(path), None)
+    if fd is None:
+        return
+    if os.name != "nt":
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    _os_unlock(fd)
+    os.close(fd)
+    if os.name == "nt":
+        try:
+            path.unlink()  # best effort; a contender holding it open keeps it
+        except OSError:
+            pass
+
+
+def _wait_lock(path: Path, wait_s: float) -> bool:
+    deadline = time.monotonic() + wait_s
+    while True:
+        if _try_lock(path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def episode_lock(stores: Stores, ep: str) -> Path:
@@ -216,13 +297,28 @@ def episode_lock(stores: Stores, ep: str) -> Path:
 
 
 def lock_episode(stores: Stores, ep: str, wait_s: float = 0.0) -> bool:
-    deadline = time.monotonic() + wait_s
-    while True:
-        if _try_lock(episode_lock(stores, ep)):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
+    return _wait_lock(episode_lock(stores, ep), wait_s)
+
+
+APPEND_LOCK_WAIT_S = 2.0
+
+
+def _append_lock(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+def append_line(path: Path, line: str) -> None:
+    """Append one JSONL line under ``path``'s append lock, as a single write, so
+    concurrent writers never interleave and a drain's claim never splits a line.
+    Raises OSError (TimeoutError when the lock stays busy)."""
+    lock = _append_lock(path)
+    if not _wait_lock(lock, APPEND_LOCK_WAIT_S):
+        raise TimeoutError(f"append lock busy: {lock.name}")
+    try:
+        with path.open("ab") as fh:
+            fh.write(line.encode("utf-8"))
+    finally:
+        _unlock(lock)
 
 
 # ---------------------------------------------------------------------- store readiness
@@ -286,13 +382,27 @@ def store_problems(stores: Stores) -> dict[str, list[str]]:
 
 # ---------------------------------------------------------------------- pending failures
 
-def record_pending(env: dict[str, str], rec: dict[str, Any]) -> None:
-    """Append one failure the stores could not take (identifiers and hashes only)."""
+def record_pending(env: dict[str, str], rec: dict[str, Any]) -> str | None:
+    """Append one failure the stores could not take (identifiers and hashes only).
+
+    Returns None once the record is on disk, else the write error: the caller must count
+    the episode as lost, because maintenance can never turn it into a ``failed`` manifest.
+    """
     try:
-        with _pending_file(env).open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
-    except OSError:
-        pass
+        append_line(_pending_file(env), json.dumps(rec, sort_keys=True) + "\n")
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _pend_or_lose(stores: Stores | None, env: dict[str, str], rec: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Record a start the stores could not take; an unwritable pending file is a lost episode."""
+    error = record_pending(env, {**rec, "reason": reason[:300]})
+    if error is None:
+        return {"action": "pending", "episode_id": rec["episode_id"], "reason": reason}
+    log_line(stores if stores is not None and stores.meta.is_dir() else None,
+             f"start {rec['episode_id']}: LOST, pending record not written ({error}); cause: {reason[:300]}")
+    return {"action": "lost", "episode_id": rec["episode_id"], "reason": reason, "error": error}
 
 
 def failed_manifest(rec: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -307,37 +417,92 @@ def failed_manifest(rec: dict[str, Any], reason: str) -> dict[str, Any]:
     return mf.refresh(m)
 
 
+def _claim_lock(work: Path) -> Path:
+    """The lock a drainer holds on its ``.draining`` file for as long as it works on it."""
+    return work.with_name(f"{work.name}.lock")
+
+
+def claim_pending(src: Path) -> Path:
+    """Move the pending file aside for draining, under its append lock, so an append is
+    either wholly in the claimed file or wholly in the next pending file. The returned
+    ``.draining`` file is held by its claim lock (taken before it exists, so no other
+    drainer sees it free); release it with ``release_claim``. Raises OSError."""
+    work = src.with_name(f"{src.name}.{os.getpid()}.{time.time_ns()}.draining")
+    if not _try_lock(_claim_lock(work)):
+        raise TimeoutError(f"claim lock busy: {_claim_lock(work).name}")
+    lock = _append_lock(src)
+    try:
+        if not _wait_lock(lock, APPEND_LOCK_WAIT_S):
+            raise TimeoutError(f"append lock busy: {lock.name}")
+        try:
+            os.replace(src, work)
+        finally:
+            _unlock(lock)
+    except BaseException:
+        _unlock(_claim_lock(work))
+        raise
+    return work
+
+
+def release_claim(work: Path) -> None:
+    _unlock(_claim_lock(work))
+
+
 def drain_pending(stores: Stores, env: dict[str, str]) -> dict[str, Any]:
     """Turn every pending failure into a ``failed`` manifest.
 
     A record leaves the pending file only once its manifest is on disk and reads back; a
     record that cannot be turned into a manifest goes back into the pending file for the
     next pass. A ``.draining`` file left by a drain that died between claiming the pending
-    file and finishing is taken up again once it is older than ``LOCK_STALE_S``. Returns
+    file and finishing is taken up by the next drain whatever its age. The pending file is
+    shared by every store on the machine while ``maintain.lock`` is per store, so a
+    ``.draining`` file is taken only when its claim lock is free: a live drain elsewhere
+    keeps its own. Returns
     ``drained`` (episode ids), ``kept`` (records put back) and ``errors`` (one line each)."""
     src = _pending_file(env)
     out: dict[str, Any] = {"drained": [], "kept": 0, "errors": []}
     claimed: list[Path] = []
+    # a .draining file whose claim lock is free belongs to a drain that died: claimed at
+    # once, with no age rule; one still held is a live drain's (another store's)
     for orphan in sorted(src.parent.glob(f"{src.name}.*.draining")):
-        try:
-            if time.time() - orphan.stat().st_mtime > LOCK_STALE_S:
+        if _try_lock(_claim_lock(orphan)):
+            if orphan.exists():
                 claimed.append(orphan)
-        except OSError as exc:
-            out["errors"].append(f"pending orphan {orphan.name}: {type(exc).__name__}")
+            else:  # finished by its drainer between the glob and the lock
+                release_claim(orphan)
+    # a claim lock without its .draining file was left by a drainer that died after
+    # removing the file: free, so taking it removes it
+    for stray in src.parent.glob(f"{src.name}.*.draining.lock"):
+        work = stray.with_name(stray.name[:-len(".lock")])
+        if not work.exists() and _try_lock(stray):
+            _unlock(stray)
+    try:
+        _drain_claimed(stores, src, claimed, out)
+    finally:
+        for work in claimed:
+            release_claim(work)
+    for err in out["errors"]:
+        log_line(stores, err)
+    if out["drained"]:
+        log_line(stores, f"pending capture failures recorded: {len(out['drained'])}")
+    return out
+
+
+def _drain_claimed(stores: Stores, src: Path, claimed: list[Path], out: dict[str, Any]) -> None:
+    """Record every line of the claimed files (claim locks held by the caller) and claim
+    the current pending file too."""
     if src.is_file():
-        work = src.with_name(f"{src.name}.{os.getpid()}.{time.time_ns()}.draining")
         try:
-            os.replace(src, work)
-            claimed.append(work)
+            claimed.append(claim_pending(src))
         except OSError as exc:
-            out["errors"].append(f"pending file not claimed: {type(exc).__name__}")
+            out["errors"].append(f"pending file not claimed: {type(exc).__name__}: {exc}"[:300])
     retry: list[str] = []
     readable: list[Path] = []
     for work in claimed:
         try:
             lines = work.read_text(encoding="utf-8").splitlines()
         except (OSError, ValueError) as exc:
-            # left in place: an unread .draining file is retried once it is stale
+            # left in place: an unread .draining file is retried by the next drain
             out["errors"].append(f"pending file unreadable {work.name}: {type(exc).__name__}")
             continue
         readable.append(work)
@@ -357,11 +522,10 @@ def drain_pending(stores: Stores, env: dict[str, str]) -> dict[str, Any]:
                 out["errors"].append(f"pending record not recorded: {type(exc).__name__}: {exc}"[:300])
     if retry:
         try:
-            with src.open("a", encoding="utf-8") as fh:
-                fh.writelines(f"{line}\n" for line in retry)
+            append_line(src, "".join(f"{line}\n" for line in retry))
             out["kept"] = len(retry)
         except OSError as exc:
-            # the claimed files stay; they are retried once stale, so nothing is lost
+            # the claimed files stay; the next drain retries them, so nothing is lost
             out["errors"].append(f"pending records not put back: {type(exc).__name__}")
             readable = []
     for work in readable:
@@ -369,11 +533,6 @@ def drain_pending(stores: Stores, env: dict[str, str]) -> dict[str, Any]:
             work.unlink()
         except OSError as exc:
             out["errors"].append(f"pending file not removed {work.name}: {type(exc).__name__}")
-    for err in out["errors"]:
-        log_line(stores, err)
-    if out["drained"]:
-        log_line(stores, f"pending capture failures recorded: {len(out['drained'])}")
-    return out
 
 
 # ---------------------------------------------------------------------- boundary
@@ -654,7 +813,7 @@ def retire_open_pointers(stores: Stores, now: str) -> dict[str, Any]:
     join. Once the episode has been maintenance-joined for ``OPEN_POINTER_STALE_H`` the
     session is over; the pointer is local operational state and the manifest keeps every
     fact, so retiring it loses no evidence. Episodes never joined stay open and are counted."""
-    out: dict[str, Any] = {"retired": [], "open_unjoined": [], "dangling": 0}
+    out: dict[str, Any] = {"retired": [], "open_unjoined": [], "dangling": 0, "unreadable": 0, "retire_failed": 0}
     now_dt = parse_iso(now)
     d = stores.meta / "open"
     if now_dt is None or not d.is_dir():
@@ -664,6 +823,7 @@ def retire_open_pointers(stores: Stores, now: str) -> dict[str, Any]:
             ep = p.read_text(encoding="utf-8").strip()
             m = read_manifest(stores, ep) if manifest_path(stores, ep).is_file() else None
         except (OSError, ValueError):
+            out["unreadable"] += 1
             continue
         if m is None:
             out["dangling"] += 1
@@ -677,7 +837,7 @@ def retire_open_pointers(stores: Stores, now: str) -> dict[str, Any]:
                     p.unlink()
                     out["retired"].append(ep)
             except OSError:
-                pass
+                out["retire_failed"] += 1
         elif cap.get("phase") == "started":
             started = parse_iso(m.get("started_at") or "")
             if started is not None and now_dt - started > timedelta(hours=OPEN_POINTER_STALE_H):
@@ -702,8 +862,7 @@ def record_start_skip(env: dict[str, str], payload: dict[str, Any], reason: str,
                "cwd_sha256": sha256_bytes(norm_path(cwd).encode()) if isinstance(cwd, str) and cwd else None}
         path = stores.meta / START_SKIPS
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        append_line(path, json.dumps(rec, sort_keys=True) + "\n")
     except Exception:  # diagnostics must never affect the prompt
         return
 
@@ -734,14 +893,12 @@ def run_start(payload: dict[str, Any], env: dict[str, str], *, now: str | None =
            "root_sha256": root_sha256(root)}
     if stores is None:
         log_line(None, "start: capture stores not configured")
-        record_pending(env, {**rec, "reason": "stores_not_configured"})
-        return {"action": "pending", "episode_id": ep, "reason": "stores_not_configured"}
+        return _pend_or_lose(None, env, rec, "stores_not_configured")
     problems = store_problems(stores)
     if problems["content"] or problems["meta"]:
         reason = "store_unusable: " + "; ".join(problems["meta"] + problems["content"])
         log_line(stores if stores.meta.is_dir() else None, f"start {ep}: {reason}")
-        record_pending(env, {**rec, "reason": reason[:300]})
-        return {"action": "pending", "episode_id": ep, "reason": reason}
+        return _pend_or_lose(stores, env, rec, reason)
 
     commit, tsha = tool_identity()
     m = mf.new_manifest(episode_id=ep, session_id=session_id, started_at=started_at, prompt_sha256=psha,
@@ -777,8 +934,12 @@ def run_start(payload: dict[str, Any], env: dict[str, str], *, now: str | None =
 
 
 def maintenance_due(stores: Stores) -> bool:
-    if (stores.meta / MAINTAIN_LOCK).exists():
+    """Whether the start hook should launch maintenance: nothing holds ``maintain.lock``
+    (a leftover file from a dead run is not a holder) and the last pass is old enough."""
+    lock = stores.meta / MAINTAIN_LOCK
+    if not _try_lock(lock):
         return False
+    _unlock(lock)
     p = stores.meta / MAINTENANCE
     try:
         return time.time() - p.stat().st_mtime >= MAINTAIN_MIN_INTERVAL_S
@@ -909,20 +1070,43 @@ def _is_capture_failure(m: dict[str, Any]) -> bool:
         m["start_snapshot"].get("state") == "failed" and m["start_snapshot"].get("reason") in STREAK_SNAPSHOT_REASONS)
 
 
-def capture_failure_times(stores: Stores, env: dict[str, str]) -> list[str]:
-    """Start times of every capture failure on record: failed manifests and not-yet-drained pending records."""
-    times = [m["started_at"] for m in scan_manifests(stores).manifests if _is_capture_failure(m)]
-    try:
-        for line in _pending_file(env).read_text(encoding="utf-8").splitlines():
+def capture_failure_records(stores: Stores, env: dict[str, str]) -> tuple[list[str], list[str]]:
+    """``(start times, problems)`` of every capture failure on record: failed manifests,
+    pending records and records claimed by a drain still in flight (``.draining`` files).
+
+    A record an in-flight drain already turned into a manifest is counted once. A pending
+    or claimed file that exists but cannot be read, and a record without a readable start
+    time, is a problem: the failures behind it are unknown, never zero."""
+    failed = {m.get("episode_id"): m["started_at"] for m in scan_manifests(stores).manifests
+              if _is_capture_failure(m)}
+    times = list(failed.values())
+    seen = set(failed)
+    problems: list[str] = []
+    src = _pending_file(env)
+    for f in [src, *sorted(src.parent.glob(f"{src.name}.*.draining"))]:
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            continue  # no pending failures, or the drain finished between the glob and the read
+        except (OSError, ValueError) as exc:
+            problems.append(f"pending file unreadable {f.name}: {type(exc).__name__}")
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
             try:
                 rec = json.loads(line)
             except ValueError:
+                rec = None
+            if not isinstance(rec, dict) or not isinstance(rec.get("started_at"), str):
+                problems.append(f"pending record unreadable in {f.name}")
                 continue
-            if isinstance(rec, dict) and isinstance(rec.get("started_at"), str):
-                times.append(rec["started_at"])
-    except OSError:
-        pass
-    return sorted(times)
+            ep = rec.get("episode_id")
+            if ep in seen:
+                continue
+            seen.add(ep)
+            times.append(rec["started_at"])
+    return sorted(times), problems
 
 
 def failure_streaks(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1064,7 +1248,9 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
             counts.update(expired_deleted=exp["expired_deleted"], expire_errors=exp["errors"],
                           expire_undated=exp["undated"])
         ptr = retire_open_pointers(stores, now)
-        counts.update(open_pointers_retired=len(ptr["retired"]), open_unjoined_stale=ptr["open_unjoined"][:20])
+        counts.update(open_pointers_retired=len(ptr["retired"]), open_unjoined_stale=ptr["open_unjoined"][:20],
+                      open_pointers_dangling=ptr["dangling"], open_pointers_unreadable=ptr["unreadable"],
+                      open_pointers_retire_failed=ptr["retire_failed"])
         if ptr["retired"]:
             log_line(stores, f"maintain: retired {len(ptr['retired'])} open pointer(s) past their Stop window: "
                              + ",".join(ptr["retired"][:20]))
@@ -1121,6 +1307,9 @@ def maintain_findings(counts: dict[str, Any]) -> tuple[list[str], list[str]]:
         warnings.append(f"review_errors: {counts['review_errors']}")
     if counts.get("failure_streaks"):
         warnings.append(f"capture_failure_streaks: {counts['failure_streaks']}")
+    stuck = {k: counts.get(f"open_pointers_{k}") for k in ("dangling", "unreadable", "retire_failed")}
+    if any(stuck.values()):
+        warnings.append("open_pointers_stuck: " + ", ".join(f"{k} {v}" for k, v in stuck.items() if v))
     return problems, warnings
 
 

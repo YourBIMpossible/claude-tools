@@ -320,6 +320,9 @@ def referenced_subagents(tr: Transcript, start: int, end: int, index: SubagentIn
 
 
 CONTAINED_WINDOW_S = 120
+# The hook's ``started_at`` and the transcript's delivery timestamp are the same moment, a
+# hook's run time apart. An identical prompt further away is an earlier turn, not this one.
+EXACT_WINDOW_S = 600
 
 
 def envelope_payloads(text: str) -> list[str]:
@@ -343,8 +346,10 @@ def find_turn(tr: Transcript, prompt_sha256: str, started_at: str,
               prompt_len: int | None = None, misses: list[str] | None = None) -> tuple[int, str] | None:
     """(index, match) of the event carrying the hook's prompt, nearest to ``started_at``.
 
-    ``exact``: a prompt (or meta prompt) event whose whole text has the hook's hash. Queue
-    enqueue records carry no turn and are never matched.
+    ``exact``: a prompt (or meta prompt) event whose whole text has the hook's hash, within
+    EXACT_WINDOW_S of ``started_at`` (an event without a timestamp is kept, as elsewhere:
+    nothing is known about its distance). Queue enqueue records carry no turn and are
+    never matched.
     ``contained``: the transcript wrapped the hook's prompt in a recognized envelope
     (:func:`envelope_payloads`); the payload must have the hook's exact length and hash,
     lie within CONTAINED_WINDOW_S, and be the only such event. Two or more is ambiguous and
@@ -355,9 +360,13 @@ def find_turn(tr: Transcript, prompt_sha256: str, started_at: str,
         ts = parse_iso(ev.ts)
         return abs((ts - start).total_seconds()) if ts and start else float("inf")
 
+    def near(ev: Event, window: float) -> bool:
+        return parse_iso(ev.ts) is None or start is None or dist(ev) <= window
+
     for kinds in (("prompt",), ("candidate",)):
         hits = [(dist(ev), i) for i, ev in enumerate(tr.events)
-                if ev.kind in kinds and "text" in ev.data and ev.data["sha256"] == prompt_sha256]
+                if ev.kind in kinds and "text" in ev.data and ev.data["sha256"] == prompt_sha256
+                and near(ev, EXACT_WINDOW_S)]
         if hits:
             return min(hits)[1], "exact"
     if not prompt_len:

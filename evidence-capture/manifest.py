@@ -92,11 +92,6 @@ def evaluate_rules(m: dict[str, Any], owner: dict[str, Any] | None = None) -> li
 
     if m["edited_files"]:
         out.append({"rule": "X2", "state": "no", "evidence": f"{len(m['edited_files'])} repository file(s) edited"})
-    elif m.get("observation", {}).get("shell_repo_mutations"):
-        # Content writes, git state changes or unresolved runs: none names an edited-file set,
-        # so the rule can be neither "no" nor "yes".
-        muts = m["observation"]["shell_repo_mutations"]
-        out.append({"rule": "X2", "state": "unknown", "evidence": "shell repository effect: " + ",".join(muts[:6])})
     elif sufficient:
         out.append({"rule": "X2", "state": "yes", "evidence": "no repository edit observed in a complete transcript"})
     else:
@@ -147,7 +142,10 @@ def compute_funnel(m: dict[str, Any]) -> dict[str, bool]:
     f["packet_linked"] = m["link"]["state"] == "linked"
     f["start_snapshot_complete"] = (m["start_snapshot"].get("state") == "complete"
                                     and bool(m.get("boundary", {}).get("trusted")))
-    f["dependency_screen_clear"] = all(rule_state(ex, r) == "no" for r in ("X1", "X2", "X3", "X4", "X5"))
+    # every exclusion rule (X6/X7 included) must be "no" over a sufficient observation:
+    # the same conditions report.blocker_partition counts as clear (review F11)
+    f["dependency_screen_clear"] = (bool(m.get("observation", {}).get("sufficient"))
+                                    and all(rule_state(ex, r) == "no" for r in RULES))
     prev = f["packet_linked"] and f["start_snapshot_complete"] and f["dependency_screen_clear"]
     rec = m.get("funnel") or {}
     for stage in ("privacy_cleared", "payload_materialized", "start_state_reconstructed", "replay_verified"):
@@ -252,3 +250,32 @@ def refresh(m: dict[str, Any], owner: dict[str, Any] | None = None) -> dict[str,
     m["exclusions"] = evaluate_rules(m, owner)
     m["funnel"] = compute_funnel(m)
     return m
+
+
+_SHAPE: dict[str, type] = {"episode_id": str, "started_at": str, "capture": dict, "prompt": dict, "repo": dict,
+                           "link": dict, "start_snapshot": dict, "boundary": dict, "observation": dict,
+                           "prior_context": dict, "deps": dict, "exclusions": list, "funnel": dict,
+                           "edited_files": list}
+
+
+def shape_problem(m: Any) -> str | None:
+    """Why ``m`` cannot be read by refresh, rescreen or the report, else None. A partial
+    manifest is reported by its readers, never allowed to abort a run (review F10)."""
+    if not isinstance(m, dict):
+        return "not an object"
+    for key, kind in _SHAPE.items():
+        if not isinstance(m.get(key), kind):
+            return f"{key} missing or not {kind.__name__}"
+    for c in DEP_CATEGORIES:
+        if not isinstance(m["deps"].get(c), dict):
+            return f"deps.{c} missing or not dict"
+    if not all(isinstance(e, dict) and "rule" in e and "state" in e for e in m["exclusions"]):
+        return "exclusions entry without rule/state"
+    obs = m["observation"]
+    if "sufficient" not in obs or not isinstance(obs.get("causes"), list):
+        return "observation without sufficient/causes"
+    try:  # every remaining read, on a copy
+        refresh(json.loads(json.dumps(m)))
+    except (KeyError, TypeError, AttributeError, ValueError) as exc:
+        return f"refresh failed: {type(exc).__name__}: {exc}"
+    return None

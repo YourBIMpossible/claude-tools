@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -82,6 +83,10 @@ def test_lab(tmp: Path) -> list[dict]:
         check(len(head) == 40 and not twin.git(repo, "remote").strip(), f"{t['task_id']}: fixture is a remote-less git repo")
         check(all((repo / p).is_file() for p in t["target_files"] + t["planted_files"]),
               f"{t['task_id']}: target and planted files exist")
+        cited = [(path, int(n), text) for path, n, text in
+                 re.findall(r"\] \S+ at (\S+):(\d+)  \|  (.+)$", t["brief"], re.M)]
+        check(all((repo / path).read_text(encoding="utf-8").splitlines()[n - 1].strip() == text.strip()
+                  for path, n, text in cited), f"{t['task_id']}: brief line citations match the fixture ({len(cited)})")
         check(not verify(t, repo), f"{t['task_id']}: verify fails before the fix")
         rel, old, new = SOLVE[t["task_id"]]
         text = (repo / rel).read_text(encoding="utf-8")
@@ -263,6 +268,62 @@ def test_real(tmp: Path) -> None:
     check(no_payload[0]["prepare"]["payload"] is None, "no payload directory, no start state")
 
 
+def test_verify_guard(tmp: Path, tasks: list[dict]) -> None:
+    """A verify.py that hangs is cut off and recorded, the run's spend still reaches the ledger,
+    and verify runs in the run's environment (no Claude or Anthropic variable from the harness)."""
+    dump = tmp / "verify_env.json"
+    script = tmp / "verify_hang.py"
+    script.write_text("import json, os, sys, time\n"
+                      "json.dump(sorted(k for k in os.environ if k.upper().startswith(('CLAUDE', 'ANTHROPIC'))),"
+                      f" open({dump.as_posix()!r}, 'w'))\n"
+                      "time.sleep(10)\nsys.exit(1)\n", encoding="utf-8")
+    task = dict(next(t for t in tasks if t["task_id"] == "neg_irrelevant"), verify=str(script))
+    plan = twin.plan([task], 1, 3)
+    plan["runs"] = plan["runs"][:1]
+    ledger = tmp / "vg-ledger.json"
+    kw = dict(archive=tmp / "vg-archive", scratch=tmp / "vg-scratch", model="m", ledger=ledger, cap=100_000,
+              ceiling=1_000_000, wall=60, claude=FAKE, kind=None, limit=None, projects=tmp / "vg-projects")
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k.upper().startswith(("CLAUDE", "ANTHROPIC"))}
+    os.environ["CLAUDE_TWIN_TEST_PARENT"] = "1"
+    patched = getattr(twin, "VERIFY_TIMEOUT", None)
+    twin.VERIFY_TIMEOUT = 2.0
+    error: Exception | None = None
+    try:
+        res = twin.run_batch([task], plan, **kw)
+    except subprocess.TimeoutExpired as exc:
+        error = exc
+    finally:
+        twin.VERIFY_TIMEOUT = patched
+        del os.environ["CLAUDE_TWIN_TEST_PARENT"]
+        os.environ.update(saved)
+    meta_path = kw["archive"] / plan["runs"][0]["run_id"] / "meta.json"
+    check(error is None and meta_path.is_file(), "a hung verify does not abort the run")
+    meta = twin.read_json(meta_path) if meta_path.is_file() else {}
+    check(meta.get("verified") is False and (meta.get("verify_error") or "").startswith("timeout"),
+          "a hung verify is recorded as unverified with the reason")
+    check(ledger.is_file() and twin.read_json(ledger)["total"] == 3390 and error is None and res["ran"] == 1,
+          "the run's spend reaches the ledger")
+    check(dump.is_file() and json.loads(dump.read_text(encoding="utf-8")) == [],
+          "verify runs without the harness's Claude or Anthropic variables")
+
+
+def test_negative_censored() -> None:
+    """A negative control with every run censored is inconclusive, not a pass."""
+    def meta(reached: bool, killed: str | None = None) -> dict:
+        return {"reached": reached, "tokens_to_target": 1000 if reached else None, "killed": killed,
+                "planted_touched": False}
+    cap = 100_000
+    both = twin.lab_verdict("negative", [meta(False)] * 2, [meta(False)] * 2, cap)
+    check(both["pass"] is None and both["ratio"] == 1.0 and "censored" in both.get("inconclusive", ""),
+          "both arms fully censored: negative verdict is null, not a pass")
+    killed = twin.lab_verdict("negative", [meta(True, "cap")] * 2, [meta(True, "wall")] * 2, cap)
+    check(killed["pass"] is None, "runs killed after reaching the target are censored too")
+    one = twin.lab_verdict("negative", [meta(True), meta(False)], [meta(True), meta(False)], cap)
+    check(one["pass"] is True, "a partly censored negative control is still judged")
+    skew = twin.lab_verdict("negative", [meta(True)] * 2, [meta(False)] * 2, cap)
+    check(skew["pass"] is False, "unequal reach fails the negative control")
+
+
 def test_bench_blind(tmp: Path) -> None:
     """bench_blind is true only on a failed positive control, null when unscored, false when all pass."""
     tasks = [{"task_id": "pos_x", "kind": "lab", "family": "positive"},
@@ -314,6 +375,8 @@ def main() -> int:
         test_hook(tmp)
         test_batch(tmp, tasks)
         test_real(tmp)
+        test_verify_guard(tmp, tasks)
+        test_negative_censored()
         test_bench_blind(tmp)
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")
     return 1 if FAILED else 0

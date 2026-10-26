@@ -26,8 +26,8 @@ import causal  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
-ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
-       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t",
+       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t",
        "GIT_CONFIG_NOSYSTEM": "1"}
 TOOLS = {"python": [sys.executable, "--version"]}
 
@@ -342,6 +342,165 @@ def test_end_to_end_synthetic_episode(tmp: Path) -> None:
     record["check_results_start"] = causal.run_checks(checks, tmp / "m0")
     assert causal.admit(record)["eligible"], causal.admit(record)
     assert record["check_results"][0]["passed"] is True
+
+
+# ------------------------------------------------------------ worktree status failure
+
+
+def _break_gitdir_pointer(worktree: Path, target: Path) -> None:
+    """Point a linked worktree's ``.git`` file at a gitdir that does not exist, so every git
+    command inside it exits 128 (the file is hidden+read-only on Windows checkouts)."""
+    dot_git = worktree / ".git"
+    os.chmod(dot_git, stat.S_IWRITE)
+    if os.name == "nt":
+        subprocess.run(["attrib", "-h", "-r", str(dot_git)], check=False, capture_output=True)
+    dot_git.write_text(f"gitdir: {target}\n", encoding="utf-8")
+
+
+def test_worktree_status_clean_is_stable_and_observed(tmp: Path) -> None:
+    repo = make_repo(tmp)
+    other = tmp / "other_wt"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(other))
+    a = causal.worktree_records(repo)
+    b = causal.worktree_records(repo)
+    key = next(iter(a))
+    assert a[key]["fp"] == b[key]["fp"] and a[key]["fp"] is not None and a[key]["paths"] == []
+    assert "status_error" not in a[key]
+    assert causal.unobservable_worktrees(a, b) == []
+    cls = causal.classify_worktrees(a, b, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
+    assert cls == {"contaminating": [], "unrelated": [], "unknown": [], "shared_state_changed": False}
+    assert "other_worktree_unknown" not in causal.admit({"worktrees": cls})["reasons"]
+
+
+def test_worktree_status_dirty_moves_and_is_observed(tmp: Path) -> None:
+    repo = make_repo(tmp)
+    other = tmp / "other_wt"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(other))
+    a = causal.worktree_records(repo)
+    (other / "a.txt").write_bytes(b"someone else")
+    b = causal.worktree_records(repo)
+    key = next(iter(a))
+    assert a[key]["fp"] != b[key]["fp"] and b[key]["fp"] is not None and b[key]["paths"] == ["a.txt"]
+    assert causal.unobservable_worktrees(a, b) == []
+    cls = causal.classify_worktrees(a, b, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
+    assert cls["unrelated"] == [key] and cls["unknown"] == []
+
+
+def test_worktree_status_failure_is_unknown_not_unmoved(tmp: Path) -> None:
+    """Audit SA-1 (2026-10-12): a worktree whose ``git status`` fails must not fingerprint
+    like a clean one. Broken gitdir pointer -> rc 128 -> unobservable -> unknown -> ineligible."""
+    repo = make_repo(tmp)
+    other = tmp / "other_wt"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(other))
+    healthy = causal.worktree_records(repo)
+    key = next(iter(healthy))
+    _break_gitdir_pointer(other, tmp / "nonexistent" / "gitdir")
+    probe = subprocess.run(["git", "-C", str(other), "status", "--porcelain=v2"], capture_output=True, env=ENV)
+    assert probe.returncode == 128, probe
+    broken = causal.worktree_records(repo)
+    rec = broken[key]
+    assert rec["fp"] is None and rec["paths"] is None
+    assert rec["status_error"]["rc"] == 128 and rec["status_error"]["stderr"]
+    assert rec["fp"] != healthy[key]["fp"]
+    assert causal.worktree_fingerprints(repo)[key] is None
+    # The record round-trips through JSON (the hooks persist it that way) and stays unobservable.
+    broken = json.loads(json.dumps(broken))
+    assert causal.unobservable_worktrees(healthy, broken) == [key]
+    # Failed on one side, failed on both sides, healthy at the end again: unknown every time.
+    for s_, e_ in ((healthy, broken), (broken, broken), (broken, healthy)):
+        cls = causal.classify_worktrees(s_, e_, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
+        assert cls["unknown"] == [key] and not cls["unrelated"] and not cls["contaminating"], cls
+        assert "other_worktree_unknown" in causal.admit({"worktrees": cls})["reasons"]
+    # ``attribute`` never treats an unobserved fingerprint as unmoved.
+    s = causal.capture_state(repo, tmp / "s", label="start")
+    fps = {k: v["fp"] for k, v in broken.items()}
+    att = causal.attribute(s, s, [], worktrees_start=fps, worktrees_end=fps)
+    assert att["other_worktrees_moved"] == [key] and not att["isolated"]
+
+
+def test_worktree_status_failure_monkeypatched_rc(tmp: Path) -> None:
+    """Any non-zero exit, not only 128, is unobservable; stderr is captured, not discarded."""
+    repo = make_repo(tmp)
+    other = tmp / "other_wt"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(other))
+    real_popen = subprocess.Popen
+
+    class FailingStatus:
+        returncode = 1
+
+        def __init__(self, *_a, **_k) -> None:
+            pass
+
+        def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+            return b"", b"error: index file corrupt\n"
+
+        def kill(self) -> None:
+            pass
+
+    def fake_popen(argv, *a, **k):
+        if argv[:2] == ["git", "-C"] and "status" in argv:
+            return FailingStatus()
+        return real_popen(argv, *a, **k)
+
+    causal.subprocess.Popen = fake_popen  # type: ignore[assignment]
+    try:
+        recs = causal.worktree_records(repo)
+    finally:
+        causal.subprocess.Popen = real_popen  # type: ignore[assignment]
+    (rec,) = recs.values()
+    assert rec["fp"] is None and rec["paths"] is None
+    assert rec["status_error"] == {"rc": 1, "stderr": "error: index file corrupt"}
+    cls = causal.classify_worktrees(recs, recs, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
+    assert cls["unknown"] == list(recs) and not causal.admit({"worktrees": cls})["eligible"]
+
+
+def _nested_ignored_worktree(tmp: Path) -> tuple[Path, Path, str]:
+    """A lane nested in an ignored directory of its parent repository."""
+    repo = make_repo(tmp, {"a.txt": b"a\n", ".gitignore": b"lanes/\n"})
+    lane = repo / "lanes" / "lane"
+    git(repo, "worktree", "add", "-q", "-b", "lane", str(lane))
+    recs = causal.worktree_records(repo)
+    (key,) = recs
+    return repo, lane, key
+
+
+def test_nested_worktree_healthy_resolves(tmp: Path) -> None:
+    repo, lane, key = _nested_ignored_worktree(tmp)
+    a = causal.worktree_records(repo)
+    assert a[key]["fp"] is not None and a[key]["paths"] == [] and "status_error" not in a[key]
+    (lane / "a.txt").write_bytes(b"edited in lane")
+    b = causal.worktree_records(repo)
+    assert b[key]["fp"] not in (None, a[key]["fp"]) and b[key]["paths"] == ["a.txt"]
+    cls = causal.classify_worktrees(a, b, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
+    assert cls["unrelated"] == [key] and cls["unknown"] == []
+
+
+def test_nested_worktree_without_marker_is_unknown(tmp: Path) -> None:
+    """Reviewer bypass (SA-1 2c): the lane's ``.git`` file removed. git walks up to the parent
+    repo, status exits 0 with no output (the lane is ignored there), so the fingerprint would
+    be stable whatever changed inside. The toplevel check must make it unobservable."""
+    repo, lane, key = _nested_ignored_worktree(tmp)
+    healthy = causal.worktree_records(repo)
+    dot_git = lane / ".git"
+    os.chmod(dot_git, stat.S_IWRITE)
+    if os.name == "nt":
+        subprocess.run(["attrib", "-h", "-r", str(dot_git)], check=False, capture_output=True)
+    dot_git.unlink()
+    probe = subprocess.run(["git", "-C", str(lane), "status", "--porcelain=v2"], capture_output=True, env=ENV)
+    assert probe.returncode == 0 and probe.stdout == b"", probe  # the bypass precondition holds
+    before = causal.worktree_records(repo)
+    (lane / "a.txt").write_bytes(b"changed while unobservable")
+    after = causal.worktree_records(repo)
+    for rec in (before[key], after[key]):
+        assert rec["fp"] is None and rec["paths"] is None, rec
+        assert rec["status_error"]["rc"] == 0 and rec["status_error"]["stderr"].startswith("toplevel mismatch: "), rec
+    for s_, e_ in ((healthy, before), (before, after), (after, healthy)):
+        cls = causal.classify_worktrees(s_, e_, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
+        assert cls["unknown"] == [key] and not cls["unrelated"], cls
+        assert not causal.admit({"worktrees": cls})["eligible"]
+    st = causal.capture_state(repo, tmp / "s", label="start")
+    fps = {k: v["fp"] for k, v in before.items()}
+    assert not causal.attribute(st, st, [], worktrees_start=fps, worktrees_end=fps)["isolated"]
 
 
 # ------------------------------------------------------------------------ runner

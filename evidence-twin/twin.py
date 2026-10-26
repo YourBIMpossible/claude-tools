@@ -305,6 +305,10 @@ def kill_tree(proc: subprocess.Popen) -> None:
 # actually loaded, and the report lists every run's set when they differ (``init_drift``).
 PINNED_OFF = ("agents-md@builtin",)
 
+# Seconds a case's verify.py may run. It imports the run's edited code, so it can hang on
+# an edit that loops; a hung verify is recorded as unverified, never as a lost run.
+VERIFY_TIMEOUT = 120.0
+
 
 def settings_for(brief_arg: str, python: str) -> dict:
     hook = f'"{Path(python).as_posix()}" "{(HERE / "replay_hook.py").as_posix()}" "{brief_arg}"'
@@ -431,10 +435,16 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
     diff = git(repo, "diff", "--cached", "--binary", head)
     (out / "diff.patch").write_text(diff, encoding="utf-8", newline="\n")
     verified = None
+    verify_error = None
     if task.get("verify"):
-        v = subprocess.run([sys.executable, task["verify"], str(repo)], cwd=repo, capture_output=True,
-                           text=True, timeout=120)
-        verified = v.returncode == 0
+        # verify.py imports the run's edited code: it gets the run's environment, not the harness's.
+        try:
+            v = subprocess.run([sys.executable, task["verify"], str(repo)], cwd=repo, capture_output=True,
+                               text=True, env=env, timeout=VERIFY_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            verified, verify_error = False, f"timeout after {VERIFY_TIMEOUT:g}s"
+        else:
+            verified = v.returncode == 0
     scored = score_run(state, repo, task)
     trace = [] if rmtree(work, tries=30) else [f"scratch not deleted: {work}"]
     trace += clear_project_trace(projects, repo)
@@ -466,6 +476,7 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         "tokens_total": state.tokens(),
         "tokens_result": sum(int(result_usage.get(f) or 0) for f in USAGE_FIELDS),
         "wall_seconds": seconds, "seconds_to_target": target_seconds, "verified": verified,
+        "verify_error": verify_error,
         "trace_left": trace,
         "stream_sha256": sha256_bytes((out / "stream.jsonl").read_bytes()),
         "diff_sha256": sha256_bytes(diff.encode("utf-8")),
@@ -555,7 +566,13 @@ def lab_verdict(family: str, a: list[dict], b: list[dict], cap: int) -> dict:
     if family == "positive":
         out["pass"] = (ra == len(a) and rb <= len(b) - 1) or (ratio is not None and ratio <= 0.5)
     elif family == "negative":
-        out["pass"] = ra == rb and ratio is not None and 0.5 < ratio < 2.0
+        if all(ttt(m, cap) == cap for m in a + b):
+            # Every run censored: both means sit at the cap and the ratio is 1 by construction,
+            # which says nothing about the brief. Inconclusive, not a pass.
+            out["pass"] = None
+            out["inconclusive"] = "every run in both arms is censored at the cap"
+        else:
+            out["pass"] = ra == rb and ratio is not None and 0.5 < ratio < 2.0
     elif family == "misleading":
         out["planted_A"] = sum(bool(m["planted_touched"]) for m in a)
         out["planted_B"] = sum(bool(m["planted_touched"]) for m in b)

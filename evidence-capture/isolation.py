@@ -61,7 +61,11 @@ def _attempt(kind: str, path: Path) -> str:
             probe = path / f"isolation-probe-{os.getpid()}"
             with probe.open("xb") as fh:
                 fh.write(b"x")
-            probe.unlink()
+            # The write already succeeded; a failed cleanup must not turn it into a denial.
+            try:
+                probe.unlink()
+            except OSError as exc:
+                return f"succeeded:probe file left behind ({type(exc).__name__})"
         else:
             return f"error:unknown kind {kind}"
         return "succeeded"

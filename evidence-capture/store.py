@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -131,6 +132,18 @@ def _under_sync_root(path: Path) -> str | None:
     return None
 
 
+# One ``attrib`` line: single-letter flags in the fixed columns, then the canonical absolute
+# path (``X:\...`` or ``\\server\...``) however the path was given (lowercase drive, relative).
+ATTRIB_LINE_RE = re.compile(r"^(?P<flags>[A-Z\s]*?)(?=[A-Za-z]:\\|\\\\)")
+
+
+def parse_attrib_flags(line: str) -> str | None:
+    """Flag letters of one ``attrib`` output line; None when it is not one (``File not
+    found - ...``, an empty output)."""
+    m = ATTRIB_LINE_RE.match(line)
+    return m.group("flags").replace(" ", "") if m else None
+
+
 def _windows_attrib_flags(path: Path) -> str | None:
     if os.name != "nt":
         return None
@@ -139,8 +152,7 @@ def _windows_attrib_flags(path: Path) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     line = out.strip().splitlines()[-1] if out.strip() else ""
-    flags = line[: max(0, line.find(str(path)[:1]))] if line else ""
-    return flags.replace(" ", "")
+    return parse_attrib_flags(line)
 
 
 def check_content_store(stores: Stores) -> list[str]:

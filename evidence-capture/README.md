@@ -200,3 +200,26 @@ python tests/test_host_probe.py
 
 All fixtures are synthetic and live in temporary directories. Hook subprocesses run
 with `HOME`, `USERPROFILE` and `TEMP` pointed into the test directory.
+
+## Running the tests
+
+The runner contract is one script per suite: `python <test file>` exits non-zero on any failure.
+The platform-neutral suites run in CI (`gates`, Ubuntu) and in `tools/release-check.ps1`:
+`tests/test_capture.py`, `tests/test_locks.py`, `tests/test_identity.py`, `tests/test_review.py`,
+`tests/test_snapshot.py`, `tests/test_causal.py`, `tests/test_host_probe.py`, plus
+`evidence-footprints/` and `evidence-twin/`.
+
+Four suites are pinned to the Windows host and are run locally before a change to capture,
+hooks, backstop or clone code lands (`test_causal_hooks.py` builds on the `test_hooks.py`
+fixtures):
+
+```
+python evidence-capture/tests/test_hooks.py
+python evidence-capture/tests/test_causal_hooks.py
+python evidence-capture/tests/test_backstop.py
+python evidence-capture/tests/test_clone.py
+```
+
+They need PyYAML (`pip install pyyaml`): without it `review.load_capture_config` fails closed
+and every episode is excluded on `deny_glob:config`, so `test_hooks.py` and `test_backstop.py`
+refuse to start and say so. The `icacls` isolation proof is skipped off Windows.

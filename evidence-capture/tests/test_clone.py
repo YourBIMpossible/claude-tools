@@ -34,6 +34,12 @@ from fixture_repo import build_source, git  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
+SKIPPED: list[str] = []
+
+
+class SkipTest(Exception):
+    """A test whose precondition is a platform the mechanism under test does not exist on.
+    Reported by name with its reason; never counted as a pass."""
 REPORT: dict[str, object] = {}
 EPISODE = "cap_0123456789abcdef"
 
@@ -277,6 +283,57 @@ def test_p9_detects_divergence(root: Path) -> None:
     assert rec["start_state_reconstructed"] is False
 
 
+def test_reconstruct_entries_stay_in_the_clone(root: Path) -> None:
+    """F5: snapshot entry paths are data. Traversal, absolute/drive/UNC/extended forms,
+    ``.git``, a non-hex blob name and a write through an earlier symlink are refused before
+    any byte lands, whatever SHA256SUMS says."""
+    dest, src, outside = root / "clone", root / "src", root / "outside"
+    for d in (dest, src, outside):
+        d.mkdir()
+    blob = b"payload\n"
+    sha = cb.sha256_bytes(blob)
+    (src / sha).write_bytes(blob)
+    bad_paths = ["../escape.txt", "a/../../escape.txt", "/abs.txt", "C:/abs.txt", "C:rel.txt",
+                 "//server/share/x.txt", "\\\\?\\C:\\x.txt", "a\\..\\..\\x.txt", ".git/config",
+                 ".GIT/hooks/pre-commit", ".git./hooks/post-checkout", ".git /config",
+                 "a//b.txt", "./a.txt", "", None]
+    if os.name == "nt":  # Win32 would write these somewhere other than their name
+        bad_paths += ["dir./x.txt", "a.txt:stream", "sub /x.txt"]
+    for rel in bad_paths:
+        try:
+            cb._write_entry(dest, {"path": rel, "sha256": sha, "path_sha256": "0" * 64}, src, False)
+        except cb.ReconstructionError as exc:
+            assert exc.reason == "unsafe_entry_path", (rel, exc.reason)
+        else:
+            raise AssertionError(f"accepted {rel!r}")
+    try:
+        cb._write_entry(dest, {"path": "ok.txt", "sha256": "../" + sha, "path_sha256": "0" * 64}, src, False)
+        raise AssertionError("a traversing blob name was read")
+    except cb.ReconstructionError as exc:
+        assert exc.reason == "unsafe_entry_path"
+    cb._write_entry(dest, {"path": "sub/ok.txt", "sha256": sha, "path_sha256": "0" * 64}, src, False)
+    assert (dest / "sub" / "ok.txt").read_bytes() == blob
+    kind = "symlink"
+    try:
+        os.symlink(outside, dest / "link", target_is_directory=True)
+    except OSError:
+        kind = None
+        if os.name == "nt":  # no symlink privilege: a junction is the same escape
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(dest / "link"), str(outside)],
+                                  capture_output=True)
+            kind = "junction" if made.returncode == 0 else None
+    if kind is None:
+        REPORT["symlink_escape"] = "unverified: this machine can create neither a symlink nor a junction"
+    else:
+        try:
+            cb._write_entry(dest, {"path": "link/escape.txt", "sha256": sha, "path_sha256": "0" * 64}, src, False)
+            raise AssertionError("wrote through an earlier symlink")
+        except cb.ReconstructionError as exc:
+            assert exc.reason == "unsafe_entry_path"
+        REPORT["symlink_escape"] = f"refused ({kind})"
+    assert not any(outside.iterdir()) and not (root / "escape.txt").exists()
+
+
 def _current_sid() -> str:
     sid = isolation.identity()["sid"]
     assert sid and sid.startswith("S-1-"), sid
@@ -311,7 +368,8 @@ def _deny(paths: list[Path], sid: str):
 def test_fs_isolation_deterministic(root: Path) -> None:
     """Plan §8: a plain process under the replay identity cannot reach the protected paths."""
     if os.name != "nt":
-        raise AssertionError("the pinned environment is Windows; this test uses icacls")
+        raise SkipTest("isolation is enforced with icacls deny ACEs (isolation.icacls); there is no "
+                       "POSIX enforcement to test, so this check exists only on Windows")
     sid = _current_sid()
     src = root / "repos" / "source"
     src.mkdir(parents=True)
@@ -464,6 +522,48 @@ def _can_symlink(root: Path) -> bool:
         return False
 
 
+def test_core_config_values_are_data(root: Path) -> None:
+    """N1: ``git-config.json`` is snapshot data. A value that is not a config value (not a
+    string, or not a bare boolean/``input`` word) never becomes a ``git config`` argument:
+    ``build_clone`` refuses it and ``clone_start_only`` records the refusal instead of
+    raising out of the run."""
+    src, start, _ = build_source(root, None, post_commits=1)
+    bad_values: list[object] = [5, ["true"], {"v": "true"}, "--unset-all", "-f", "true\n[core]\n\thooksPath = x",
+                                "", "true false", "x" * 17]
+    for i, value in enumerate(bad_values):
+        dest = root / f"c{i}" / "repo"
+        try:
+            cb.build_clone(src, start, dest, core_config={"core.autocrlf": value})  # type: ignore[dict-item]
+        except cb.CloneError as exc:
+            assert "core.autocrlf" in str(exc), (value, exc)
+        else:
+            raise AssertionError(f"build_clone accepted {value!r}")
+        assert not dest.exists(), f"a refused value left a clone for {value!r}"
+    try:
+        cb.build_clone(src, start, root / "k" / "repo", core_config={"remote.origin.url": "x"})
+    except cb.CloneError:
+        pass
+    else:
+        raise AssertionError("build_clone accepted a key outside core.autocrlf/core.symlinks")
+    # every accepted value is in the clone, including a dash-free one git would also take
+    rec = cb.build_clone(src, start, root / "ok" / "repo", core_config={"core.autocrlf": "input", "core.symlinks": None})
+    assert any(c["cmd"][-2:] == ["core.autocrlf", "input"] for c in rec), rec
+    for i, value in enumerate([["true"], "--unset-all"]):
+        snap = root / f"s{i}"
+        snap.mkdir()
+        (snap / "git-config.json").write_text(json.dumps({"core.autocrlf": value, "core.symlinks": "false"}),
+                                              encoding="utf-8")
+        rec = cb.clone_start_only(src, start, root / f"r{i}" / "repo", snap, [])
+        assert rec["start_state_reconstructed"] is False
+        assert rec["error"] and rec["error"].startswith("CloneError") and "core.autocrlf" in rec["error"], rec["error"]
+        assert not (root / f"r{i}" / "repo").exists(), "the refusal came before any git ran"
+    bad = root / "s_shape"
+    bad.mkdir()
+    (bad / "git-config.json").write_text("[]", encoding="utf-8")
+    rec = cb.clone_start_only(src, start, root / "r_shape" / "repo", bad, [])
+    assert rec["error"] and rec["error"].startswith("CloneError"), rec["error"]
+
+
 def test_git_transport_pinned_env(root: Path) -> None:
     at = snap_at_start(root, dirty_mixed)
     src, start, sentinels = build_source(root, at, post_commits=3)
@@ -508,6 +608,9 @@ def main() -> int:
             try:
                 fn(case)
                 PASSED.append(f"{fn.__name__} ({time.perf_counter() - t0:.1f}s)")
+            except SkipTest as exc:
+                SKIPPED.append(fn.__name__)
+                print(f"SKIP {fn.__name__}: {exc}")
             except Exception:  # noqa: BLE001 — plain-check runner
                 FAILED.append(fn.__name__)
                 print(f"FAIL {fn.__name__}\n{traceback.format_exc()}")
@@ -515,7 +618,7 @@ def main() -> int:
         print(f"ok   {name}")
     if REPORT:
         print("report", json.dumps(REPORT, sort_keys=True, default=str))
-    print(f"{len(PASSED)} passed, {len(FAILED)} failed")
+    print(f"{len(PASSED)} passed, {len(FAILED)} failed, {len(SKIPPED)} skipped")
     return 1 if FAILED else 0
 
 

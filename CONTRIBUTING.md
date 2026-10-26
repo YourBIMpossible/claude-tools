@@ -16,6 +16,7 @@ or the individual gates:
 ```bash
 bin/gitleaks.exe detect --source . --no-banner   # requires the gitleaks download
 python tools/pre_publish_check.py                # forbidden-file + private-marker scan
+python .github/scripts/check_machine_paths.py   # no machine-specific absolute paths (also a CI workflow)
 ```
 
 Never attach to a commit, issue, or PR: secrets, tokens, keys, `.env` files;

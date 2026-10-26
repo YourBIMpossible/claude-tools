@@ -16,6 +16,9 @@ The snapshot records the checkout exactly as it is when the prompt is submitted:
 * ``state/*``             ``MERGE_HEAD``, ``REBASE_HEAD``, ``CHERRY_PICK_HEAD`` ... when present
 * ``untracked/<sha>``     every untracked, unignored file as bytes; ``untracked.json`` holds
                           path, mode, size, sha256 and symlink targets
+* ``nested.json``         paths of nested repositories (untracked ``dir/`` entries) and submodules
+                          whose worktree differs; their contents are never read, so the
+                          snapshot completes and the clone's P9 status comparison reports them
 * ``ignored.json``        path hashes of ignored files (never their bytes)
 * ``git-config.json``     ``core.symlinks``, ``core.autocrlf``, ``core.filemode``, git version
 * ``SHA256SUMS``          over everything above; ``INCOMPLETE`` is removed only after every
@@ -155,23 +158,31 @@ def read_index(gitdir: Path) -> tuple[bytes, int | None]:
     return index.read_bytes(), mtime
 
 
-def parse_status(status: bytes) -> tuple[list[str], list[str], bool]:
-    """(untracked paths, ignored paths, dirty) from porcelain v2 -z output without renames."""
+def parse_status(status: bytes) -> tuple[list[str], list[str], bool, list[str]]:
+    """(untracked paths, ignored paths, dirty, nested repositories) from porcelain v2 -z
+    output without renames.
+
+    ``--untracked-files=all`` never descends into a nested repository: it is reported as
+    one ``? dir/`` record. Such a path is a directory, so it is listed separately and its
+    bytes are never read.
+    """
     untracked: list[str] = []
     ignored: list[str] = []
+    nested: list[str] = []
     dirty = False
     for rec in status.split(b"\0"):
         if not rec:
             continue
         kind = rec[:1]
         if kind == b"?":
-            untracked.append(rec[2:].decode("utf-8", "surrogateescape"))
+            path = rec[2:].decode("utf-8", "surrogateescape")
+            (nested if path.endswith("/") else untracked).append(path)
             dirty = True
         elif kind == b"!":
             ignored.append(rec[2:].decode("utf-8", "surrogateescape"))
         else:
             dirty = True
-    return untracked, ignored, dirty
+    return untracked, ignored, dirty, nested
 
 
 def make_bracket(gitdir: Path, common: Path, status: bytes, head_raw: bytes,
@@ -256,23 +267,38 @@ def cat_blobs(repo: Path, shas: list[str], timeout: float) -> dict[str, bytes]:
     return blobs
 
 
-def worktree_changed(status: bytes) -> list[tuple[str, bool]]:
-    """Tracked paths whose worktree differs from the index: ``(path, deleted)``.
+def worktree_changed(status: bytes, top: Path) -> tuple[list[tuple[str, bool]], list[str]]:
+    """Tracked paths whose worktree differs from the index: ``(path, deleted)``, plus the
+    submodule paths among them.
 
     From porcelain v2 ``1`` records with a worktree status other than ``.`` and every
-    unmerged ``u`` record (the conflicted file as it sits in the worktree).
+    unmerged ``u`` record (the conflicted file as it sits in the worktree). An unmerged
+    record's ``XY`` names the merge sides, not the worktree: ``UD`` (deleted by them)
+    leaves our version on disk, so deletion is read from the worktree itself. A submodule
+    (``sub`` field ``S...``) is a directory whose bytes are never read; its path is
+    returned separately.
     """
     out: list[tuple[str, bool]] = []
+    submodules: list[str] = []
     for rec in status.split(b"\0"):
         if rec.startswith(b"1 "):
             parts = rec.split(b" ", 8)
             y = parts[1][1:2]
-            if y != b".":
-                out.append((parts[8].decode("utf-8", "surrogateescape"), y == b"D"))
+            if y == b".":
+                continue
+            path = parts[8].decode("utf-8", "surrogateescape")
+            if parts[2].startswith(b"S"):
+                submodules.append(path)
+            else:
+                out.append((path, y == b"D"))
         elif rec.startswith(b"u "):
             parts = rec.split(b" ", 10)
-            out.append((parts[10].decode("utf-8", "surrogateescape"), parts[1][1:2] == b"D"))
-    return out
+            path = parts[10].decode("utf-8", "surrogateescape")
+            if parts[2].startswith(b"S"):
+                submodules.append(path)
+            else:
+                out.append((path, not os.path.lexists(top / path)))
+    return out, submodules
 
 
 def _untracked_entry(top: Path, rel: str) -> tuple[dict[str, Any], bytes | None]:
@@ -329,7 +355,7 @@ def take_snapshot(repo: Path, episode: str, stores: Stores, *, budget_s: float =
         if not pre["head"]:
             raise SnapshotFailed("head_unresolved", "git rev-parse HEAD failed")
         repo_fields["head"] = pre["head"]
-        untracked_paths, ignored_paths, dirty = parse_status(pre["_status"])
+        untracked_paths, ignored_paths, dirty, nested_repos = parse_status(pre["_status"])
         snap.update(status_sha256=pre["status_sha256"], index_sha256=pre["index_sha256"], dirty=dirty)
         dl.check("bracket")
 
@@ -374,13 +400,16 @@ def take_snapshot(repo: Path, episode: str, stores: Stores, *, budget_s: float =
             return meta
 
         untracked_meta = keep_files(untracked_paths, "untracked")
-        changed = worktree_changed(pre["_status"])
+        changed, submodules = worktree_changed(pre["_status"], top)
         worktree_meta = keep_files([p for p, deleted in changed if not deleted], "worktree")
         worktree_meta += [{"path": p, "path_sha256": path_sha256(p), "deleted": True} for p, deleted in changed if deleted]
+        nested_meta = [{"path": p, "path_sha256": path_sha256(p), "kind": "nested_repo"} for p in nested_repos]
+        nested_meta += [{"path": p, "path_sha256": path_sha256(p), "kind": "submodule"} for p in submodules]
         (tmp / "untracked.json").write_text(json.dumps(untracked_meta, sort_keys=True, indent=1) + "\n",
                                             encoding="utf-8")
         (tmp / "worktree.json").write_text(json.dumps(worktree_meta, sort_keys=True, indent=1) + "\n",
                                            encoding="utf-8")
+        (tmp / "nested.json").write_text(json.dumps(nested_meta, sort_keys=True, indent=1) + "\n", encoding="utf-8")
         ignored = sorted(path_sha256(p) for p in ignored_paths)
         (tmp / "ignored.json").write_text(json.dumps(ignored) + "\n", encoding="utf-8")
 
@@ -400,8 +429,11 @@ def take_snapshot(repo: Path, episode: str, stores: Stores, *, budget_s: float =
                 continue
             if redo["sha256"] != entry["sha256"] or redo["mode"] != entry["mode"]:
                 diffs.append("untracked:" + entry["path_sha256"])
-        if set(parse_status(post["_status"])[0]) != {e["path"] for e in untracked_meta}:
+        post_untracked, _, _, post_nested = parse_status(post["_status"])
+        if set(post_untracked) != {e["path"] for e in untracked_meta}:
             diffs.append("untracked_set")
+        if set(post_nested) != set(nested_repos):
+            diffs.append("nested_set")
         snap["bracket"]["diff"] = diffs
         if diffs:
             raise SnapshotFailed("concurrent_change", ",".join(diffs))

@@ -434,8 +434,12 @@ def retrieved_section(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _pick_transcript(pid: str, session_id: str | None, by_pid: dict[str, list[tuple[Transcript, int]]],
-                     by_session: dict[str, list[Transcript]]) -> tuple[str, Transcript | None, int | None, str]:
-    """(status, transcript, brief position, detail); status is found | none | ambiguous."""
+                     by_session: dict[str, list[Transcript]],
+                     root_rank: dict[str, int]) -> tuple[str, Transcript | None, int | None, str]:
+    """(status, transcript, brief position, detail); status is found | none | ambiguous.
+
+    ``root_rank`` is each transcript root's position on the command line: when a
+    file is in several roots, the earliest root wins, never the alphabetically first."""
     hits = by_pid.get(pid, [])
     if hits:
         # A resumed or forked session copies history into a new file; the brief
@@ -443,8 +447,8 @@ def _pick_transcript(pid: str, session_id: str | None, by_pid: dict[str, list[tu
         own = [(t, pos) for t, pos in hits
                if t.session == (session_id or t.events[pos].data.get("session_id"))]
         pool = own or hits
-        roots = sorted({t.root for t, _ in pool})
-        pool = [(t, pos) for t, pos in pool if t.root == roots[0]]  # first-priority root wins
+        first = min((t.root for t, _ in pool), key=root_rank.__getitem__)
+        pool = [(t, pos) for t, pos in pool if t.root == first]  # first-priority root wins
         files = sorted({(t.root, t.rel) for t, _ in pool})
         if len(files) > 1:
             return "ambiguous", None, None, "packet_id in " + ", ".join(f"{r}:{p}" for r, p in files)
@@ -452,8 +456,8 @@ def _pick_transcript(pid: str, session_id: str | None, by_pid: dict[str, list[tu
         return "found", tr, pos, ""
     if session_id and session_id in by_session:
         cands = by_session[session_id]
-        roots = sorted({t.root for t in cands})
-        cands = [t for t in cands if t.root == roots[0]]
+        first = min((t.root for t in cands), key=root_rank.__getitem__)
+        cands = [t for t in cands if t.root == first]
         if len(cands) > 1:
             return "ambiguous", None, None, "session in " + ", ".join(sorted(t.rel for t in cands))
         return "found", cands[0], None, ""
@@ -534,7 +538,7 @@ def _anchor_by_prompt(tr: Transcript, want_hash: str | None,
 
 def build_row(pid: str, copies: list[PacketCopy], cohorts: list[Cohort],
               by_pid: dict[str, list[tuple[Transcript, int]]],
-              by_session: dict[str, list[Transcript]]) -> dict[str, Any]:
+              by_session: dict[str, list[Transcript]], root_rank: dict[str, int]) -> dict[str, Any]:
     row: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION, "packet_id": pid,
         "sources": [{"source": c.source, "path": c.rel, "sha256": c.sha256} for c in copies],
@@ -584,7 +588,7 @@ def build_row(pid: str, copies: list[PacketCopy], cohorts: list[Cohort],
     row["retrieved"] = retrieved_section(raw) if packet is not None else None
 
     rendered = render_brief(packet).text if packet is not None else None
-    status, tr, brief_pos, tdetail = _pick_transcript(pid, session_id, by_pid, by_session)
+    status, tr, brief_pos, tdetail = _pick_transcript(pid, session_id, by_pid, by_session, root_rank)
     anchor_pos: int | None = None
     matched: str | None = None
     injected: dict[str, Any] = {"rendered_nonempty": None if rendered is None else bool(rendered),
@@ -741,6 +745,7 @@ def build(sources: list[tuple[str, Path]], transcript_roots: list[tuple[str, Pat
         copies[pid].sort(key=lambda c: (order[c.source], c.rel))
 
     transcripts = discover_transcripts(transcript_roots)
+    root_rank = {name: i for i, (name, _) in enumerate(transcript_roots)}
     by_pid: dict[str, list[tuple[Transcript, int]]] = defaultdict(list)
     by_session: dict[str, list[Transcript]] = defaultdict(list)
     for tr in transcripts:
@@ -749,7 +754,7 @@ def build(sources: list[tuple[str, Path]], transcript_roots: list[tuple[str, Pat
             if ev.kind == "brief":
                 by_pid[ev.data["packet_id"]].append((tr, pos))
 
-    rows = [build_row(pid, copies[pid], cohorts, by_pid, by_session) for pid in sorted(copies)]
+    rows = [build_row(pid, copies[pid], cohorts, by_pid, by_session, root_rank) for pid in sorted(copies)]
     starts: dict[int, set[int]] = defaultdict(set)
     for row in rows:
         if "_turn" in row:

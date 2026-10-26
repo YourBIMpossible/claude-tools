@@ -105,7 +105,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.health:
             st = _stores(env)
-            _print(backstop.health(backstop.status_path(env), failure_times=pipeline.capture_failure_times(st, env)))
+            times, unread = pipeline.capture_failure_records(st, env)
+            _print(backstop.health(backstop.status_path(env), failure_times=times, failure_problems=unread))
             return 0
         rec = backstop.run_backstop(env)
         _print(rec)
@@ -127,8 +128,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "report":
         commit, _ = pipeline.tool_identity()
         import backstop
+        times, unread = pipeline.capture_failure_records(st, env)
         path, ck = write_checkpoint(st, tool_commit=commit, backstop=backstop.health(
-            backstop.status_path(env), failure_times=pipeline.capture_failure_times(st, env)))
+            backstop.status_path(env), failure_times=times, failure_problems=unread))
         _print({"checkpoint": str(path), "episodes": ck["denominator"]["episodes_total"],
                 "provisional_candidates": ck["funnel"]["provisional_candidates"]})
         return 0
@@ -136,7 +138,12 @@ def main(argv: list[str] | None = None) -> int:
         import rescreen
         res = rescreen.run_rescreen(st, env)
         _print({k: v for k, v in res.items() if k != "changed"} | {"changed": len(res.get("changed", []))})
-        return 0 if res.get("action") != "skipped" else 1
+        if res.get("action") == "skipped":
+            return 1
+        if res.get("committed") is False:
+            print("rescreen: corrections written but the metadata commit failed", file=sys.stderr)
+            return 2
+        return 0
     if args.cmd == "fn-audit":
         try:
             if args.action == "sheet":

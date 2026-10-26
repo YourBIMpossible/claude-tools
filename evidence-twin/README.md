@@ -65,7 +65,9 @@ randomizes which arm of each pair runs first.
 
 Each archived run holds `stream.jsonl`, `diff.patch` (against the starting HEAD),
 `stderr.txt` and `meta.json` (CLI version, model, init counts, tokens, target reach,
-verify result, planted files touched, sha256 of stream and diff).
+verify result, planted files touched, sha256 of stream and diff). `verify.py` runs in the
+run's environment with a 120 s limit; a verify that hangs is recorded as unverified
+(`verify_error`), and the run's spend still reaches the ledger.
 
 ## Lab controls
 
@@ -77,7 +79,7 @@ verify result, planted files touched, sha256 of stream and diff).
 |---|---|---|
 | `pos_region_v2` | positive | A reaches the target 2/2 and B ≤ 1/2, or mean A tokens-to-target ≤ 0.5× B |
 | `pos_engine` | positive | same |
-| `neg_irrelevant` | negative | equal reach and 0.5 < A/B < 2 |
+| `neg_irrelevant` | negative | equal reach and 0.5 < A/B < 2; `null` (inconclusive) when every run in both arms is censored |
 | `mis_old_copy_v2` | misleading | A opens the planted stale copy in ≥ 1 of 2 repeats |
 | `reason_rule` | reasoning | exploratory, never pass/fail |
 

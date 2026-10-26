@@ -208,5 +208,161 @@
     "rule": "claude-user-home",
     "line_sha256": "d5e0d77b0fe7fc2245436123c01991d4ee18d117e70aabd198fc6855703b948d",
     "reason": "Documentation of the client's projects-directory layout; no real path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "3e6794e06205014b1e1de2f2c6c551a92bfd8ceec34e0df74d28fc4b658b278e",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "90d5c12d38880773a186a804856fd5a281009e637c937ef466dc674b16f8f703",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "c29065e5561cd7c18f0b10f9d07202db14d60dc863e00ca0c321516ae99d4343",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "2ee8260bcbe4eb519162e0145d4628a1401a9325fa1dbccb8c7256aa385f2660",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "7017e5eef6944f67e06c41acf363067911e12743c883a8bb74637024283ee20d",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "306572f9becda2d3d5340047c89a9321ac1346b68ad287ead2d86e68ba329733",
+    "reason": "Synthetic Windows path forms (drive-absolute, drive-relative, UNC, extended-length) that the screen's path classifier must resolve; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_clone.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "7a29703dc622e5f21f2a234e10513ae7ce4985d33f20e8c7182b3943807f8162",
+    "reason": "Synthetic hostile snapshot entry paths (drive, UNC, extended-length) that reconstruction must refuse; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_clone.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "80cfd6534a7a7c1f0f4485fb1ab2bfa13292718e37d285f1e31652f06b82795d",
+    "reason": "Synthetic hostile snapshot entry paths (drive, UNC, extended-length) that reconstruction must refuse; fixture strings, no real machine path."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "c3b680cc7b1da82b6b5e00c1cb22e1d0203a7c9ea693c04a885e468392b0848b",
+    "reason": "Synthetic drive-letter path in a PowerShell parsing case; the parser's Windows behavior is what is tested; no real machine path."
+  },
+  {
+    "path": "evidence-footprints/test_footprints.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "fd64d83f905cef661d6f90902374348689f75b2927c37be4dea08b8245d9b490",
+    "reason": "Synthetic drive-letter path in a PowerShell parsing case; the parser's Windows behavior is what is tested; no real machine path."
+  },
+  {
+    "path": "evidence-capture/screen.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "b6fa4c13ca8fc93132d4cf367282bc0ed939bb37f681a52a0490d3fc984caa5c",
+    "reason": "Functional regex fragment: matches the Claude Code worktree directory segment in attribution of tool paths; no machine-specific prefix."
+  },
+  {
+    "path": "evidence-capture/store.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "863b954b249bceda88f966a04ecf13c642cd33bffdda60674cce00675ba4f774",
+    "reason": "Docstring/comment illustrating the drive-letter and UNC path forms the store must normalise; placeholder X: and server names, not a real location."
+  },
+  {
+    "path": "evidence-capture/store.py",
+    "rule": "unc-path",
+    "line_sha256": "863b954b249bceda88f966a04ecf13c642cd33bffdda60674cce00675ba4f774",
+    "reason": "Docstring/comment illustrating the drive-letter and UNC path forms the store must normalise; placeholder X: and server names, not a real location."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "dead51903c73bf7f78f896ed2746ad9f59b52b258366b60cea2eea3e40043642",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "6daf74fbd9d2e18f9836e36adb2779ccd56d4fe5b72bc6f5b62775fb4a6cbb07",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "unc-path",
+    "line_sha256": "df6f6e83fd76d31037010dc99cdadf7004689b294b23a5f4d580ee82b3706b05",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "e30751a66dbc97906eb95061fed07657ee24c5e40c4d917b7010437e64a6f2ab",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "f5b850e73e14551130b6a5e2e8edd7cfe573b73bbe2ba0069feb688d276bb1b2",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "f5b850e73e14551130b6a5e2e8edd7cfe573b73bbe2ba0069feb688d276bb1b2",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "claude-worktree-path",
+    "line_sha256": "2ddf9dc83d8eabb9f75daf0e4812d8999987a5a10aede0465e1ce0bcf602ee6e",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "ed89cb150fbc18fc7b81da86587a463aca0a6082f4815bb669282ead000f50e2",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "343f9c860c840a64cb8823fbe4999c328029455ba446f8b270f194f39f0fc3e2",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "d6563c76c292a3c1de981ec601aff040b8bab958800e25c320f97135c1225f7a",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "34391ddd4c237b4bf6892fd3b2386520c8ba6d6c4903dbf8f968e08377c280e0",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "0d52d826a07f4218504b6da67d900988a3cb8868c376b2d072b8141175913f1a",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "d4e2dbdea6478cb0eece4f1925bb6c8aba27662c942f207ca52687b836daee8a",
+    "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
   }
 ]

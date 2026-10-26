@@ -218,17 +218,42 @@ def snapshot_content_paths(snapshot: Path) -> list[str]:
     return sorted(set(paths))
 
 
+def _zero_dir_forms(form: str) -> set[str]:
+    """Every way of letting each ``/**/`` span zero directories (collapse to ``/``) or more."""
+    out, todo = set(), [form]
+    while todo:
+        f = todo.pop()
+        if f in out:
+            continue
+        out.add(f)
+        i = f.find("/**/")
+        while i != -1:
+            todo.append(f[:i] + f[i + 3:])
+            i = f.find("/**/", i + 1)
+    return out
+
+
 def deny_match(rel: str, globs: list[str]) -> str | None:
     low = rel.replace("\\", "/").lower()
     base = low.rsplit("/", 1)[-1]
     for g in globs:
         gl = g.replace("\\", "/").lower().lstrip("/")
-        if gl.endswith("/**") or gl.endswith("/"):
-            prefix = gl.rstrip("*").rstrip("/") + "/"
-            if low.startswith(prefix) or ("/" + prefix) in ("/" + low):
+        # ``**/**/`` means the same as ``**/``; collapse so the root-level bare form below applies.
+        while "**/**/" in gl:
+            gl = gl.replace("**/**/", "**/")
+        # fnmatch has no ``**``: ``**/x`` only matches through its ``/``, so a root-level
+        # ``x`` needs the bare form too (``*`` already crosses ``/`` for deeper paths).
+        forms = (gl, gl[3:]) if gl.startswith("**/") and len(gl) > 3 else (gl,)
+        # ``a/**/b`` also matches ``a/b``: ``**`` spans zero directories.
+        if "/**/" in gl:
+            forms = tuple(v for f in forms for v in _zero_dir_forms(f))
+        for form in forms:
+            if form.endswith("/**") or form.endswith("/"):
+                prefix = form.rstrip("*").rstrip("/") + "/"
+                if low.startswith(prefix) or ("/" + prefix) in ("/" + low):
+                    return g
+            if fnmatch.fnmatchcase(low, form) or fnmatch.fnmatchcase(base, form):
                 return g
-        if fnmatch.fnmatchcase(low, gl) or fnmatch.fnmatchcase(base, gl):
-            return g
     return None
 
 
@@ -240,7 +265,11 @@ def privacy_check(m: dict[str, Any], snapshot: Path, inputs: ReviewInputs) -> di
     def add(check: str, source: str, digest: str | None = None, **extra: Any) -> None:
         findings.append({"check": check, "source": source, "sha256": digest, **extra})
 
-    for label, text in (("prompt", inputs.prompt_text), ("settings", json.dumps(inputs.settings, sort_keys=True))):
+    # Settings are scanned as they are written to the payload (``ensure_ascii=False``): the
+    # default ``\uXXXX`` escapes would turn a non-ASCII repository root into a path that no
+    # longer starts with the root key and is flagged as outside.
+    settings_text = json.dumps(inputs.settings, sort_keys=True, ensure_ascii=False)
+    for label, text in (("prompt", inputs.prompt_text), ("settings", settings_text)):
         for h in outside_paths(text, root):
             add("path_outside_repo", label, h)
     for h in outside_paths(inputs.brief_text, root):
@@ -478,7 +507,8 @@ def review_episode(stores: Stores, m: dict[str, Any], inputs: ReviewInputs | Non
             try:
                 out["causal_deletion"] = verified_delete(stores, "causal", ep, f"excluded:{reason}")
             except StoreError as exc:
-                out["error"] = str(exc)
+                # a snapshot deletion error above is kept, never replaced
+                out["error"] = f"{out['error']}; {exc}" if out.get("error") else str(exc)
                 log_line(stores, f"review {ep}: causal state deletion not verified: {exc}")
             touched.append(stores.meta / "DELETIONS.log")
     elif state == "held":
@@ -673,8 +703,14 @@ def expire(stores: Stores, *, now: str | None = None, commit: bool = True) -> di
         counts["deletions_verified"] += int(rec["verified"])
         touched.append(stores.meta / "DELETIONS.log")
         if m is not None:
-            m.setdefault("retention", {}).update(deleted_at=rec["deleted_at"], deleted_kind=kind,
-                                                 deletion_verified=rec["verified"])
+            # one pass can delete an episode's payloads, snapshots and causal states: each is
+            # kept under ``deletions``; ``deleted_kind``/``deleted_at`` name the latest and
+            # ``deletion_verified`` holds only when every recorded deletion verified
+            ret = m.setdefault("retention", {})
+            dels = ret.setdefault("deletions", {})
+            dels[kind] = {"deleted_at": rec["deleted_at"], "verified": rec["verified"]}
+            ret.update(deleted_at=rec["deleted_at"], deleted_kind=kind,
+                       deletion_verified=all(d["verified"] for d in dels.values()))
             write_manifest(stores, m)
             touched.append(mp)
     if touched and commit:

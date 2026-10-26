@@ -29,8 +29,10 @@ from __future__ import annotations
 import copy
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -61,9 +63,33 @@ def summary(m: dict[str, Any]) -> dict[str, Any]:
             "rules": {e["rule"]: e["state"] for e in m["exclusions"]},
             "dependency_screen_clear": bool(m["funnel"].get("dependency_screen_clear")),
             "edited_files": len(m.get("edited_files") or []),
-            # X2 evidence: a reclassified effect must be persisted even when no rule state moves.
-            "shell_repo_mutations": list(m["observation"].get("shell_repo_mutations") or []),
             "task_class": (m.get("task_class") or {}).get("mechanical")}
+
+
+def _well_formed(m: dict[str, Any]) -> bool:
+    """True when ``m`` has every field a rescreen reads; a partial manifest is reported,
+    never allowed to abort the run."""
+    if mf.shape_problem(m) is not None:
+        return False
+    try:
+        summary(m)
+        return True
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def _new_record_path(directory: Path, stem: str) -> Path:
+    """A record path no earlier record has: ``<stem>.json``, else ``<stem>-<n>.json``,
+    reserved by exclusive create so two runs in one second never share one."""
+    directory.mkdir(parents=True, exist_ok=True)
+    n = 0
+    while True:
+        path = directory / (f"{stem}.json" if n == 0 else f"{stem}-{n}.json")
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            return path
+        except FileExistsError:
+            n += 1
 
 
 def _delegated(m: dict[str, Any]) -> bool:
@@ -93,9 +119,7 @@ def rescreen_one(stores: Stores, m: dict[str, Any], env: dict[str, str]) -> str:
     """Re-join and re-screen ``m`` in place; the outcome label."""
     tr = find_transcript(m["session_id"], env)
     if tr is None:
-        # A sufficient judgement that cannot be re-derived under the current rules (delegated
-        # work, or a stored "no edit" the current shell-effect rules never saw) is withdrawn.
-        if m["observation"].get("sufficient") and (_delegated(m) or not m.get("edited_files")):
+        if m["observation"].get("sufficient") and _delegated(m):
             invalidate(m, "rescreen_transcript_unavailable")
             return "invalidated_transcript_unavailable"
         return "transcript_unavailable"
@@ -125,26 +149,161 @@ def rescreen_one(stores: Stores, m: dict[str, Any], env: dict[str, str]) -> str:
 
 
 def run_child(stores: Stores, m: dict[str, Any], env: dict[str, str], timeout_s: float,
-              argv: tuple[str, ...] = CHILD_ARGV) -> tuple[str, dict[str, Any] | None]:
+              argv: tuple[str, ...] = CHILD_ARGV, *,
+              causes: list[str] | None = None) -> tuple[str, dict[str, Any] | None]:
     """Re-screen ``m`` in a child process; (outcome, re-screened manifest or None).
+    When the child fails, one line naming why (exit code and the tail of its stderr) is
+    appended to ``causes``.
 
     The child gets the manifest and store paths on stdin and is killed after
-    ``timeout_s``; a timeout, crash or unreadable reply is an outcome, never a hang."""
+    ``timeout_s``; a timeout, crash or unreadable reply is an outcome, never a hang.
+
+    The child's stdin/stdout/stderr are temporary files, not pipes: a descendant it
+    started (git, say) that outlives it cannot hold a pipe open and stall the drain. The
+    child runs in its own session (POSIX) or job object (Windows), and the whole tree is
+    killed when ``run_child`` returns, whether the child timed out or exited: nothing it
+    started survives the episode."""
     req = json.dumps({"manifest": m, "meta": str(stores.meta), "content": str(stores.content)})
-    try:
-        cp = subprocess.run(list(argv), input=req.encode("utf-8"), capture_output=True, timeout=timeout_s,
-                            env={**env, "PYTHONIOENCODING": "utf-8"})
-    except subprocess.TimeoutExpired:
-        return "timeout", None
-    except OSError:
-        return "child_failed", None
-    if cp.returncode != 0:
-        return "child_failed", None
-    try:
-        rep = json.loads(cp.stdout.decode("utf-8"))
-        return str(rep["outcome"]), rep["manifest"]
-    except (ValueError, KeyError, TypeError):
-        return "child_failed", None
+    with tempfile.TemporaryFile() as fin, tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:
+        fin.write(req.encode("utf-8"))
+        fin.seek(0)
+        try:
+            proc = subprocess.Popen(list(argv), stdin=fin, stdout=fout, stderr=ferr,
+                                    env={**env, "PYTHONIOENCODING": "utf-8"}, **_GROUP_KW)
+        except OSError as exc:
+            if causes is not None:
+                causes.append(f"spawn: {type(exc).__name__}: {exc}"[:500])
+            return "child_failed", None
+        tree = _ProcessTree(proc)
+
+        def why(head: str) -> None:
+            if causes is None:
+                return
+            ferr.seek(0)
+            tail = ferr.read()[-400:].decode("utf-8", "replace").strip()
+            causes.append(f"{head}: {tail}" if tail else head)
+        try:
+            try:
+                rc = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                return "timeout", None
+            if rc != 0:
+                why(f"exit {rc}")
+                return "child_failed", None
+            fout.seek(0)
+            try:
+                rep = json.loads(fout.read().decode("utf-8"))
+                return str(rep["outcome"]), rep["manifest"]
+            except (ValueError, KeyError, TypeError) as exc:
+                why(f"unreadable reply: {type(exc).__name__}")
+                return "child_failed", None
+        finally:
+            tree.kill()
+
+
+_GROUP_KW: dict[str, Any] = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                             else {"start_new_session": True})
+KILL_WAIT_S = 10.0
+
+
+class _ProcessTree:
+    """Everything ``proc`` starts, killable as one unit after ``proc`` itself is gone.
+
+    POSIX: the child is a session leader, so its process group holds every descendant
+    that did not call ``setsid`` and the group id stays reserved while any member lives.
+    Windows: a job object with ``KILL_ON_JOB_CLOSE``; a grandchild whose parent already
+    exited is still a member, which ``taskkill /T`` (a walk over live parent links) would
+    miss. The child is assigned right after it is created, before its interpreter can
+    start anything; a failed assignment falls back to the parent-link walk."""
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self.proc = proc
+        self.job: int | None = None
+        if os.name == "nt":
+            try:
+                self.job = _win_job_for(proc)
+            except Exception:
+                self.job = None  # fall back to the parent-link walk; never leak the child
+
+    def kill(self) -> None:
+        try:
+            if os.name == "nt":
+                if self.job is not None:
+                    _win_terminate_job(self.job)
+                    self.job = None
+                elif self.proc.poll() is None:
+                    subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=KILL_WAIT_S)
+            else:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            self.proc.kill()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=KILL_WAIT_S)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+
+def _win_job_for(proc: subprocess.Popen) -> int | None:
+    """A kill-on-close job object holding ``proc``, or None when the OS refused."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimit(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("ReadOperationCount", "WriteOperationCount",
+                                                    "OtherOperationCount", "ReadTransferCount",
+                                                    "WriteTransferCount", "OtherTransferCount")]
+
+    class ExtendedLimit(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BasicLimit), ("IoInfo", IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k32.AssignProcessToJobObject.restype = wintypes.BOOL
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = ExtendedLimit()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    ok = (k32.SetInformationJobObject(job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info),
+                                      ctypes.sizeof(info))
+          and k32.AssignProcessToJobObject(job, int(proc._handle)))  # type: ignore[attr-defined]
+    if not ok:
+        k32.CloseHandle(job)
+        return None
+    return int(job)
+
+
+def _win_terminate_job(job: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.TerminateJobObject(job, 1)
+    k32.CloseHandle(job)
 
 
 def _child_main() -> int:
@@ -154,13 +313,6 @@ def _child_main() -> int:
     outcome = rescreen_one(stores, m, dict(os.environ))
     sys.stdout.write(json.dumps({"outcome": outcome, "manifest": m}))
     return 0
-
-
-def _touch(lock: Path) -> None:
-    try:
-        os.utime(lock)
-    except OSError:
-        pass
 
 
 def _counts(sums: list[dict[str, Any]]) -> dict[str, Any]:
@@ -187,14 +339,17 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
     try:
         scan = scan_manifests(stores)
         befores, afters, changed, busy, deferred = [], [], [], [], []
+        child_failures: list[dict[str, str]] = []
         outcomes: Counter[str] = Counter()
         touched = []
         deadline = time.monotonic() + run_budget_s
-        for m in sorted(scan.manifests, key=lambda x: x["started_at"]):
+        usable, malformed = [], []
+        for m in scan.manifests:
+            (usable if _well_formed(m) else malformed).append(m)
+        for m in sorted(usable, key=lambda x: x["started_at"]):
             if (m["capture"].get("join") or {}).get("state") != "joined":
                 continue
             ep = m["episode_id"]
-            _touch(lock)
             if time.monotonic() >= deadline:
                 deferred.append(ep)
                 continue
@@ -205,7 +360,9 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
             try:
                 before = summary(m)
                 join_before = dict(m["capture"].get("join") or {})
-                outcome, done = run_child(stores, m, env, episode_timeout_s, child_argv)
+                causes: list[str] = []
+                outcome, done = run_child(stores, m, env, episode_timeout_s, child_argv, causes=causes)
+                child_failures.extend({"episode_id": ep, "cause": c} for c in causes)
                 if done is not None:
                     m = done
                 else:
@@ -229,9 +386,9 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
         rec = {"kind": "rescreen", "at": now, "tool_commit": tool_commit, "outcomes": dict(sorted(outcomes.items())),
                "busy_skipped": busy, "deferred": deferred,
                "limits": {"episode_timeout_s": episode_timeout_s, "run_budget_s": run_budget_s}, "before": _counts(befores), "after": _counts(afters),
-               "changed": changed, "manifests_unreadable": len(scan.unreadable)}
-        path = stores.meta / "corrections" / f"{now.replace(':', '').replace('-', '')}-rescreen.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
+               "changed": changed, "child_failures": child_failures, "manifests_unreadable": len(scan.unreadable),
+               "manifests_malformed": sorted(str(m.get("episode_id")) for m in malformed)}
+        path = _new_record_path(stores.meta / "corrections", f"{now.replace(':', '').replace('-', '')}-rescreen")
         write_json_atomic(path, rec)
         if commit:
             rec["committed"] = commit_meta(stores, touched + [path],

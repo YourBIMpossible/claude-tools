@@ -25,12 +25,17 @@ runs), sessions whose cwd sits in the system temp dir, and log records that matc
 organic transcript call are all kept out of stages 2-4; unmatched records are reported as
 "unattributed".
 
-Config (graphify.local.json beside this script, or --config):
+Config (graphify.local.json beside this script, or --config), validated before any analysis:
   "skill_scripts": folder holding the skill's resolve_graph.py        (required)
   "query_log":     query log path (default: env GRAPHIFY_QUERY_LOG)
   "funnel": {"hint_live_since": "YYYY-MM-DDT00:00:00Z", "exclude_temp_cwd": true,
-             "exclude_sessions": {"<session-id>": "<reason>"}}
-  "targets": [{"repo": ...}]   repos that are expected to have a graph
+             "exclude_sessions": {"<session-id>": "<reason>"} or ["<session-id>", ...]}
+  "targets": [{"scan": ..., "repo": ...}]   repos that are expected to have a graph
+Relative config paths resolve against the config file's folder, as in GraphifyConfig.ps1.
+
+Input problems (missing/unreadable/corrupt query log, unreadable or undated transcripts,
+missing subagent metadata) are counted in the JSON "inputs" block and listed in the report;
+they are never read as low volume.
 
 Run: python graphify_funnel.py [--days 7] [--out report.md] [--json summary.json]
 """
@@ -40,6 +45,7 @@ import argparse
 import dataclasses
 import importlib.util
 import json
+import math
 import os
 import re
 import statistics
@@ -52,10 +58,88 @@ from typing import Any, Callable, Iterable
 
 PASS, FAIL, INSUFFICIENT = "PASS", "FAIL", "INSUFFICIENT EVIDENCE"
 
-# (?<!\w) keeps test runs such as test_query_reranked.py out.
-GRAPHIFY_CALL_RE = re.compile(
-    r"(?<!\w)query_reranked\.py|(?<!\w)graphify(?:\.exe)?[\"']?\s+(?:query|path|explain)\b", re.I)
-WRAPPER_RE = re.compile(r"(?<!\w)query_reranked\.py", re.I)
+# A call is an INVOCATION, not a mention: reading, grepping, diffing, editing or committing
+# the wrapper's source names query_reranked.py too, so the wrapper only counts when a Python
+# interpreter in command position runs it as its script (not `-m <module>` or `-c <code>`
+# with the path as an argument), and bare graphify only counts in command position (start
+# of the command, after a shell separator, or as a path ending in graphify[.exe]).
+# Detection runs on code_part(command): heredoc/here-string bodies and multi-line quoted
+# strings (commit messages, prose) are removed first, so their line starts are not commands,
+# and separators inside single-line quoted strings (grep patterns like "a\|b") are blanked.
+# Path components must end in / or \, which keeps test_query_reranked.py out; a quoted path
+# may contain spaces.
+_CMD_POS = r"(?:^|[;&|(\n]|\$\()\s*(?:[A-Za-z_]\w*=\S*\s+)*"   # separator, VAR=value prefixes
+_ARG = r"(?:\"[^\"\n]*[\\/]|'[^'\n]*[\\/]|[\"']?[^\s\"';|&]*[\\/]|[\"'])?"
+WRAPPER_RE = re.compile(
+    _CMD_POS + _ARG + r"(?:python[\d.]*|py)(?:\.exe)?[\"']?"      # interpreter
+    r"(?:\s+(?!-[mc])-\S+(?:\s+[A-Za-z_]\w*(?:=\S*)?)?)*\s+"       # options, e.g. -3, -X utf8
+    + _ARG + r"query_reranked\.py",
+    re.I | re.M)
+BARE_CLI_RE = re.compile(
+    _CMD_POS + _ARG + r"graphify(?:\.exe)?[\"']?\s+(?:query|path|explain)\b",
+    re.I | re.M)
+GRAPHIFY_CALL_RE = re.compile(f"{WRAPPER_RE.pattern}|{BARE_CLI_RE.pattern}", re.I | re.M)
+_HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n.*?^[ \t]*\2[ \t]*$", re.S | re.M)
+_HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
+
+
+_QUOTED_SEPARATORS = str.maketrans(";&|()", "     ")
+
+
+def _blank_quoted_code(command: str, escape: str = "\\") -> str:
+    """Replace each quoted string that spans a newline with "", and blank shell separators
+    (;&|()) inside single-line quoted strings, so a search pattern such as a\\|graphify query
+    in quotes gives `graphify` no command position. A double-quoted string containing $( keeps
+    all its separators, since that substitution runs a real command (so a pattern string that
+    also contains $( can still read as a call). Commands after a separator inside a quoted
+    `bash -c`, `pwsh -Command` or `cmd /c` argument are not counted: the string is an argument.
+
+    A regex would pair one line's closing quote with the next line's opening quote and blank
+    the real command between them, so quotes are paired by walking the string: `escape`
+    (backslash for a POSIX shell, backtick for PowerShell) escapes the next character inside
+    "..." and outside quotes, and a `#` comment runs to end of
+    line, so an apostrophe in it opens nothing. An unclosed quote leaves the rest as is.
+    """
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "#" and (i == 0 or command[i - 1] in " \t\n;"):
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            out.append(command[i:end])
+            i = end
+        elif ch == escape and i + 1 < n:
+            out.append(command[i:i + 2])
+            i += 2
+        elif ch in "\"'":
+            j = i + 1
+            while j < n and command[j] != ch:
+                j += 2 if ch == '"' and command[j] == escape else 1
+            if j >= n:
+                out.append(command[i:])
+                break
+            span = command[i:j + 1]
+            if "\n" in span:
+                span = '""'
+            elif not (ch == '"' and "$(" in span):
+                span = span.translate(_QUOTED_SEPARATORS)
+            out.append(span)
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def code_part(command: str, tool: str = "Bash") -> str:
+    """The command with heredoc/here-string bodies and multi-line quoted strings blanked, and
+    shell separators inside single-line quoted strings neutralised."""
+    command = _HEREDOC_RE.sub("<<HEREDOC", command)
+    command = _HERESTRING_RE.sub("@''@", command)
+    return _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\")
+
+
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use
 QUESTION_RE = re.compile(r"(?:query_reranked\.py[\"']?|\s(?:query|explain))\s+\"([^\"]+)\"")
 SHELL_SEARCH_RE = re.compile(r"(?:^|[\s|;&(])(?:grep|rg|findstr|Select-String|git grep)\b", re.I)
@@ -94,6 +178,8 @@ class Call:
     is_error: bool | None = None
     output: str = ""
     record: dict | None = None
+    origin_session: str | None = None   # the transcript record's sessionId (kept on copies)
+    copy: bool = False                  # a continued/forked transcript's copy of another call
 
     @property
     def status(self) -> str:
@@ -156,11 +242,55 @@ class Session:
     resolved: dict | None = None
     repo: str | None = None
     excluded: str | None = None
+    read_errors: list[str] = field(default_factory=list)     # "<file>: <error>", main or subagent
+    corrupt_lines: int = 0                                    # undecodable / non-object JSONL lines
+    meta_problems: list[str] = field(default_factory=list)   # "<agent file>: <problem>"
 
     def unit(self, unit_id: str, agent_type: str | None = None) -> Unit:
         if unit_id not in self.units:
             self.units[unit_id] = Unit(self, unit_id, agent_type)
         return self.units[unit_id]
+
+
+@dataclass
+class SessionScan:
+    """Sessions in the window, plus every transcript that could not be placed in it."""
+    sessions: list[Session]
+    projects_missing: bool = False
+    unstatable: list[str] = field(default_factory=list)     # "<file>: <error>"
+    undated: list[Session] = field(default_factory=list)    # no timestamp at all (incl. unreadable)
+
+
+@dataclass
+class QueryLog:
+    path: Path | None
+    status: str              # ok | not-configured | missing | not-a-file | unreadable
+    records: list[dict] = field(default_factory=list)
+    corrupt_lines: int = 0
+    error: str | None = None
+
+
+@dataclass
+class ReadStats:
+    corrupt_lines: int = 0
+    error: str | None = None
+
+
+class ConfigError(ValueError):
+    def __init__(self, errors: list[str]):
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+@dataclass(frozen=True)
+class FunnelConfig:
+    skill_scripts: Path
+    query_log: Path | None
+    targets: tuple[str, ...]              # absolute repo paths (repo, else scan)
+    hint_live_since: datetime | None
+    hint_live_since_raw: str | None
+    exclude_temp_cwd: bool
+    exclude_sessions: dict[str, str]      # session id -> reason
 
 
 # --------------------------------------------------------------------------- helpers
@@ -183,18 +313,24 @@ def norm_path(p: str) -> str:
     return norm(p)
 
 
-def iter_json_lines(path: Path) -> Iterable[dict]:
+def iter_json_lines(path: Path, stats: ReadStats) -> Iterable[dict]:
+    """Yield the JSON objects in a JSONL file; corrupt lines and read errors go to `stats`."""
     try:
         with path.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
+                if not line.strip():
+                    continue
                 try:
                     rec = json.loads(line)
                 except ValueError:
+                    stats.corrupt_lines += 1
                     continue
                 if isinstance(rec, dict):
                     yield rec
-    except OSError:
-        return
+                else:
+                    stats.corrupt_lines += 1
+    except OSError as exc:
+        stats.error = f"{type(exc).__name__}: {exc}"
 
 
 def result_text(content: Any) -> str:
@@ -228,11 +364,133 @@ def norm(p: str | Path) -> str:
     return os.path.normcase(os.path.normpath(str(p)))
 
 
+# --------------------------------------------------------------------------- config
+
+FUNNEL_KEYS = {"hint_live_since", "exclude_temp_cwd", "exclude_sessions"}
+PLACEHOLDER_RE = re.compile(r"<[^<>]*>")   # template value such as "<path-to-repo>"
+
+
+def resolve_config_path(value: Any, base: Path, field_name: str, errors: list[str]) -> Path | None:
+    """Mirror of GraphifyConfig.ps1 Resolve-GraphifyConfigPath: a config-file path resolves
+    against the config file's folder and becomes absolute; drive-relative ("C:x") and
+    root-relative ("\\x") forms are rejected because they depend on the current drive."""
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"{field_name} must be a non-empty string.")
+        return None
+    if PLACEHOLDER_RE.search(value):
+        errors.append(f"{field_name} still holds a template placeholder.")
+        return None
+    p = Path(value)
+    if p.is_absolute():
+        return Path(os.path.normpath(p))
+    if p.drive or p.root:
+        errors.append(f"{field_name} is drive- or root-relative; use an absolute path "
+                      "or one relative to the config file.")
+        return None
+    return Path(os.path.normpath(base / p))
+
+
+def _parse_funnel(raw: Any, errors: list[str]) -> tuple[datetime | None, str | None, bool, dict[str, str]]:
+    hint, hint_raw, temp_rule, excludes = None, None, True, {}
+    if raw is None:
+        return hint, hint_raw, temp_rule, excludes
+    if not isinstance(raw, dict):
+        errors.append("funnel must be a JSON object.")
+        return hint, hint_raw, temp_rule, excludes
+    for key in sorted(set(raw) - FUNNEL_KEYS):
+        errors.append(f"funnel.{key} is not a known key (expected one of {sorted(FUNNEL_KEYS)}).")
+    if "hint_live_since" in raw:
+        v = raw["hint_live_since"]
+        hint = parse_ts(v)
+        if hint is None:
+            errors.append(f"funnel.hint_live_since must be an ISO-8601 timestamp, got {v!r}.")
+        else:
+            hint_raw = v
+    if "exclude_temp_cwd" in raw:
+        if isinstance(raw["exclude_temp_cwd"], bool):
+            temp_rule = raw["exclude_temp_cwd"]
+        else:
+            errors.append(f"funnel.exclude_temp_cwd must be true or false, got {raw['exclude_temp_cwd']!r}.")
+    if "exclude_sessions" in raw:
+        v = raw["exclude_sessions"]
+        # Documented form is {session-id: reason}; a bare list of ids is accepted too.
+        pairs = (list(v.items()) if isinstance(v, dict)
+                 else [(sid, "listed in funnel.exclude_sessions") for sid in v] if isinstance(v, list)
+                 else None)
+        if pairs is None:
+            errors.append("funnel.exclude_sessions must be an object {session-id: reason} "
+                          "or a list of session ids.")
+        else:
+            for sid, reason in pairs:
+                if not isinstance(sid, str) or not sid.strip():
+                    errors.append(f"funnel.exclude_sessions holds a non-string or empty session id: {sid!r}.")
+                elif not isinstance(reason, str) or not reason.strip():
+                    errors.append(f"funnel.exclude_sessions[{sid!r}] needs a non-empty string reason.")
+                else:
+                    excludes[sid] = reason
+    return hint, hint_raw, temp_rule, excludes
+
+
+def _parse_targets(raw: Any, base: Path, errors: list[str]) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        errors.append("targets must be a JSON array.")
+        return ()
+    out: list[str] = []
+    for i, t in enumerate(raw):
+        f = f"targets[{i}]"
+        if not isinstance(t, dict):
+            errors.append(f"{f} must be a JSON object.")
+            continue
+        # GraphifyConfig.ps1 Test-GraphifyConfigTargets: "repo" is optional and defaults to
+        # "scan" ($repoIn = if ($t.repo) { $t.repo } else { $t.scan }); both resolve against
+        # the config folder. A scan-only target therefore still names a graph-expected repo.
+        if t.get("repo"):
+            p = resolve_config_path(t["repo"], base, f"{f}.repo", errors)
+        elif t.get("scan"):
+            p = resolve_config_path(t["scan"], base, f"{f}.scan", errors)
+        else:
+            errors.append(f"{f} needs a scan or repo path.")
+            continue
+        if p is not None:
+            out.append(str(p))
+    return tuple(out)
+
+
+def parse_config(raw: Any, base: Path) -> FunnelConfig:
+    """Validate every value the funnel reads; raise ConfigError listing all problems."""
+    if not isinstance(raw, dict):
+        raise ConfigError(["config must be a JSON object."])
+    errors: list[str] = []
+    scripts = None
+    if "skill_scripts" not in raw:
+        errors.append("skill_scripts is missing (folder holding resolve_graph.py).")
+    else:
+        scripts = resolve_config_path(raw["skill_scripts"], base, "skill_scripts", errors)
+    log = (resolve_config_path(raw["query_log"], base, "query_log", errors)
+           if "query_log" in raw else None)
+    targets = _parse_targets(raw.get("targets"), base, errors)
+    hint, hint_raw, temp_rule, excludes = _parse_funnel(raw.get("funnel"), errors)
+    if errors or scripts is None:
+        raise ConfigError(errors)
+    return FunnelConfig(scripts, log, targets, hint, hint_raw, temp_rule, excludes)
+
+
 # --------------------------------------------------------------------------- transcripts
 
 def _ingest(session: Session, unit: Unit, path: Path, pending: dict[str, Call],
             track_sidechain: bool) -> None:
-    for rec in iter_json_lines(path):
+    stats = ReadStats()
+    _ingest_records(session, unit, iter_json_lines(path, stats), pending, track_sidechain)
+    session.corrupt_lines += stats.corrupt_lines
+    if stats.error:
+        session.read_errors.append(f"{path}: {stats.error}")
+
+
+def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
+                    pending: dict[str, Call], track_sidechain: bool) -> None:
+    for rec in records:
         ts = parse_ts(rec.get("timestamp"))
         if ts:
             session.first_ts = min(filter(None, [session.first_ts, ts]))
@@ -263,7 +521,8 @@ def _ingest(session: Session, unit: Unit, path: Path, pending: dict[str, Call],
                 if tool_id and tool_id in session.seen_tool_ids:
                     continue    # resumed/forked transcripts repeat earlier records
                 session.seen_tool_ids.add(tool_id)
-                _tool_use(target, block, ts, pending)
+                origin = rec.get("sessionId")
+                _tool_use(target, block, ts, pending, origin if isinstance(origin, str) else None)
             elif block.get("type") == "tool_result":
                 call = pending.pop(block.get("tool_use_id", ""), None)
                 if call is not None:
@@ -272,7 +531,8 @@ def _ingest(session: Session, unit: Unit, path: Path, pending: dict[str, Call],
                     call.output = result_text(block.get("content"))[:4000]
 
 
-def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, Call]) -> None:
+def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, Call],
+              origin_session: str | None = None) -> None:
     name = block.get("name", "")
     inp = block.get("input") if isinstance(block.get("input"), dict) else {}
     if name in SEARCH_TOOLS:
@@ -292,10 +552,12 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
                                                   or "graphify" in prompt.lower())})
     elif name in SHELL_TOOLS:
         cmd = str(inp.get("command", ""))
-        if GRAPHIFY_CALL_RE.search(cmd):
+        code = code_part(cmd, name)
+        if GRAPHIFY_CALL_RE.search(code):
             m = QUESTION_RE.search(cmd)
             call = Call(unit, str(block.get("id", "")), ts, cmd, m.group(1) if m else None,
-                        bool(WRAPPER_RE.search(cmd)), bool(ALT_LOG_RE.search(cmd)))
+                        bool(WRAPPER_RE.search(code)), bool(ALT_LOG_RE.search(cmd)),
+                        origin_session=origin_session)
             unit.calls.append(call)
             pending[call.tool_use_id] = call
         elif SHELL_SEARCH_RE.search(cmd):
@@ -309,53 +571,113 @@ def load_session(path: Path) -> Session:
     sub_dir = path.with_suffix("") / "subagents"
     if sub_dir.is_dir():
         for sub in sorted(sub_dir.glob("agent-*.jsonl")):
-            agent_type = None
-            try:
-                meta = json.loads(sub.with_suffix(".meta.json").read_text(encoding="utf-8"))
-                agent_type = meta.get("agentType")
-            except (OSError, ValueError):
-                pass
+            agent_type, problem = read_agent_type(sub.with_suffix(".meta.json"))
+            if problem:
+                # The unit stays in the session but cannot be judged explore-type: say so.
+                session.meta_problems.append(f"{sub.name}: {problem}")
             unit = session.unit(sub.stem.removeprefix("agent-"), agent_type)
             _ingest(session, unit, sub, pending, track_sidechain=False)
     return session
 
 
-def discover_sessions(projects: Path, since: datetime, until: datetime) -> list[Session]:
+def read_agent_type(meta_path: Path) -> tuple[str | None, str | None]:
+    """(agentType, problem) from a subagent's .meta.json; problem is None when it was read."""
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "metadata missing"
+    except OSError as exc:
+        return None, f"metadata unreadable ({type(exc).__name__})"
+    except ValueError:
+        return None, "metadata is not valid JSON"
+    agent_type = meta.get("agentType") if isinstance(meta, dict) else None
+    if not isinstance(agent_type, str) or not agent_type:
+        return None, "metadata has no agentType"
+    return agent_type, None
+
+
+def discover_sessions(projects: Path, since: datetime, until: datetime) -> SessionScan:
     # A session moved between project folders leaves a copy in each; keep the largest.
     best: dict[str, tuple[int, Path]] = {}
     floor = since.timestamp()
     if not projects.is_dir():
-        return []
+        return SessionScan([], projects_missing=True)
+    scan = SessionScan([])
     for proj in sorted(p for p in projects.iterdir() if p.is_dir()):
         for path in proj.glob("*.jsonl"):
             try:
                 st = path.stat()
-            except OSError:
+            except OSError as exc:
+                scan.unstatable.append(f"{path}: {type(exc).__name__}: {exc}")
                 continue
             if st.st_mtime < floor:
                 continue
             if path.stem not in best or st.st_size > best[path.stem][0]:
                 best[path.stem] = (st.st_size, path)
-    out: list[Session] = []
     for _, path in sorted(best.values(), key=lambda v: str(v[1])):
         s = load_session(path)
-        if s.first_ts and s.last_ts and s.last_ts >= since and s.first_ts <= until:
-            out.append(s)
-    return out
+        if not (s.first_ts and s.last_ts):
+            scan.undated.append(s)      # unreadable, or no timestamped record: not placeable
+        elif s.last_ts >= since and s.first_ts <= until:
+            scan.sessions.append(s)
+    return scan
 
 
 # --------------------------------------------------------------------------- analysis
 
-def load_log(path: Path | None, since: datetime, until: datetime) -> list[dict]:
-    if path is None or not path.is_file():
-        return []
+def load_log(path: Path | None, since: datetime, until: datetime) -> QueryLog:
+    if path is None:
+        return QueryLog(None, "not-configured")
+    if not path.exists():
+        return QueryLog(path, "missing")
+    if not path.is_file():
+        return QueryLog(path, "not-a-file")
+    stats = ReadStats()
     recs = []
-    for r in iter_json_lines(path):
+    for r in iter_json_lines(path, stats):
         ts = parse_ts(r.get("ts"))
         if r.get("kind") == "query" and ts and since - MATCH_SLACK <= ts <= until + MATCH_SLACK:
             r["_ts"] = ts
             recs.append(r)
-    return recs
+    return QueryLog(path, "unreadable" if stats.error else "ok", recs,
+                    stats.corrupt_lines, stats.error)
+
+
+def finite_duration(value: Any) -> float | None:
+    """A usable latency: int or float, not bool (an int subclass), finite, >= 0. Else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value >= 0 else None
+
+
+def mark_copied_calls(sessions: list[Session]) -> int:
+    """Mark all but one Call per tool_use id across sessions as copies; return the count.
+
+    A continued or forked session starts a new transcript (new session id) holding a copy of
+    the earlier history, so one real invocation shows up in every copy, yet the query log has
+    one record for it. The copy kept is the one in the session named by the record's own
+    sessionId (copies keep the originating id); without that, the earliest-starting session.
+    Copies leave execution and measurement but stay in routing: the copied transcript also
+    carries the original's searches and reads, so dropping only the call would turn the
+    copying unit into a false "bypassed".
+    """
+    def rank(c: Call) -> tuple:
+        s = c.unit.session
+        return (c.origin_session != s.session_id,
+                s.first_ts or datetime.max.replace(tzinfo=timezone.utc), s.session_id)
+
+    by_id: dict[str, list[Call]] = {}
+    for s in sessions:
+        for u in s.units.values():
+            for c in u.calls:
+                if c.tool_use_id:
+                    by_id.setdefault(c.tool_use_id, []).append(c)
+    marked = 0
+    for copies in by_id.values():
+        for c in sorted(copies, key=rank)[1:]:
+            c.copy = True
+            marked += 1
+    return marked
 
 
 def match_records(calls: list[Call], records: list[dict]) -> None:
@@ -401,12 +723,10 @@ def coverage(session: Session) -> Callable[[str], bool]:
     return in_scope
 
 
-def repo_of(session: Session, resolver) -> str | None:
-    if not session.cwd:
-        return None
-    here = Path(session.cwd)
+def repo_identity(path: str, resolver) -> str | None:
+    """Main-checkout root of the git repo holding `path` (a worktree maps to its main checkout)."""
     try:
-        top = resolver._git_toplevel(here.resolve())
+        top = resolver._git_toplevel(Path(path).resolve())
     except OSError:
         return None
     if top is None:
@@ -415,14 +735,47 @@ def repo_of(session: Session, resolver) -> str | None:
     return str(main or top)
 
 
-def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
+def repo_of(session: Session, resolver) -> str | None:
+    return repo_identity(session.cwd, resolver) if session.cwd else None
+
+
+def input_problems(inputs: dict) -> list[str]:
+    """One line per kind of unusable input; empty when every input was read cleanly."""
+    q, out = inputs["query_log"], []
+    if q["status"] == "not-configured":
+        out.append("query log not configured (no query_log, --log or GRAPHIFY_QUERY_LOG): "
+                   "execution and measurement have no log evidence")
+    elif q["status"] != "ok":
+        out.append(f"query log {q['status']}: {q['path']}"
+                   + (f" ({q['error']})" if q["error"] else "")
+                   + ": execution and measurement have no complete log evidence")
+    if q["corrupt_lines"]:
+        out.append(f"query log has {q['corrupt_lines']} corrupt line(s), skipped")
+    if inputs["projects_dir_missing"]:
+        out.append("transcript projects folder missing: no sessions could be read")
+    for key, text in (("transcripts_unstatable", "transcript(s) could not be stat'ed"),
+                      ("transcripts_unreadable", "transcript file(s) could not be read"),
+                      ("transcripts_undated", "transcript(s) had no timestamped record and were left out"),
+                      ("subagent_metadata_problems", "subagent(s) without readable metadata "
+                                                     "(type unknown, so never routing-eligible)"),
+                      ("sessions_without_cwd", "session(s) without a cwd (repo and graph unknown)")):
+        if inputs[key]:
+            out.append(f"{len(inputs[key])} {text}")
+    if inputs["transcript_corrupt_lines"]:
+        out.append(f"{inputs['transcript_corrupt_lines']} corrupt transcript line(s), skipped")
+    return out
+
+
+def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             since: datetime, until: datetime) -> dict:
-    funnel = cfg.get("funnel", {}) if isinstance(cfg.get("funnel"), dict) else {}
-    excludes = funnel.get("exclude_sessions", {}) or {}
-    hint_live = parse_ts(funnel.get("hint_live_since")) if funnel.get("hint_live_since") else None
-    targets = {norm(t["repo"]) for t in cfg.get("targets", []) if isinstance(t, dict) and t.get("repo")}
+    sessions, records = scan.sessions, log.records
+    excludes = cfg.exclude_sessions
+    hint_live = cfg.hint_live_since
+    # A target path (repo, else scan) may sit inside a repo or a worktree lane: compare it by
+    # the same identity as a session's repo; a path outside any git repo is kept verbatim.
+    targets = {norm(repo_identity(t, resolver) or t) for t in cfg.targets}
     # Headless/throwaway runs start in the temp dir; on unless the config turns it off.
-    tmp = norm(tempfile.gettempdir()) if funnel.get("exclude_temp_cwd", True) else None
+    tmp = norm(tempfile.gettempdir()) if cfg.exclude_temp_cwd else None
 
     for s in sessions:
         if s.session_id in excludes:
@@ -435,10 +788,13 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
         s.repo = repo_of(s, resolver)
 
     organic = [s for s in sessions if not s.excluded]
-    all_calls = [c for s in sessions for u in s.units.values() for c in u.calls]
+    copied_calls = mark_copied_calls(sessions)
+    all_calls = [c for s in sessions for u in s.units.values() for c in u.calls if not c.copy]
     match_records(all_calls, records)
-    organic_calls = [c for s in organic for u in s.units.values() for c in u.calls if not c.alt_log]
-    alt_log_calls = sum(1 for s in organic for u in s.units.values() for c in u.calls if c.alt_log)
+    organic_calls = [c for s in organic for u in s.units.values() for c in u.calls
+                     if not c.alt_log and not c.copy]
+    alt_log_calls = sum(1 for s in organic for u in s.units.values() for c in u.calls
+                        if c.alt_log and not c.copy)
 
     # ---- stage 1: availability
     def post_hint(s: Session) -> bool:
@@ -510,7 +866,8 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
     unlogged = [c for c in ok_calls if c.via_wrapper and c.record is None]
     wrapper_errors = [c for c in organic_calls if c.status == "wrapper-error"]
     def recovered(c: Call) -> bool:
-        return any(o.status == "ok" and o.ts and c.ts and o.ts >= c.ts for o in c.unit.calls)
+        return any(o.status == "ok" and o.ts and c.ts and o.ts >= c.ts
+                   for o in c.unit.calls if not o.copy)
 
     shell_errors = [c for c in organic_calls if c.status == "shell-error"]
     unrecovered = [c for c in shell_errors if not recovered(c)]
@@ -532,8 +889,10 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
 
     def arm(pred) -> dict:
         rs = [r for r in organic_recs if pred(r)]
-        d = [float(r["duration_ms"]) for r in rs if isinstance(r.get("duration_ms"), (int, float))]
-        return {"n": len(rs), "zero_nodes": sum(1 for r in rs if r.get("nodes_returned") == 0),
+        # A record without a usable duration is untimed: it never counts as 0 ms.
+        d = [v for v in (finite_duration(r.get("duration_ms")) for r in rs) if v is not None]
+        return {"n": len(rs), "timed": len(d), "untimed": len(rs) - len(d),
+                "zero_nodes": sum(1 for r in rs if r.get("nodes_returned") == 0),
                 "median_ms": statistics.median(d) if d else None, "p90_ms": percentile(d, 90)}
 
     # Only wrapper records carry an explicit rerank stamp, and both arms are wrapper wall
@@ -542,16 +901,36 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
     reranked = arm(lambda r: r.get("rerank") is True)
     stock = arm(lambda r: r.get("rerank") is False)
     unlabelled = arm(lambda r: "rerank" not in r)
-    if reranked["n"] < MIN_RERANKED:
+    # Latency is judged on timed records only, and an incompletely read log is no evidence.
+    if log.status != "ok" or reranked["timed"] < MIN_RERANKED:
         v4 = INSUFFICIENT
-    elif ((reranked["median_ms"] or 0) > LATENCY_MEDIAN_MS
-          or (reranked["p90_ms"] or 0) > LATENCY_P90_MS):
+    elif reranked["median_ms"] > LATENCY_MEDIAN_MS or reranked["p90_ms"] > LATENCY_P90_MS:
         v4 = FAIL
     else:
         v4 = PASS
 
+    # ---- inputs: what could not be read is reported, never taken as low volume
+    seen = sessions + scan.undated
+    unreadable = [e for s in seen for e in s.read_errors]
+    meta = [f"{s.session_id[:8]} {p}" for s in sessions for p in s.meta_problems]
+    no_cwd = [s.session_id[:8] for s in sessions if not s.cwd]
+    inputs = {
+        "query_log": {"path": str(log.path) if log.path else None, "status": log.status,
+                      "error": log.error, "corrupt_lines": log.corrupt_lines,
+                      "records_in_window": len(records)},
+        "projects_dir_missing": scan.projects_missing,
+        "transcripts_unstatable": scan.unstatable,
+        "transcripts_unreadable": unreadable,
+        "transcripts_undated": [str(s.path) for s in scan.undated],
+        "transcript_corrupt_lines": sum(s.corrupt_lines for s in seen),
+        "subagent_metadata_problems": meta,
+        "sessions_without_cwd": no_cwd,
+    }
+    inputs["problems"] = input_problems(inputs)
+
     return {
         "window": {"since": since.isoformat(), "until": until.isoformat()},
+        "inputs": inputs,
         "sessions": {"total": len(sessions), "organic": len(organic),
                      "excluded": [{"session": s.session_id, "reason": s.excluded}
                                   for s in sessions if s.excluded]},
@@ -561,7 +940,7 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
             "graph_backed_pre_hint": len(graph_backed) - len(graph_post),
             "graph_backed_post_hint": len(graph_post),
             "hinted_post_hint": sum(1 for s in graph_post if s.hint_seen),
-            "hint_live_since": funnel.get("hint_live_since"),
+            "hint_live_since": cfg.hint_live_since_raw,
             "expected_graph_missing": [f"{s.session_id[:8]} {s.cwd}" for s in missing_expected],
             "hint_missing": [f"{s.session_id[:8]} {s.cwd}" for s in hint_missing],
             "subagent_hints": sum(s.subagent_hints for s in graph_backed)},
@@ -587,6 +966,7 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
             "verdict": v3, "calls": len(organic_calls), "by_status": by_status,
             "logged": sum(1 for c in ok_calls if c.record is not None),
             "unlogged_ok_wrapper_calls": [c.unit.label for c in unlogged],
+            "copied_calls_excluded": copied_calls,
             "wrapper_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in wrapper_errors],
             "unrecovered_shell_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in unrecovered],
             "recovered_shell_errors": [f"{c.unit.label}: {c.command[:160]!r} -> {c.output[:160]!r}"
@@ -594,6 +974,7 @@ def analyse(sessions: list[Session], records: list[dict], resolver, cfg: dict,
             "bare_cli_calls": len(bare), "test_alt_log_calls": alt_log_calls},
         "measurement": {
             "verdict": v4, "organic_records": len(organic_recs), "reranked": reranked,
+            "log_status": log.status,
             "stock": stock, "unlabelled_bare_cli": unlabelled, "min_reranked": MIN_RERANKED,
             "latency_ceiling_ms": {"median": LATENCY_MEDIAN_MS, "p90": LATENCY_P90_MS},
             "excluded_session_records": len(excluded_recs),
@@ -609,10 +990,16 @@ def _fmt_ms(v: float | None) -> str:
 
 def render(summary: dict) -> str:
     a, r, e, m = (summary[k] for k in ("availability", "routing", "execution", "measurement"))
-    w, s = summary["window"], summary["sessions"]
+    w, s, inp = summary["window"], summary["sessions"], summary["inputs"]
+    q = inp["query_log"]
     L = [f"# Graphify adoption funnel {w['since'][:10]} -> {w['until'][:10]}", "",
          f"Sessions in window: {s['total']} ({s['organic']} organic, {len(s['excluded'])} excluded as tests/smoke).",
-         "", "| Stage | Verdict | Evidence |", "|---|---|---|",
+         f"Query log: {q['path'] or 'not configured'} ({q['status']}, {q['records_in_window']} query records "
+         f"in window).", ""]
+    if inp["problems"]:
+        L += ["**Input problems (verdicts below are missing this evidence; this is not low volume):**",
+              *[f"- {x}" for x in inp["problems"]], ""]
+    L += ["| Stage | Verdict | Evidence |", "|---|---|---|",
          f"| 1a Graph resolution | {a['graph_resolution']} | {a['graph_backed']}/{s['organic']} organic sessions "
          f"resolved a graph; {len(a['expected_graph_missing'])} in graph-expected repos without one |",
          f"| 1b Hint delivery | {a['hint_delivery']} | {a['hinted_post_hint']}/{a['graph_backed_post_hint']} graph-backed "
@@ -621,8 +1008,11 @@ def render(summary: dict) -> str:
          f"{r['after_hint_live']['exploration_units']} exploration units queried graphify; whole window: "
          f"{len(r['used_graphify'])}/{r['exploration_units']} (heuristic), {len(r['bypassed'])} bypassed |",
          f"| 3 Execution | {e['verdict']} | {e['calls']} calls, {e['by_status']}, {e['logged']} logged |",
-         f"| 4 Measurement | {m['verdict']} | {m['organic_records']} organic records: {m['reranked']['n']} reranked, "
-         f"{m['stock']['n']} stock, {m['unlabelled_bare_cli']['n']} unlabelled bare CLI |", ""]
+         f"| 4 Measurement | {m['verdict']} | "
+         + ("" if m["log_status"] == "ok" else f"query log {m['log_status']}; ")
+         + f"{m['organic_records']} organic records: {m['reranked']['n']} reranked "
+         f"({m['reranked']['timed']} timed), {m['stock']['n']} stock, "
+         f"{m['unlabelled_bare_cli']['n']} unlabelled bare CLI |", ""]
     L += ["## 1 Availability", "",
           "Graph resolution and hint delivery are separate claims: only graph-backed sessions that started "
           "after the hint went live show whether the hook delivers it.", "",
@@ -659,7 +1049,8 @@ def render(summary: dict) -> str:
         L += ["", f"**Bypassed (routing failures to investigate this week; largest {len(shown)} of "
                   f"{len(r['bypassed'])}, full list in the JSON summary):**", *[f"- {x}" for x in shown]]
     L += ["", "## 3 Execution", "",
-          f"- Calls: {e['calls']} by status {e['by_status']}; logged: {e['logged']}; bare CLI (outside wrapper): {e['bare_cli_calls']}",
+          f"- Calls: {e['calls']} by status {e['by_status']}; logged: {e['logged']}; bare CLI (outside wrapper): {e['bare_cli_calls']}; "
+          f"copies from continued/forked transcripts excluded: {e['copied_calls_excluded']}",
           f"- Test runs against a redirected GRAPHIFY_QUERY_LOG (not counted): {e['test_alt_log_calls']}"]
     for title, key in (("Completed wrapper calls with no log record", "unlogged_ok_wrapper_calls"),
                        ("Wrapper/query errors", "wrapper_errors"),
@@ -669,12 +1060,13 @@ def render(summary: dict) -> str:
             L += ["", f"**{title}:**", *[f"- {x}" for x in e[key]]]
     rr, st, ul = m["reranked"], m["stock"], m["unlabelled_bare_cli"]
     L += ["", "## 4 Measurement (organic only)", "",
-          "| Arm | Records | Zero-node | Median ms | p90 ms |", "|---|---|---|---|---|",
-          f"| reranked | {rr['n']} | {rr['zero_nodes']} | {_fmt_ms(rr['median_ms'])} | {_fmt_ms(rr['p90_ms'])} |",
-          f"| stock (wrapper, rerank=false) | {st['n']} | {st['zero_nodes']} | {_fmt_ms(st['median_ms'])} | "
-          f"{_fmt_ms(st['p90_ms'])} |",
-          f"| unlabelled bare CLI (not an arm) | {ul['n']} | {ul['zero_nodes']} | {_fmt_ms(ul['median_ms'])} | "
-          f"{_fmt_ms(ul['p90_ms'])} |", "",
+          "| Arm | Records | Timed | Zero-node | Median ms | p90 ms |", "|---|---|---|---|---|---|",
+          *[f"| {name} | {x['n']} | {x['timed']} | {x['zero_nodes']} | {_fmt_ms(x['median_ms'])} | "
+            f"{_fmt_ms(x['p90_ms'])} |"
+            for name, x in (("reranked", rr), ("stock (wrapper, rerank=false)", st),
+                            ("unlabelled bare CLI (not an arm)", ul))], "",
+          "Latency uses timed records only (a numeric, finite duration_ms); an untimed record "
+          f"never counts as 0 ms. The latency verdict needs >= {m['min_reranked']} timed reranked records.", "",
           "Reranked and stock are both wrapper wall time. Bare-CLI records carry no `rerank` stamp and "
           "traversal-only timing, so they sit outside both arms. "
           f"Reranked latency ceiling: median {m['latency_ceiling_ms']['median']:.0f} / p90 {m['latency_ceiling_ms']['p90']:.0f} ms; "
@@ -698,28 +1090,28 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        cfg = json.loads(args.config.read_text(encoding="utf-8"))
+        raw = json.loads(args.config.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         print(f"config unreadable: {args.config}: {exc}", file=sys.stderr)
         return 2
-    scripts = cfg.get("skill_scripts")
-    if not scripts:
-        print("config is missing skill_scripts (folder holding resolve_graph.py)", file=sys.stderr)
+    try:
+        cfg = parse_config(raw, args.config.resolve().parent)
+    except ConfigError as exc:
+        print(f"config invalid: {args.config}:", *[f"  - {x}" for x in exc.errors], sep="\n", file=sys.stderr)
         return 2
-    base = args.config.parent
-    resolver = load_resolver((base / scripts).resolve())
-    log_path = args.log or (Path(cfg["query_log"]) if cfg.get("query_log")
-                            else Path(os.environ["GRAPHIFY_QUERY_LOG"]) if os.environ.get("GRAPHIFY_QUERY_LOG")
-                            else None)
+    resolver = load_resolver(cfg.skill_scripts)
+    # Precedence: --log (relative to cwd, like any CLI path), then the config value (already
+    # resolved against the config folder), then the env override used verbatim.
+    env_log = os.environ.get("GRAPHIFY_QUERY_LOG")
+    log_path = args.log or cfg.query_log or (Path(env_log) if env_log else None)
     until = parse_ts(args.until) if args.until else datetime.now(timezone.utc)
     if until is None:
         print(f"bad --until: {args.until}", file=sys.stderr)
         return 2
     since = until - timedelta(days=args.days)
 
-    sessions = discover_sessions(args.projects, since, until)
-    summary = analyse(sessions, load_log(log_path, since, until), resolver, cfg, since, until)
-    summary["query_log"] = str(log_path) if log_path else None
+    scan = discover_sessions(args.projects, since, until)
+    summary = analyse(scan, load_log(log_path, since, until), resolver, cfg, since, until)
     report = render(summary)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
