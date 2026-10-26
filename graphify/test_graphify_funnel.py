@@ -148,7 +148,7 @@ class FunnelCase(unittest.TestCase):
         scan = gf.discover_sessions(self.projects, SINCE, UNTIL)
         records = gf.load_log(self.log if log is None else log, SINCE, UNTIL)
         cfg = gf.parse_config(self.cfg, self.root)
-        # Agent definitions come from the fixture, never the real ~/.claude/agents.
+        # Agent definitions come from the fixture, never the real user-level agents folder.
         return gf.analyse(scan, records, self.resolver, cfg, SINCE, UNTIL,
                           user_agents=self.root / "user-agents")
 

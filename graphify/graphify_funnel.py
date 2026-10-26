@@ -624,7 +624,7 @@ def _shell_words(segment: str, tool: str) -> list[str]:
 def _shell_path(arg: str, base: str | None) -> str | None:
     """A normalised path for a command argument that names a file or folder, else None.
 
-    Accepts absolute paths (drive, MSYS /x/..., ~) and relative ones that contain a
+    Accepts absolute paths (a drive letter, a Git Bash drive prefix, a home tilde) and relative ones that contain a
     separator or end in a file extension; a git `<ref>:<path>` keeps the path; a glob is cut
     back to the folder before its first wildcard. Relative paths need `base` (the cd target,
     else the record's cwd).
@@ -892,7 +892,7 @@ def repo_of(session: Session, resolver) -> str | None:
 
 
 # --------------------------------------------------------------------------- agent definitions
-# Ported from Claude-Profile hooks/graphify_hint.py (the hook may not import from here, and
+# Ported from the profile's graphify hint hook (the hook may not import from here, and
 # this repo cannot import the hook): keep the two in step. Definitions are read as they are
 # now, not as they were when the session ran.
 
