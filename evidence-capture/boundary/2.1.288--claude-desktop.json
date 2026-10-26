@@ -2,7 +2,7 @@
   "accepted": {
     "at": "2026-10-07T02:55:07Z",
     "by": "owner, explicit acceptance instruction of 2026-10-06 naming the record recorded 2026-10-06T19:37:59-0700, CLI 2.1.288, mode claude-desktop, host 2.19675.1 and SHA-256 84304f7d…0ab91",
-    "note": "first-tool runs are probe turns 4-5 (session 48f97ff8, unarmed Read turns, prompt sha256 matched); armed turn 1 excluded by the analyser; provenance report F:/Claude-Tools/reports/2026-10-06__desktop-probe-2.1.288-provenance.md"
+    "note": "first-tool runs are probe turns 4-5 (session 48f97ff8, unarmed Read turns, prompt sha256 matched); armed turn 1 excluded by the analyser; provenance report reports/2026-10-06__desktop-probe-2.1.288-provenance.md"
   },
   "cli_version": "2.1.288",
   "full_result": "host-probe-result.json",
