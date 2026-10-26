@@ -48,6 +48,7 @@ import json
 import math
 import os
 import re
+import shlex
 import statistics
 import sys
 import tempfile
@@ -148,10 +149,34 @@ WRAPPER_FAILURE_RE = re.compile(r"graphify query failed|Traceback \(most recent 
 SHELL_TOOLS = {"Bash", "PowerShell"}
 SEARCH_TOOLS = {"Grep", "Glob"}
 AGENT_TOOLS = {"Agent", "Task"}
-EXPLORE_AGENT_TYPES = {"Explore", "general-purpose", "Plan"}
+EXPLORE_AGENT_TYPES = {"Explore", "general-purpose", "Plan"}   # spawn statistics only
+# Built-in subagent types without a shell; custom ones are judged by their definition.
+NO_SHELL_AGENTS = {"claude-code-guide", "statusline-setup"}
+
+# Shell commands read from a Bash/PowerShell call, per command segment (lowercased).
+SHELL_CD_CMDS = {"cd", "pushd", "chdir", "set-location", "sl", "push-location"}
+SHELL_READ_CMDS = {"cat", "head", "tail", "sed", "less", "more", "nl", "get-content", "gc", "type",
+                   "git show", "git blame"}
+SHELL_SEARCH_CMDS = {"grep", "egrep", "fgrep", "rg", "findstr", "select-string", "sls", "find", "fd",
+                     "get-childitem", "gci", "git grep", "git ls-files"}
+# The first positional argument of these is a pattern or script, not a path.
+SHELL_PATTERN_FIRST = {"grep", "egrep", "fgrep", "rg", "findstr", "sed", "git grep"}
+SHELL_PATTERN_OPTS = {"-e", "--regexp", "-f", "--file", "-pattern"}
+# Options whose value is not a path. Short options are case-sensitive (grep -A vs -a);
+# longer ones (PowerShell, find) are compared lowercased.
+SHELL_VALUE_OPTS = {"-e", "--regexp", "-g", "--glob", "--include", "--exclude", "--exclude-dir",
+                    "-t", "--type", "-A", "-B", "-C", "-m", "--max-count", "-pattern", "-filter",
+                    "-include", "-exclude", "-name", "-iname", "-encoding"}
+_SEGMENT_RE = re.compile(r"(&&|\|\||[;|&\n()])")
+_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_PATHLIKE_RE = re.compile(r"^[\w.~\-\\/: ]+$")
+_GLOB_CHARS = "*?[{"
 
 # Routing heuristic thresholds (tool counts are a proxy for "cross-file exploration").
-SUBAGENT_MIN_LOOKUPS = 3      # searches + reads for an explore-type subagent
+SHELL_TOOLS = ("Bash", "PowerShell")
+AGENT_DEF_MAX_BYTES = 256 << 10
+_LIST_SPLIT_RE = re.compile(r",(?![^()]*\))")  # commas outside Bash(...) patterns
+SUBAGENT_MIN_LOOKUPS = 3      # searches + reads for a subagent of any type
 MAIN_MIN_SEARCHES = 6         # searches for a main thread
 MAIN_MIN_FILES = 3            # distinct files read by that main thread
 MATCH_SLACK = timedelta(seconds=5)
@@ -201,11 +226,14 @@ class Unit:
     agent_type: str | None
     searches: int = 0
     reads: int = 0
-    files: set[str] = field(default_factory=set)          # Read targets
-    search_paths: set[str] = field(default_factory=set)   # Grep/Glob path arguments
+    files: set[str] = field(default_factory=set)          # Read targets, shell read arguments
+    search_paths: set[str] = field(default_factory=set)   # Grep/Glob paths, shell search paths
     calls: list[Call] = field(default_factory=list)
     skill_selected: bool = False
     spawned: list[dict] = field(default_factory=list)   # Agent calls made by this unit
+    cwd: str | None = None              # first cwd in this unit's own records
+    resolved: dict | None = None        # the graph for that cwd (set by analyse)
+    repo: str | None = None
 
     @property
     def label(self) -> str:
@@ -219,8 +247,7 @@ class Unit:
     def enough_lookups(self) -> bool:
         if self.unit_id == "main":
             return self.searches >= MAIN_MIN_SEARCHES and len(self.files) >= MAIN_MIN_FILES
-        return (self.agent_type in EXPLORE_AGENT_TYPES
-                and self.searches + self.reads >= SUBAGENT_MIN_LOOKUPS)
+        return self.searches + self.reads >= SUBAGENT_MIN_LOOKUPS
 
     def is_exploration(self, in_scope: Callable[[str], bool]) -> bool:
         """Heuristic eligibility: enough lookups, and they land in code the graph covers."""
@@ -495,11 +522,14 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
         if ts:
             session.first_ts = min(filter(None, [session.first_ts, ts]))
             session.last_ts = max(filter(None, [session.last_ts, ts]))
-        if session.cwd is None and isinstance(rec.get("cwd"), str):
-            session.cwd = rec["cwd"]
+        cwd = rec.get("cwd") if isinstance(rec.get("cwd"), str) else None
+        if session.cwd is None and cwd:
+            session.cwd = cwd
         target = unit
         if track_sidechain and rec.get("isSidechain"):
             target = session.unit("sidechain", "subagent")
+        if target.cwd is None and cwd:
+            target.cwd = cwd
 
         att = rec.get("attachment")
         if isinstance(att, dict) and att.get("type") == "hook_additional_context":
@@ -522,7 +552,8 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
                     continue    # resumed/forked transcripts repeat earlier records
                 session.seen_tool_ids.add(tool_id)
                 origin = rec.get("sessionId")
-                _tool_use(target, block, ts, pending, origin if isinstance(origin, str) else None)
+                _tool_use(target, block, ts, pending, origin if isinstance(origin, str) else None,
+                          cwd or target.cwd)
             elif block.get("type") == "tool_result":
                 call = pending.pop(block.get("tool_use_id", ""), None)
                 if call is not None:
@@ -532,7 +563,7 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
 
 
 def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, Call],
-              origin_session: str | None = None) -> None:
+              origin_session: str | None = None, cwd: str | None = None) -> None:
     name = block.get("name", "")
     inp = block.get("input") if isinstance(block.get("input"), dict) else {}
     if name in SEARCH_TOOLS:
@@ -560,8 +591,125 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
                         origin_session=origin_session)
             unit.calls.append(call)
             pending[call.tool_use_id] = call
-        elif SHELL_SEARCH_RE.search(cmd):
-            unit.searches += 1
+        else:
+            lk = shell_lookups(cmd, name, cwd)
+            if SHELL_SEARCH_RE.search(cmd) or lk.searched:
+                unit.searches += 1
+            elif lk.read:
+                unit.reads += 1
+            unit.search_paths |= lk.search_paths
+            unit.files |= lk.read_paths
+
+
+@dataclass
+class ShellLookups:
+    searched: bool = False
+    read: bool = False
+    search_paths: set[str] = field(default_factory=set)
+    read_paths: set[str] = field(default_factory=set)
+
+
+def _shell_words(segment: str, tool: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(segment, posix=tool != "PowerShell", punctuation_chars=False)
+        lexer.whitespace_split = True
+        if tool == "PowerShell":
+            lexer.escape = ""     # backslashes are path separators there, and ` is not modelled
+        words = list(lexer)
+    except ValueError:
+        words = segment.split()
+    return [w[1:-1] if len(w) >= 2 and w[0] == w[-1] and w[0] in "\"'" else w for w in words]
+
+
+def _shell_path(arg: str, base: str | None) -> str | None:
+    """A normalised path for a command argument that names a file or folder, else None.
+
+    Accepts absolute paths (drive, MSYS /x/..., ~) and relative ones that contain a
+    separator or end in a file extension; a git `<ref>:<path>` keeps the path; a glob is cut
+    back to the folder before its first wildcard. Relative paths need `base` (the cd target,
+    else the record's cwd).
+    """
+    if not arg or arg.startswith("-") or "://" in arg or "$" in arg:
+        return None
+    if not _DRIVE_RE.match(arg) and ":" in arg:
+        arg = arg.rsplit(":", 1)[1]
+    cut = min((arg.find(c) for c in _GLOB_CHARS if c in arg), default=-1)
+    if cut >= 0:
+        arg = arg[:max(arg.rfind("/", 0, cut), arg.rfind("\\", 0, cut)) + 1]
+    if not arg or not _PATHLIKE_RE.match(arg) or arg in (".", ".."):
+        return None
+    if arg.startswith("~"):
+        arg = os.path.expanduser(arg)
+    absolute = bool(_DRIVE_RE.match(arg)) or arg.startswith("/")
+    if not absolute:
+        if not (re.search(r"[\\/]", arg) or re.search(r"\.\w{1,8}$", arg)) or not base:
+            return None
+        arg = os.path.join(base, arg)
+    return norm_path(arg.rstrip("/\\") or arg)
+
+
+def shell_lookups(command: str, tool: str, cwd: str | None) -> ShellLookups:
+    """Searches and reads in a shell command, with the paths they touched.
+
+    Splits the command (heredoc bodies and quoted separators already blanked) into
+    segments, follows `cd`/`Set-Location`/`git -C` so relative arguments resolve against
+    where the command ran, and keeps only path-like arguments of search and read commands.
+    A search with no path argument after a `cd` searched the cd target. Commands it does
+    not know (python, git log, ...) contribute nothing.
+    """
+    out = ShellLookups()
+    base = norm_path(cwd) if cwd else None
+    parts = _SEGMENT_RE.split(code_part(command, tool))
+    for i in range(0, len(parts), 2):
+        piped = i > 0 and parts[i - 1] == "|"
+        words = _shell_words(parts[i], tool)
+        while words and re.match(r"^\w+=", words[0]):
+            words.pop(0)                  # VAR=value prefixes
+        if not words:
+            continue
+        head, args, here = words[0].lower(), words[1:], base
+        if head.endswith(".exe"):
+            head = head[:-4]
+        if head == "git":
+            while len(args) >= 2 and args[0] == "-C":
+                here = _shell_path(args[1], here) or here
+                args = args[2:]
+            if args:
+                head, args = f"git {args[0].lower()}", args[1:]
+        if head in SHELL_CD_CMDS:
+            target = next((a for a in args if not a.startswith("-")), None)
+            dest = _shell_path(target, base) if target else None
+            if dest:
+                base = dest
+            continue
+        is_read, is_search = head in SHELL_READ_CMDS, head in SHELL_SEARCH_CMDS
+        if not (is_read or is_search):
+            continue
+        positional: list[str] = []
+        pattern_given, skip = False, False
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            opt = a.split("=", 1)[0]
+            opt = opt if len(opt) <= 2 else opt.lower()
+            if a.startswith("-"):
+                pattern_given |= opt in SHELL_PATTERN_OPTS
+                skip = opt in SHELL_VALUE_OPTS and "=" not in a
+                continue
+            positional.append(a)
+        if head in SHELL_PATTERN_FIRST and not pattern_given:
+            positional = positional[1:]
+        found = {p for p in (_shell_path(a, here) for a in positional) if p}
+        if is_search:
+            out.searched = True
+            if not found and here and here != (norm_path(cwd) if cwd else None) and not piped:
+                found = {here}
+            out.search_paths |= found
+        else:
+            out.read = True
+            out.read_paths |= found
+    return out
 
 
 def load_session(path: Path) -> Session:
@@ -573,7 +721,7 @@ def load_session(path: Path) -> Session:
         for sub in sorted(sub_dir.glob("agent-*.jsonl")):
             agent_type, problem = read_agent_type(sub.with_suffix(".meta.json"))
             if problem:
-                # The unit stays in the session but cannot be judged explore-type: say so.
+                # The unit stays in the session; with no type it is judged shell-capable: say so.
                 session.meta_problems.append(f"{sub.name}: {problem}")
             unit = session.unit(sub.stem.removeprefix("agent-"), agent_type)
             _ingest(session, unit, sub, pending, track_sidechain=False)
@@ -697,17 +845,21 @@ def match_records(calls: list[Call], records: list[dict]) -> None:
 
 
 def coverage(session: Session) -> Callable[[str], bool]:
-    """Path predicate for the code the session's graph covers.
+    return coverage_for(session.resolved, session.repo)
 
-    Covers the graph root, the session's local mapping of it, and the same relative
-    folder inside any worktree lane under the repo, so sessions from worktrees
+
+def coverage_for(resolved: dict | None, repo: str | None) -> Callable[[str], bool]:
+    """Path predicate for the code a resolved graph covers.
+
+    Covers the graph root, the local mapping of it, and the same relative
+    folder inside any worktree lane under the repo, so units from worktrees
     that were deleted since (they now resolve to the main checkout) still count.
     """
-    r = session.resolved or {}
+    r = resolved or {}
     roots = {norm(r["graph_root"]), norm(r["local_root"])} if r else set()
     patterns = []
-    if r and session.repo:
-        repo = norm(session.repo)
+    if r and repo:
+        repo = norm(repo)
         graph_root = norm(r["graph_root"])
         rel = os.path.relpath(graph_root, repo) if graph_root.startswith(repo) else None
         if rel is not None and not rel.startswith(".."):
@@ -739,6 +891,110 @@ def repo_of(session: Session, resolver) -> str | None:
     return repo_identity(session.cwd, resolver) if session.cwd else None
 
 
+# --------------------------------------------------------------------------- agent definitions
+# Ported from Claude-Profile hooks/graphify_hint.py (the hook may not import from here, and
+# this repo cannot import the hook): keep the two in step. Definitions are read as they are
+# now, not as they were when the session ran.
+
+def _unquote(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
+def _scalar_or_list(value: str) -> str | list[str]:
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        return [_unquote(v) for v in _LIST_SPLIT_RE.split(value[1:-1]) if v.strip()]
+    return _unquote(value)
+
+
+def parse_frontmatter(text: str) -> dict[str, str | list[str]] | None:
+    """Top-level keys of a `---` frontmatter block; None if there is none or it is unterminated."""
+    lines = text.lstrip("\ufeff").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    out: dict[str, str | list[str]] = {}
+    key: str | None = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return out
+        item = re.match(r"\s*-\s+(.*)$", line)
+        if item and key is not None and isinstance(out.get(key), list):
+            out[key].append(_unquote(item.group(1)))  # type: ignore[union-attr]
+            continue
+        m = re.match(r"([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+        if m:
+            key, value = m.group(1), m.group(2)
+            out[key] = _scalar_or_list(value) if value.strip() else []
+    return None
+
+
+def _tool_names(value: str | list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    items = value if isinstance(value, list) else _LIST_SPLIT_RE.split(value)
+    return [t.strip() for t in items if t.strip()]
+
+
+def find_agent_definition(agent_type: str, cwd: str | None,
+                          user_agents: Path | None) -> dict[str, str | list[str]] | None:
+    """Frontmatter of the agent file whose `name` (or file stem) is agent_type.
+
+    Searched in .claude/agents from cwd upward (nearest wins), then in user_agents.
+    """
+    dirs: list[Path] = []
+    if cwd:
+        here = Path(cwd)
+        dirs = [d / ".claude" / "agents" for d in (here, *here.parents)]
+    if user_agents is not None:
+        dirs.append(user_agents)
+    for d in dirs:
+        try:
+            paths = sorted(d.glob("*.md")) if d.is_dir() else []
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                with open(path, "rb") as f:
+                    text = f.read(AGENT_DEF_MAX_BYTES).decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            fm = parse_frontmatter(text)
+            if fm is None:
+                continue
+            name = fm.get("name")
+            if (name if isinstance(name, str) and name else path.stem) == agent_type:
+                return fm
+    return None
+
+
+def agent_has_shell(agent_type: str | None, cwd: str | None,
+                    user_agents: Path | None) -> bool | None:
+    """False when the agent provably has no Bash/PowerShell; None when its definition is unknown.
+
+    A `tools` field absent or `*` means every tool; a pattern grant such as Bash(git:*)
+    counts as a shell; only a bare entry in disallowedTools removes one.
+    """
+    if not agent_type:
+        return None
+    if agent_type in NO_SHELL_AGENTS:
+        return False
+    if ":" in agent_type:
+        return None
+    fm = find_agent_definition(agent_type, cwd, user_agents)
+    if fm is None:
+        return None
+    tools = _tool_names(fm.get("tools"))
+    denied = set(_tool_names(fm.get("disallowedTools")) or [])
+    if not tools or "*" in tools:
+        granted = set(SHELL_TOOLS)
+    else:
+        granted = {t.split("(", 1)[0].strip() for t in tools} & set(SHELL_TOOLS)
+    return bool(granted - denied)
+
+
 def input_problems(inputs: dict) -> list[str]:
     """One line per kind of unusable input; empty when every input was read cleanly."""
     q, out = inputs["query_log"], []
@@ -757,7 +1013,7 @@ def input_problems(inputs: dict) -> list[str]:
                       ("transcripts_unreadable", "transcript file(s) could not be read"),
                       ("transcripts_undated", "transcript(s) had no timestamped record and were left out"),
                       ("subagent_metadata_problems", "subagent(s) without readable metadata "
-                                                     "(type unknown, so never routing-eligible)"),
+                                                     "(type unknown, judged shell-capable)"),
                       ("sessions_without_cwd", "session(s) without a cwd (repo and graph unknown)")):
         if inputs[key]:
             out.append(f"{len(inputs[key])} {text}")
@@ -767,7 +1023,9 @@ def input_problems(inputs: dict) -> list[str]:
 
 
 def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
-            since: datetime, until: datetime) -> dict:
+            since: datetime, until: datetime, user_agents: Path | None = None) -> dict:
+    if user_agents is None:
+        user_agents = Path.home() / ".claude" / "agents"
     sessions, records = scan.sessions, log.records
     excludes = cfg.exclude_sessions
     hint_live = cfg.hint_live_since
@@ -837,9 +1095,27 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     v1 = FAIL if FAIL in (v1a, v1b) else PASS if (v1a, v1b) == (PASS, PASS) else INSUFFICIENT
 
     # ---- stage 2: routing
-    scopes = {s.session_id: coverage(s) for s in graph_backed}
-    units = [u for s in graph_backed for u in s.units.values()]
-    exploration = [u for u in units if u.is_exploration(scopes[u.session.session_id])]
+    # Each unit is judged against the graph of its own cwd: a subagent may run elsewhere
+    # than its session started, and a graph-less session may spawn one inside a graph.
+    graph_cache: dict[str, tuple[dict | None, str | None]] = {}
+    for s in organic:
+        for u in s.units.values():
+            u.cwd = u.cwd or s.cwd
+            if not u.cwd:
+                continue
+            if u.cwd not in graph_cache:
+                r = resolver.resolve(u.cwd)
+                graph_cache[u.cwd] = (dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r,
+                                      repo_identity(u.cwd, resolver))
+            u.resolved, u.repo = graph_cache[u.cwd]
+    units = [u for s in organic for u in s.units.values() if u.resolved]
+    scope_of = {id(u): coverage_for(u.resolved, u.repo) for u in units}
+    eligible = [u for u in units if u.is_exploration(scope_of[id(u)])]
+    # A subagent without a shell cannot run graphify: its lookups show the graph was
+    # unusable to it, not that it was bypassed.
+    unusable = [u for u in eligible if u.unit_id != "main"
+                and agent_has_shell(u.agent_type, u.cwd, user_agents) is False]
+    exploration = [u for u in eligible if u not in unusable]
     no_path_evidence = [u for u in units if u.enough_lookups() and not (u.files | u.search_paths)]
     def real_calls(u: Unit) -> list[Call]:
         return [c for c in u.calls if not c.alt_log]
@@ -847,8 +1123,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     used = [u for u in exploration if real_calls(u)]
     bypassed = sorted((u for u in exploration if not real_calls(u)),
                       key=lambda u: -(u.searches + u.reads))
-    other_callers = [u for u in units
-                     if real_calls(u) and not u.is_exploration(scopes[u.session.session_id])]
+    other_callers = [u for u in units if real_calls(u) and u not in eligible]
     after_hint = [u for u in exploration if post_hint(u.session)]
     spawns = [sp for u in units for sp in u.spawned if sp["type"] in EXPLORE_AGENT_TYPES]
     if bypassed:
@@ -954,14 +1229,19 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
                                              f"transcript={u.session.path}"
                                              for u in after_hint if not real_calls(u)]},
             "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} files={len(u.files)} "
-                         f"in_graph={u.covered(scopes[u.session.session_id])} "
-                         f"cwd={u.session.cwd}" for u in bypassed],
+                         f"in_graph={u.covered(scope_of[id(u)])} "
+                         f"cwd={u.cwd}" for u in bypassed],
+            "graph_unusable_units": len(unusable),
+            "graph_unusable": [f"{u.label} searches={u.searches} reads={u.reads} "
+                               f"in_graph={u.covered(scope_of[id(u)])} cwd={u.cwd}"
+                               for u in unusable],
             "non_exploration_callers": len(other_callers),
             "skill_selected_units": sum(1 for u in units if u.skill_selected),
             "explore_spawns": len(spawns),
             "explore_spawns_passed_graph": sum(1 for sp in spawns if sp["passed_graph"]),
             "lookup_units_without_path_evidence": len(no_path_evidence),
-            "eligibility_unknown_sessions": len(graph_backed) - len({u.session.session_id for u in exploration})},
+            "eligibility_unknown_sessions": len({u.session.session_id for u in units}
+                                                - {u.session.session_id for u in eligible})},
         "execution": {
             "verdict": v3, "calls": len(organic_calls), "by_status": by_status,
             "logged": sum(1 for c in ok_calls if c.record is not None),
@@ -1027,13 +1307,15 @@ def render(summary: dict) -> str:
         if items:
             L += ["", f"**{title}:**", *[f"- {x}" for x in items]]
     L += ["", "## 2 Routing", "",
-          f"Eligibility is a heuristic (explore-type subagent with >= {SUBAGENT_MIN_LOOKUPS} lookups, or a main "
-          f"thread with >= {MAIN_MIN_SEARCHES} searches over >= {MAIN_MIN_FILES} files). "
-          "Only lookups inside the graph's coverage count. "
-          f"{r['eligibility_unknown_sessions']} graph-backed sessions had no exploration unit by this rule: "
+          f"Eligibility is a heuristic (a subagent of any type with >= {SUBAGENT_MIN_LOOKUPS} lookups, or a main "
+          f"thread with >= {MAIN_MIN_SEARCHES} searches over >= {MAIN_MIN_FILES} files; shell searches and reads "
+          "count with the paths they name). Each unit is judged against the graph of its own cwd, and "
+          "only lookups inside that graph's coverage count. "
+          f"{r['eligibility_unknown_sessions']} sessions with graph-backed units had no exploration unit by this rule: "
           "their eligibility is unknown, not zero demand.", "",
           f"- Graph-backed units: {r['graph_backed_units']}; exploration units: {r['exploration_units']}",
-          f"- Units with enough lookups but no file/path evidence (shell-only, eligibility unknown): "
+          f"- Subagents without a shell (graph unusable, not bypasses): {r['graph_unusable_units']}",
+          f"- Units with enough lookups but no file/path evidence (eligibility unknown): "
           f"{r['lookup_units_without_path_evidence']}",
           f"- Queried graphify: {len(r['used_graphify'])} {r['used_graphify'] or ''}",
           f"- **Decisive line — after the hint went live: {r['after_hint_live']['used_graphify']}/"
@@ -1044,6 +1326,9 @@ def render(summary: dict) -> str:
     if r["after_hint_live"]["bypassed"]:
         L += ["", "**Bypassed after go-live (open these transcripts first):**",
               *[f"- {x}" for x in r["after_hint_live"]["bypassed"][:BYPASS_SHOWN]]]
+    if r["graph_unusable"]:
+        L += ["", "**Graph unusable (subagent definition grants no Bash/PowerShell):**",
+              *[f"- {x}" for x in r["graph_unusable"][:BYPASS_SHOWN]]]
     if r["bypassed"]:
         shown = r["bypassed"][:BYPASS_SHOWN]
         L += ["", f"**Bypassed (routing failures to investigate this week; largest {len(shown)} of "
