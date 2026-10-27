@@ -271,6 +271,15 @@ class ShellLookups(FunnelCase):
         self.assertEqual(lk.search_paths, set())
         self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "a.py"))})
 
+    def test_a_commented_out_search_is_not_counted_in_the_unit(self):
+        # SA26-16: the unit's search count must ignore the comment too, not just shell_lookups.
+        path = Transcript(self.repo) \
+            .tool("Bash", {"command": "cat a.py  # later; grep -rn foo backend/b.py"}) \
+            .tool("Bash", {"command": "ls  # rg later"}) \
+            .write(self.projects, "p", "s-comment")
+        unit = gf.load_session(path).units["main"]
+        self.assertEqual((unit.searches, unit.reads), (0, 1))
+
     def test_unknown_commands_and_urls_contribute_nothing(self):
         lk = self.lookups("python build.py && curl https://x/a.py && echo backend/a.py")
         self.assertEqual((lk.searched, lk.read, lk.search_paths, lk.read_paths),

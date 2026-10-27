@@ -627,7 +627,7 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
             pending[call.tool_use_id] = call
         else:
             lk = shell_lookups(cmd, name, cwd)
-            searched = bool(SHELL_SEARCH_RE.search(cmd)) or lk.searched
+            searched = bool(SHELL_SEARCH_RE.search(code)) or lk.searched
             if searched or lk.read:          # paths only come with a search or a read
                 unit.lookups.append(Lookup(tool_id, searched, frozenset(lk.read_paths),
                                            frozenset(lk.search_paths)))
