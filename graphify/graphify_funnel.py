@@ -207,7 +207,8 @@ QUESTION_RE = re.compile(r"(?:query_reranked\.py[\"']?|\s(?:query|explain))\s+\"
 # A shell search is a search tool in COMMAND position, not a word of an argument (`echo "use grep here"`,
 # `Write-Host 'use Select-String'`, a commit message). Command positions: the start of a segment (after
 # ; & | ( ` or a newline), after `if`/`then`/`do`/`{` and the like, after a VAR=value prefix or an
-# assignment (`$r = `), after a wrapper (sudo, env, xargs, timeout, time, nohup, watch, ...) and its
+# assignment (`$r = `), after a wrapper (sudo, env, xargs, timeout, time, nohup, watch, taskset, numactl,
+# flock, nsenter, gdb --args, ...) and its
 # options, behind `git`'s global options, and anywhere after a runner that takes a whole command line
 # (ssh, docker, kubectl, wsl, adb, su, eval, chroot, ...), which this cannot parse. (`find` is a search
 # command of its own, see SHELL_SEARCH_CMDS, so its -exec needs no rule.)
@@ -220,7 +221,15 @@ _SEARCH_WRAPPER_VALUE_FLAGS = {          # wrapper -> its options that take a se
     "timeout": {"-s", "-k"}, "nice": {"-n"}, "ionice": {"-c", "-n", "-p", "-P", "-u"},
     "stdbuf": {"-i", "-o", "-e"}, "nohup": set(), "command": set(), "exec": {"-a"}, "builtin": set(),
     "time": {"-f", "-o"}, "watch": {"-n"}, "setsid": set(), "unbuffer": set(), "busybox": set(),
-    "parallel": {"-j", "-n", "-a", "-N"}, "strace": {"-o", "-e", "-p", "-s", "-u"}}
+    "parallel": {"-j", "-n", "-a", "-N"}, "strace": {"-o", "-e", "-p", "-s", "-u"},
+    "taskset": {"-c", "--cpu-list"}, "chronic": set(), "caffeinate": {"-t", "-w"}, "valgrind": set(),
+    "numactl": {"-N", "-m", "-C", "-i", "-p", "--cpunodebind", "--membind", "--physcpubind", "--interleave",
+                "--preferred"},
+    "flock": {"-w", "-E", "--timeout", "--wait", "--conflict-exit-code"},
+    "ltrace": {"-o", "-e", "-p", "-s", "-u", "-n", "-l", "-a", "-A", "-F", "-x", "-w"},
+    "nsenter": {"-t", "--target", "-S", "--setuid", "-G", "--setgid"},
+    "gdb": {"-ex", "-iex", "-x", "-ix", "-d", "-cd", "-p", "-pid", "-c", "-core", "-s", "-e", "-se", "-tty",
+            "-b", "-l", "-D", "-directory"}}      # gdb: the program follows --args
 _SEARCH_RUNNERS = {"ssh", "wsl", "docker", "podman", "kubectl", "adb", "su", "script", "eval", "chroot"}
 _GIT_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 WRAPPER_FAILURE_RE = re.compile(r"graphify query failed|Traceback \(most recent call last\)")
@@ -771,6 +780,11 @@ def _segment_searches(words: list[str]) -> bool:
                 want = False                    # `command -v rg` looks a tool up, it does not run it
             if name == "timeout" and i < n and re.match(r"\d[\w.]*$", words[i]):
                 i += 1                          # timeout's duration
+            elif (name == "taskset" and i < n and not {"-c", "--cpu-list"} & set(words[first_flag:i])
+                  and re.match(r"(0x)?[0-9a-fA-F][0-9a-fA-F,-]*$", words[i])):
+                i += 1                          # taskset's CPU mask, when no -c list was given
+            elif name == "flock" and i < n:
+                i += 1                          # flock's lock file or directory
         elif name in _SEARCH_RUNNERS:
             runner, want = True, False
         else:
