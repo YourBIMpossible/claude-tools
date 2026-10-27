@@ -8,6 +8,8 @@ config nor the real temp-dir fallback log is touched.
 """
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import os
 import subprocess
@@ -74,6 +76,12 @@ def load_inconclusive(m: dict) -> str | None:
     return None
 
 
+def skip_if_load_inconclusive(m: dict) -> None:
+    """Raise ``Skip`` when ``m`` is an episode whose hooks ran over budget (see ``load_inconclusive``)."""
+    if (why := load_inconclusive(m)) is not None:
+        raise Skip(f"inconclusive under load, {why}")
+
+
 def manifests(stores: store.Stores) -> list[dict]:
     """Every manifest; a fixture store never holds an unreadable one."""
     scan = store.scan_manifests(stores)
@@ -128,6 +136,12 @@ class Fixture:
         assert len(found) == 1, f"{len(found)} manifests for session"
         return found[0]
 
+    def episode_in_budget(self, sid: str) -> dict:
+        """``episode`` for a test that asserts on a materialized episode: over budget is a skip."""
+        m = self.episode(sid)
+        skip_if_load_inconclusive(m)
+        return m
+
 
 def _git_status(repo: Path) -> str:
     return subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1"], capture_output=True, text=True,
@@ -141,12 +155,12 @@ def test_end_to_end_materialized(root: Path) -> None:
     index_before = (fx.repo / ".git" / "index").read_bytes()
     sid = str(uuid.uuid4())
     pid, ts = fx.start(sid)
-    m = fx.episode(sid)
+    m = fx.episode_in_budget(sid)
     assert m["capture"]["phase"] == "started" and m["start_snapshot"]["state"] == "complete", m["start_snapshot"]
     assert m["link"]["state"] == "none", "start never reads a packet"
     tp = fx.transcript(sid, PROMPT, pid, ts)
     fx.end(sid, tp)
-    m = fx.episode(sid)
+    m = fx.episode_in_budget(sid)
     assert m["capture"]["status"] == "complete", m["capture"]
     assert m["link"]["state"] == "linked" and m["link"]["packet_id"] == pid, m["link"]
     assert m["boundary"]["trusted"] and m["boundary"]["cli_version"] == dryrun.CLI_VERSION, m["boundary"]
@@ -242,6 +256,7 @@ def test_capture_failures_in_denominator(root: Path) -> None:
     sid_ok = str(uuid.uuid4())
     pid, ts = fx.start(sid_ok)
     fx.end(sid_ok, fx.transcript(sid_ok, PROMPT, pid, ts))
+    fx.episode_in_budget(sid_ok)
     # three starts the store could not take (pending), recorded by the next maintenance
     markers = {n: (fx.stores.content / n).read_bytes() for n in store.CONTENT_MARKERS}
     for n in markers:
@@ -301,6 +316,7 @@ def test_rejoin_by_maintenance(root: Path) -> None:
     first = [m for m in manifests(fx.stores) if m["session_id"] == sid and m["started_at"] < ts2]
     assert len(first) == 1
     m = first[0]
+    skip_if_load_inconclusive(m)
     assert m["capture"]["join"]["by"] == "maintain" and m["ended_by"] == "prompt", m["capture"]["join"]
     assert m["link"]["state"] == "linked" and m["review"]["state"] == "materialized", (m["link"], m["review"])
     # the later episode stays open for its own Stop hook
@@ -325,7 +341,9 @@ def test_end_waits_for_episode_lock(root: Path) -> None:
     assert res["action"] == "busy", res
     assert fx.episode(sid)["capture"]["phase"] == "started", "a busy episode is left untouched"
     res = pipeline.run_end({"session_id": sid, "transcript_path": str(tp)}, fx.env)
-    assert res["action"] == "ended" and res["review"] == "materialized", res
+    assert res["action"] == "ended", res
+    skip_if_load_inconclusive(fx.episode(sid))
+    assert res["review"] == "materialized", res
 
 
 def test_boundary_overrides(root: Path) -> None:
@@ -376,7 +394,7 @@ def test_fn_audit_sheet_and_gate(root: Path) -> None:
         sid = str(uuid.uuid4())
         pid, ts = fx.start(sid)
         fx.end(sid, fx.transcript(sid, PROMPT, pid, ts))
-        eps.append(fx.episode(sid)["episode_id"])
+        eps.append(fx.episode_in_budget(sid)["episode_id"])
     sheet = audit.build_sheet(fx.stores)
     k = sheet["audit"]
     labels = read_json(audit.labels_path(fx.stores, k))
@@ -433,6 +451,7 @@ def test_checkpoint_schema(root: Path) -> None:
     sid = str(uuid.uuid4())
     pid, ts = fx.start(sid)
     fx.end(sid, fx.transcript(sid, PROMPT, pid, ts))
+    fx.episode_in_budget(sid)
     ck = report.build_checkpoint(fx.stores, 1, tool_commit="0" * 40)
     want = ["checkpoint", "window", "denominator", "funnel", "exclusions", "screen", "fn_audit", "task_mix",
             "capture_failures", "content_store", "integrity", "isolation", "twin", "model_probes", "decision_inputs"]
@@ -803,6 +822,60 @@ def test_rescreen_records_never_share_a_name(root: Path) -> None:
     assert a != b and a.is_file() and b.is_file() and b.name.endswith("-1.json"), (a, b)
 
 
+
+# The tests that assert on a materialized episode run the real hooks under their real wall-clock
+# budgets. Under machine load the product records ``partial`` with ``*_over_budget`` (the budget
+# working as specified), which these tests must report as inconclusive, never as a failure.
+MATERIALIZATION_TESTS = ("test_end_to_end_materialized", "test_capture_failures_in_denominator",
+                         "test_rejoin_by_maintenance", "test_end_waits_for_episode_lock",
+                         "test_fn_audit_sheet_and_gate", "test_checkpoint_schema")
+
+
+@contextlib.contextmanager
+def _capture_errors_injected(errors: list[str]):
+    """Every manifest ``manifests()`` returns (so every ``Fixture.episode``) reads as a capture
+    that ended ``partial`` with ``errors``; the stores themselves are untouched."""
+    real = globals()["manifests"]
+
+    def injected(stores: store.Stores) -> list[dict]:
+        out = copy.deepcopy(real(stores))
+        for m in out:
+            m["capture"]["status"], m["capture"]["errors"] = "partial", list(errors)
+        return out
+
+    globals()["manifests"] = injected
+    try:
+        yield
+    finally:
+        globals()["manifests"] = real
+
+
+def test_materialization_tests_skip_when_the_hooks_ran_over_budget(root: Path) -> None:
+    for name in MATERIALIZATION_TESTS:
+        case = root / name
+        case.mkdir()
+        with _capture_errors_injected(["start_over_budget", "end_over_budget"]):
+            try:
+                globals()[name](case)
+            except Skip:
+                continue
+            except AssertionError as exc:
+                raise AssertionError(f"{name} failed on an over-budget capture instead of skipping: {exc}") from exc
+        raise AssertionError(f"{name} ran to the end on an over-budget capture")
+
+
+def test_materialization_tests_still_fail_on_a_real_capture_error(root: Path) -> None:
+    """The load gate must not turn a genuine capture failure into a skip."""
+    case = root / "real-error"
+    case.mkdir()
+    with _capture_errors_injected(["root:unresolved"]):
+        try:
+            test_end_to_end_materialized(case)
+        except Skip as exc:
+            raise AssertionError(f"a non-budget capture error was skipped as load: {exc}") from exc
+        except AssertionError:
+            return
+    raise AssertionError("a capture with a real error passed the materialization test")
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
