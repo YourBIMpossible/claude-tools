@@ -500,12 +500,17 @@ def test_nav_destination() -> None:
         return [t[1] for t in f.touches], f.unresolved
 
     check(later(fp("cd src && cd .. && cat a.py")) == (["a.py"], 0), "cd src && cd ..: back in the starting directory")
-    check(later(fp("cd . && cat a.py")) == (["a.py"], 0), "cd .: the directory is unchanged")
+    f = fp("cd . && cat a.py")
+    check((later(f), f.outside) == ((["a.py"], 0), 0), "cd .: the directory is unchanged, nothing outside")
     check(later(fp("cd .. && cat a.py", WT + "/src")) == (["a.py"], 0), "cd .. from a subdirectory cwd")
     check(later(fp("cd src; Set-Location ..; Get-Content a.py", tool="PowerShell")) == (["a.py"], 0),
           "Set-Location .. is the parent, as cd .. is")
-    check(fp("cd src && cd .. && cat a.py").outside == fp(f"cd {WT} && cat a.py").outside,
-          "cd .. back to the root counts its argument exactly like cd <root>")
+    check(fp("cd src && cd .. && cat a.py").outside == 0, "cd .. back to the root: nothing outside")
+    check(fp("cd src; (cd ..; cat a.py); cat b.py").outside == 0, "cd .. inside a subshell: nothing outside")
+    segs = sp.parse_command("cd .. > out.log")[0]
+    check([(u.path, u.role) for u in segs[0].paths] == [("out.log", "write")] and segs[0].nav_dest == "..",
+          "cd ..: the destination is kept apart from the segment's paths")
+    check(sp.parse_command("cd src > out.log")[0][0].nav_dest == "src", "cd src > out.log: the destination is src")
     f = fp("cd .. && cat a.py", None)
     check((f.touches, f.outside) == ([], 0), "cd .. with no recorded cwd: nothing touched, nothing outside")
     f = fp("cd ../../../../../../../.. && cat a.py")

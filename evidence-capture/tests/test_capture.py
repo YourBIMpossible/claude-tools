@@ -525,6 +525,21 @@ def test_external_repo_doc_required(root: Path) -> None:
     assert rule(m, "X4") == "yes"
 
 
+def test_cd_parent_back_to_root_is_not_external(root: Path) -> None:
+    """Regression (SA26-7 review): screen classifies each path against the call's cwd and does not
+    track cd, so a nav to '..' or '.' must not reach it as a path."""
+    repo = make_repo(root)
+    idx = screen.RepoIndex(repo)
+    for cmd in ("cd src && cd .. && cat a.py", "cd . && cat a.py"):
+        obs, clean = screen._shell_observations(cmd, idx, screen.norm_path(repo), [])
+        assert {c: v for c, v in obs.items() if v} == {} and clean, (cmd, obs)
+    turns = [{"prompt": "fix alpha", "tools": [
+        {"name": "Bash", "input": {"command": "cd src && cd .. && cat src/alpha.py"}, "result": "def alpha"},
+        {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}]}]
+    m = joined(root, repo, turns, 0)
+    assert m["deps"]["external_path"]["observed"] == 0 and rule(m, "X4") == "no", (m["deps"]["external_path"], m["exclusions"])
+
+
 def test_observed_not_required(root: Path) -> None:
     repo = make_repo(root)
     elsewhere = root / "elsewhere"

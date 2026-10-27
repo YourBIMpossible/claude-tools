@@ -345,8 +345,7 @@ class Footprint:
                     # Later segments run in the new directory; one this parser cannot evaluate
                     # (cd -, popd, a variable) leaves later relative paths unattributed. The
                     # destination is the nav argument itself, not a redirect listed before it.
-                    dest = (next((u.path for u in seg.paths if u.role == "nav"), None)
-                            if seg.verb not in {"popd", "pop-location"} else None)
+                    dest = seg.nav_dest if seg.verb not in {"popd", "pop-location"} else None
                     # A piped nav ends with its stage in Bash (a subshell scope); in PowerShell its
                     # timing against the other stages is unknown.
                     wd = (UNRESOLVED if dest is None or dest == "-" or seg.piped

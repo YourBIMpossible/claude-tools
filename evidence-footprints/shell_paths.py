@@ -200,6 +200,9 @@ class Segment:
     opens: tuple[int, ...] = ()
     # Part of a pipeline of two or more stages.
     piped: bool = False
+    # Where a nav segment moves the working directory: its own argument, kept apart from
+    # ``paths`` because '.' and '..' are not file arguments and a redirect is not the destination.
+    nav_dest: str | None = None
 
 
 def _is_absolute(p: str) -> bool:
@@ -704,11 +707,12 @@ def parse_segment(seg: str) -> Segment:
     elif verb in NAV:
         s.kind = "nav"
         if pos[:1] and pos[0].strip() in {".", ".."}:
-            # The directory in effect and its parent, as for git -C: kept, although _clean_arg
-            # drops them as file arguments.
-            s.paths.append(PathUse(pos[0].strip(), "nav", verb))
+            # The directory in effect and its parent, as for git -C: a destination only, since
+            # _clean_arg drops them as file arguments.
+            s.nav_dest = pos[0].strip()
         else:
             add(pos[:1], "nav")
+            s.nav_dest = next((u.path for u in s.paths if u.role == "nav"), None)
     elif verb in NONFILE:
         s.kind = "nonfile"
     elif s.has_pathlike:
