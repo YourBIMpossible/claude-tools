@@ -660,6 +660,35 @@ class CallWindow(FunnelCase):
         self.assertEqual((ex["calls"], ex["verdict"], ex["calls_outside_window_excluded"]),
                          (1, gf.FAIL, 0))
 
+    def edge_call(self, session_id: str, start: datetime, end: datetime) -> None:
+        """A wrapper call that starts at `start` and returns, and is logged, at `end`."""
+        t = Transcript(self.repo, start - timedelta(seconds=1))
+        tid = f"toolu_{session_id}"
+        t.lines.append({"timestamp": iso(start), "cwd": t.cwd, "type": "assistant",
+                        "message": {"content": [{"type": "tool_use", "id": tid, "name": "Bash", "input": {
+                            "command": 'python "/x/query_reranked.py" "q-edge" --graph "/x/graph.json"'}}]}})
+        t.lines.append({"timestamp": iso(end), "cwd": t.cwd, "type": "user",
+                        "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                                 "is_error": False, "content": "NODE x [src=a.py]"}]}})
+        t.write(self.projects, "p", session_id)
+        self.log_record("q-edge", end)
+
+    def test_call_ending_after_the_window_is_not_judged(self):
+        # The wrapper logs at the call's end, past the log window: no false FAIL.
+        self.edge_call("s-upper", UNTIL - timedelta(seconds=2), UNTIL + timedelta(seconds=8))
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"],
+                          ex["calls_outside_window_excluded"]), (0, gf.INSUFFICIENT, [], 1))
+
+    def test_call_starting_before_the_window_but_ending_in_it_is_judged(self):
+        # Its record is in the log window, so the call is measured, not silently dropped.
+        self.edge_call("s-lower", SINCE - timedelta(seconds=10), SINCE + timedelta(seconds=1))
+        out = self.run_funnel()
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["calls_outside_window_excluded"]),
+                         (1, gf.PASS, 0))
+        self.assertEqual(out["measurement"]["reranked"]["n"], 1)
+
 
 class Availability(FunnelCase):
     def test_missing_hint_after_go_live_fails(self):

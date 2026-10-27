@@ -1117,10 +1117,12 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
 
     # A session is kept whole when it overlaps the window, but the log is windowed per
     # record, so execution and measurement judge only calls made inside the window (same
-    # slack as the log); an undated call stays in. Records of boundary calls are still
-    # matched above, so they never read as unattributed.
+    # slack as the log); an undated call stays in. The wrapper logs when the call ends, so
+    # a call is placed by its result time when it has one. Records of boundary calls are
+    # still matched above, so they never read as unattributed.
     def in_window(c: Call) -> bool:
-        return c.ts is None or since - MATCH_SLACK <= c.ts <= until + MATCH_SLACK
+        t = c.result_ts or c.ts
+        return t is None or since - MATCH_SLACK <= t <= until + MATCH_SLACK
 
     outside_window = sum(1 for s in organic for u in s.units.values() for c in u.calls
                          if not c.copy and not in_window(c))
