@@ -557,12 +557,82 @@ class OrganicSeparation(FunnelCase):
         self.assertEqual(out["execution"]["calls"], 1)
         self.assertEqual(out["execution"]["copied_calls_excluded"], 1)
 
+    def test_forked_exploration_counts_once_in_routing(self):
+        # SA26-6: the fork repeats the original's lookups (same tool_use ids); one real unit.
+        t = Transcript(self.repo).greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "p", "s-orig")
+        t.write(self.projects, "p", "s-fork")
+        r = self.run_funnel()["routing"]
+        self.assertEqual((r["graph_backed_units"], r["exploration_units"], len(r["bypassed"])), (2, 1, 1))
+
+    def test_continuation_call_covers_its_copied_exploration(self):
+        # SA26-6: a continued transcript holds the earlier lookups and then queries graphify
+        # itself; the conversation is one used unit, not a bypass plus a used unit.
+        t = Transcript(self.repo).greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "p", "s-orig")
+        t.query("later q")
+        for rec in t.lines[-2:]:
+            rec["sessionId"] = "s-cont"
+        t.write(self.projects, "p", "s-cont")
+        self.log_record("later q", t.t)
+        r = self.run_funnel()["routing"]
+        self.assertEqual((r["verdict"], r["exploration_units"], r["bypassed"]), (gf.PASS, 1, []))
+        self.assertEqual(r["used_graphify"], ["s-cont/main"])
+        self.assertEqual(r["non_exploration_callers"], 0)
+
     def test_repeated_tool_ids_are_counted_once(self):
         t = Transcript(self.repo)
         for _ in range(3):
             t.tool("Grep", {"pattern": "x"}, tool_id="toolu_same")
         path = t.write(self.projects, "p", "s-rep")
         self.assertEqual(gf.load_session(path).units["main"].searches, 1)
+
+
+class CallWindow(FunnelCase):
+    """SA26-4/5: the log is windowed per record, so calls are too; a session is kept whole."""
+
+    def test_call_before_the_window_in_a_spanning_session_is_not_judged(self):
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)).query("q-early")
+        self.log_record("q-early", t.t)          # logged, but before the window
+        t.t = SINCE + timedelta(hours=1)
+        t.greps(1).write(self.projects, "p", "s-span")
+        out = self.run_funnel()
+        self.assertEqual(out["sessions"]["total"], 1)
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"]),
+                         (0, gf.INSUFFICIENT, []))
+        self.assertEqual(ex["calls_outside_window_excluded"], 1)
+
+    def test_fork_of_a_pre_window_session_drops_the_copied_call(self):
+        orig = Transcript(self.repo, SINCE - timedelta(days=2)).query("q-old")
+        for rec in orig.lines:
+            rec["sessionId"] = "s-orig"
+        self.log_record("q-old", orig.t)
+        path = orig.write(self.projects, "p", "s-orig")
+        old = (SINCE - timedelta(days=1)).timestamp()
+        os.utime(path, (old, old))               # below the mtime floor: never loaded
+        fork = Transcript(self.repo, SINCE + timedelta(hours=1)).greps(1)
+        for rec in fork.lines:
+            rec["sessionId"] = "s-fork"
+        fork.lines = [dict(r) for r in orig.lines] + fork.lines
+        fork.write(self.projects, "p", "s-fork")
+        out = self.run_funnel()
+        self.assertEqual(out["sessions"]["total"], 1)
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"]),
+                         (0, gf.INSUFFICIENT, []))
+
+    def test_call_inside_the_window_is_still_judged(self):
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)).greps(1)
+        t.t = SINCE + timedelta(hours=1)
+        t.query("q-late").write(self.projects, "p", "s-span2")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["calls_outside_window_excluded"]),
+                         (1, gf.FAIL, 0))
 
 
 class Availability(FunnelCase):
