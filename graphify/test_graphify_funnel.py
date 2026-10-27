@@ -294,7 +294,10 @@ class ShellLookups(FunnelCase):
                           ("Bash", "sudo bash <<'EOF'\ngrep -rn foo src\nEOF"),
                           ("Bash", "ssh host bash <<'EOF'\ngrep -rn foo src\nEOF"),
                           ("Bash", "FOO=1 bash <<'EOF'\ngrep -rn foo src\nEOF"),
-                          ("Bash", 'bash --norc -c "set -e\ngrep -rn foo src\n"')):
+                          ("Bash", 'bash --norc -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash -o pipefail -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash --rcfile x -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash -euo pipefail -c "set -e\ngrep -rn foo src\n"')):
             with self.subTest(cmd=cmd):
                 unit = self.unit_of(tool, cmd)
                 self.assertEqual((unit.searches, unit.reads), (1, 0))

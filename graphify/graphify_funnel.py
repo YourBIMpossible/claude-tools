@@ -87,7 +87,7 @@ _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
 _QUOTED_SEPARATORS = str.maketrans(";&|()", "     ")
 # The end of a line that passes the next quoted argument to a shell as its script.
 _SHELL_SCRIPT_ARG_RE = re.compile(
-    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+--?[\w-]+)*\s+-\w*c\w*"
+    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+[^\s\"']+)*?\s+-\w*c\w*"
     r"|(?P<ps>pwsh|powershell)(?:\.exe)?[\"']?(?:\s+[^\s\"']+)*?\s+-c(?:ommand)?"
     r"|(?P<cmd>cmd)(?:\.exe)?[\"']?\s+/[ck])\s*$", re.I)
 _SHELLS = {"bash": "Bash", "sh": "Bash", "zsh": "Bash", "dash": "Bash", "cmd": "Bash",
