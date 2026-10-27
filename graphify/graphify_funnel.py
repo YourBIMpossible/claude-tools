@@ -1125,7 +1125,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         return t is None or since - MATCH_SLACK <= t <= until + MATCH_SLACK
 
     outside_window = sum(1 for s in organic for u in s.units.values() for c in u.calls
-                         if not c.copy and not in_window(c))
+                         if not c.alt_log and not c.copy and not in_window(c))
     organic_calls = [c for s in organic for u in s.units.values() for c in u.calls
                      if not c.alt_log and not c.copy and in_window(c)]
     alt_log_calls = sum(1 for s in organic for u in s.units.values() for c in u.calls

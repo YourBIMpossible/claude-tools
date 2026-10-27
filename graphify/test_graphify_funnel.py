@@ -689,6 +689,16 @@ class CallWindow(FunnelCase):
                          (1, gf.PASS, 0))
         self.assertEqual(out["measurement"]["reranked"]["n"], 1)
 
+    def test_test_run_before_the_window_is_not_an_excluded_call(self):
+        # A redirected-log test run is never a call, inside the window or outside it.
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)) \
+            .query("redirected", extra="GRAPHIFY_QUERY_LOG=/tmp/x.log ")
+        t.t = SINCE + timedelta(hours=1)
+        t.greps(1).write(self.projects, "p", "s-test-early")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["calls_outside_window_excluded"], ex["test_alt_log_calls"]),
+                         (0, 0, 0))
+
 
 class Availability(FunnelCase):
     def test_missing_hint_after_go_live_fails(self):
