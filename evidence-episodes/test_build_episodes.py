@@ -324,12 +324,50 @@ def test_root_precedence(tmp: Path) -> None:
           "reversing the roots reverses the choice")
 
 
+def test_unique_names(tmp: Path) -> None:
+    """SA26-22: a repeated source, transcript-root or cohort name is refused, by build() and on the command line,
+    instead of letting the last root win the precedence rank and hiding an ambiguous copy."""
+    d1, d2, d3 = (tmp / n for n in ("d1", "d2", "d3"))
+    for d in (d1, d2, d3):
+        d.mkdir()
+    manifest = tmp / "cohort.json"
+    manifest.write_text("{}", encoding="utf-8")
+
+    def refused(sources: list, roots: list, cohorts: list) -> bool:
+        try:
+            be.build(sources, roots, cohorts, tmp / "out")
+        except ValueError:
+            return True
+        return False
+
+    def cli_refused(*argv: str) -> bool:
+        try:
+            be.main([*argv, "--out", str(tmp / "out-cli")])
+        except SystemExit as exc:
+            return exc.code == 2
+        return False
+
+    check(refused([("s", d1)], [("A", d1), ("B", d2), ("A", d3)], []),
+          "build: a repeated transcript-root name is refused")
+    check(refused([("s", d1)], [], [("c", manifest), ("c", manifest)]), "build: a repeated cohort name is refused")
+    check(refused([("s", d1), ("s", d2)], [], []), "build: a repeated source name is refused")
+    check(not (tmp / "out").exists(), "build: a refused call writes nothing")
+    check(cli_refused("--source", f"s={d1}", "--transcripts", f"A={d1}", "--transcripts", f"A={d2}"),
+          "CLI: a repeated --transcripts name is a usage error")
+    check(cli_refused("--source", f"s={d1}", "--transcripts", f"t1={d1}", "--transcripts", str(d2)),
+          "CLI: an explicit name that collides with a derived t<i> name is a usage error")
+    check(cli_refused("--source", f"s={d1}", "--cohort", f"c={manifest}", "--cohort", f"c={manifest}"),
+          "CLI: a repeated --cohort name is a usage error")
+
+
 def main() -> int:
     test_unit_helpers()
     with tempfile.TemporaryDirectory() as td:
         test_build(Path(td))
     with tempfile.TemporaryDirectory() as td:
         test_root_precedence(Path(td))
+    with tempfile.TemporaryDirectory() as td:
+        test_unique_names(Path(td))
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     if FAILURES:
