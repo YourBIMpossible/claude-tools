@@ -264,6 +264,13 @@ class ShellLookups(FunnelCase):
         lk = self.lookups(f"Select-String -Pattern sync -Path {self.repo}\\backend\\*.py", "PowerShell")
         self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
 
+    def test_commands_inside_a_comment_are_not_lookups(self):
+        # SA26-16: a search named in a trailing comment never ran.
+        lk = self.lookups("cat a.py  # later; grep -rn foo backend/b.py", cwd=self.repo)
+        self.assertFalse(lk.searched)
+        self.assertEqual(lk.search_paths, set())
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "a.py"))})
+
     def test_unknown_commands_and_urls_contribute_nothing(self):
         lk = self.lookups("python build.py && curl https://x/a.py && echo backend/a.py")
         self.assertEqual((lk.searched, lk.read, lk.search_paths, lk.read_paths),
@@ -472,6 +479,16 @@ class Execution(FunnelCase):
         ex = self.run_funnel()["execution"]
         self.assertEqual(ex["calls"], 5)
         self.assertEqual(ex["bare_cli_calls"], 3)
+
+    def test_a_mention_inside_a_comment_is_not_a_call(self):
+        # SA26-16: text after `#` is a comment; a separator in it is no command position.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'cat a.py  # later; graphify query "foo"'}) \
+            .tool("PowerShell", {"command": 'Get-Content a.py # then; python /x/query_reranked.py "q"'}) \
+            .write(self.projects, "p", "s-comment")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 0)
+        self.assertEqual(ex["bare_cli_calls"], 0)
 
     def test_commands_inside_a_quoted_shell_argument_are_not_counted(self):
         # Accepted limit of the quoted-separator rule: the inner command is an argument string.
@@ -943,6 +960,32 @@ class InputVisibility(FunnelCase):
         self.assertEqual(out["inputs"]["query_log"]["corrupt_lines"], 2)
         self.assertEqual(out["inputs"]["query_log"]["records_in_window"], 1)
         self.assert_problem(out, "query log has 2 corrupt line(s)")
+
+    def test_query_records_without_a_usable_ts_are_counted(self):
+        # SA26-17: a query record that cannot be placed in time is reported, not dropped.
+        with self.log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"kind": "query", "question": "a", "duration_ms": 5}) + "\n")
+            fh.write(json.dumps({"ts": "not-a-date", "kind": "query", "question": "b"}) + "\n")
+            fh.write(json.dumps({"kind": "refresh"}) + "\n")      # not a query: not counted
+        out = self.run_funnel()
+        q = out["inputs"]["query_log"]
+        self.assertEqual((q["records_in_window"], q["undated_records"]), (0, 2))
+        self.assert_problem(out, "query log has 2 query record(s) without a usable ts")
+
+    def test_undecodable_lines_are_counted_as_corrupt(self):
+        # SA26-18: invalid UTF-8 is a corrupt line in the log and in a transcript.
+        at = T0.isoformat().encode()
+        with self.log.open("ab") as fh:
+            fh.write(b'{"ts": "' + at + b'", "kind": "query", "question": "\xff\xfe"}\n')
+        path = Transcript(self.repo).greps(1).write(self.projects, "p", "s-bytes")
+        with path.open("ab") as fh:
+            fh.write(b'{"timestamp": "' + at + b'", "cwd": "\xff\xfe"}\n')
+        out = self.run_funnel()
+        q = out["inputs"]["query_log"]
+        self.assertEqual((q["records_in_window"], q["corrupt_lines"]), (0, 1))
+        self.assertEqual(out["inputs"]["transcript_corrupt_lines"], 1)
+        self.assert_problem(out, "query log has 1 corrupt line(s)")
+        self.assert_problem(out, "1 corrupt transcript line(s)")
 
     def test_missing_projects_folder(self):
         out = self.run_funnel()

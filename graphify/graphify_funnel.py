@@ -98,8 +98,9 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
     A regex would pair one line's closing quote with the next line's opening quote and blank
     the real command between them, so quotes are paired by walking the string: `escape`
     (backslash for a POSIX shell, backtick for PowerShell) escapes the next character inside
-    "..." and outside quotes, and a `#` comment runs to end of
-    line, so an apostrophe in it opens nothing. An unclosed quote leaves the rest as is.
+    "..." and outside quotes, and a `#` comment runs to end of line and is blanked, so an
+    apostrophe in it opens nothing and a command named in it is no invocation or lookup.
+    An unclosed quote leaves the rest as is.
     """
     out: list[str] = []
     i, n = 0, len(command)
@@ -108,7 +109,7 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
         if ch == "#" and (i == 0 or command[i - 1] in " \t\n;"):
             end = command.find("\n", i)
             end = n if end < 0 else end
-            out.append(command[i:end])
+            out.append(" " * (end - i))
             i = end
         elif ch == escape and i + 1 < n:
             out.append(command[i:i + 2])
@@ -325,6 +326,7 @@ class QueryLog:
     records: list[dict] = field(default_factory=list)
     corrupt_lines: int = 0
     error: str | None = None
+    undated_records: int = 0     # query records whose ts is missing or unparseable
 
 
 @dataclass
@@ -371,15 +373,16 @@ def norm_path(p: str) -> str:
 
 
 def iter_json_lines(path: Path, stats: ReadStats) -> Iterable[dict]:
-    """Yield the JSON objects in a JSONL file; corrupt lines and read errors go to `stats`."""
+    """Yield the JSON objects in a JSONL file. Corrupt lines (invalid UTF-8, invalid JSON, or
+    not an object) and read errors go to `stats`."""
     try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if not line.strip():
+        with path.open("rb") as fh:
+            for raw in fh:
+                if not raw.strip():
                     continue
                 try:
-                    rec = json.loads(line)
-                except ValueError:
+                    rec = json.loads(raw.decode("utf-8"))
+                except ValueError:       # UnicodeDecodeError is a ValueError
                     stats.corrupt_lines += 1
                     continue
                 if isinstance(rec, dict):
@@ -810,14 +813,18 @@ def load_log(path: Path | None, since: datetime, until: datetime) -> QueryLog:
     if not path.is_file():
         return QueryLog(path, "not-a-file")
     stats = ReadStats()
-    recs = []
+    recs, undated = [], 0
     for r in iter_json_lines(path, stats):
+        if r.get("kind") != "query":
+            continue
         ts = parse_ts(r.get("ts"))
-        if r.get("kind") == "query" and ts and since - MATCH_SLACK <= ts <= until + MATCH_SLACK:
+        if ts is None:
+            undated += 1          # cannot be placed in any window: reported, never dropped silently
+        elif since - MATCH_SLACK <= ts <= until + MATCH_SLACK:
             r["_ts"] = ts
             recs.append(r)
     return QueryLog(path, "unreadable" if stats.error else "ok", recs,
-                    stats.corrupt_lines, stats.error)
+                    stats.corrupt_lines, stats.error, undated)
 
 
 def finite_duration(value: Any) -> float | None:
@@ -1063,6 +1070,8 @@ def input_problems(inputs: dict) -> list[str]:
                    + ": execution and measurement have no complete log evidence")
     if q["corrupt_lines"]:
         out.append(f"query log has {q['corrupt_lines']} corrupt line(s), skipped")
+    if q["undated_records"]:
+        out.append(f"query log has {q['undated_records']} query record(s) without a usable ts, skipped")
     if inputs["projects_dir_missing"]:
         out.append("transcript projects folder missing: no sessions could be read")
     for key, text in (("transcripts_unstatable", "transcript(s) could not be stat'ed"),
@@ -1256,6 +1265,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     inputs = {
         "query_log": {"path": str(log.path) if log.path else None, "status": log.status,
                       "error": log.error, "corrupt_lines": log.corrupt_lines,
+                      "undated_records": log.undated_records,
                       "records_in_window": len(records)},
         "projects_dir_missing": scan.projects_missing,
         "transcripts_unstatable": scan.unstatable,
