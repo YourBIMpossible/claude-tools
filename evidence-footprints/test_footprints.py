@@ -519,6 +519,46 @@ def test_nav_destination() -> None:
           "a redirect before the argument is not the destination")
 
 
+def test_powershell_scope_and_conditional_nav() -> None:
+    """SA26-20: a PowerShell ``$( ... )`` or ``( ... )`` runs in the current scope, so its Set-Location carries on;
+    a Bash one is still a subshell. SA26-21: the pipeline after ``||`` runs only when the one before it failed, so
+    it starts in the directory that one started in, and its own cd leaves the success path alone; a Bash pipeline
+    stage is a subshell, and a PowerShell nav inside a pipeline leaves later relative paths unresolved."""
+    def fp(cmd: str, tool: str = "Bash") -> fpm.Footprint:
+        c = call(1, tool, {"command": cmd})
+        c["cwd"] = WT
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def later(cmd: str, tool: str = "Bash") -> tuple[list[str], int]:
+        f = fp(cmd, tool)
+        return [t[1] for t in f.touches], f.unresolved
+
+    ps = "PowerShell"
+    check(later("$(Set-Location src); Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell $(Set-Location): the location change carries on")
+    check(later("(Set-Location src); Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell (Set-Location): the location change carries on")
+    check(later("echo $(cd src); cat a.py") == (["a.py"], 0), "Bash $(cd): still a subshell")
+    check(later("(cd src); cat a.py") == (["a.py"], 0), "Bash (cd): still a subshell")
+    check(sp.parse_command("(cd src)")[0][0].scope != () and sp.parse_command("(cd src)", shell="bash")[0][0].scope != ()
+          and sp.parse_command("(Set-Location src)", shell="powershell")[0][0].scope == (),
+          "parse_command defaults to Bash scoping; shell='powershell' keeps a group in the current scope")
+    check(later("cd src || cat a.py") == (["a.py"], 0), "cd X || cmd: cmd runs only if the cd failed")
+    check(later("Set-Location src || Get-Content a.py", ps) == (["a.py"], 0), "PowerShell ||: the same")
+    check(later("cd src || exit 1; cat a.py") == (["src/a.py"], 0), "cd X || exit; later segments are in X")
+    check(later("cd a || cd b || cat y.py") == (["y.py"], 0), "a chain of || starts where the first cd started")
+    check(later("cat x.py || cd src; cat a.py") == (["x.py", "a.py"], 0),
+          "a cd that runs only on failure does not move the success path")
+    check(later("cd src && cat a.py || cat b.py") == (["src/a.py", "src/b.py"], 0),
+          "after cd && cmd, the || branch starts where cmd started")
+    check(later("cd src || cat $(echo a.py) b.py") == (["b.py"], 0),
+          "a substitution inside the || branch belongs to the branch")
+    check(later("cd src | cat a.py") == (["a.py"], 0), "Bash cd X | cmd: the cd ends with its pipeline stage")
+    check(later("cd src | cat; cat a.py") == (["a.py"], 0), "Bash: a piped cd does not move later segments")
+    check(later("Set-Location src | Get-Content a.py", ps) == ([], 1),
+          "PowerShell: a piped Set-Location leaves later relative paths unresolved")
+
+
 def main() -> int:
     test_shell_paths()
     test_powershell_assignment_and_foreach()
@@ -529,6 +569,7 @@ def main() -> int:
     test_git_bash_drive_paths()
     test_block_and_subshell_cwd_scope()
     test_nav_destination()
+    test_powershell_scope_and_conditional_nav()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")

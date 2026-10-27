@@ -306,18 +306,23 @@ class Footprint:
             if isinstance(inp.get("path"), str):
                 self._touch(idx, inp["path"], "search", native=True)
         elif name in SHELL_TOOLS and isinstance(inp.get("command"), str):
-            segments, script = sp.parse_command(inp["command"])
+            segments, script = sp.parse_command(inp["command"], shell="powershell" if name == "PowerShell" else "bash")
             wd: str | None = call.get("cwd")
             scope: tuple[int, ...] = ()
             entered: list[tuple[tuple[int, ...], str | None]] = []  # (enclosing scope, its cwd)
+            branch_start: dict[int, str | None] = {}  # branch id -> the directory it starts in
             for seg in segments:
-                # A subshell starts in the directory in effect where it stands; its own cd
-                # ends with it, so the enclosing segments resume in their directory.
+                # A subshell starts in the directory in effect where it stands, a branch (after
+                # ||) where the pipeline before it started; a cd inside either ends with it, so
+                # the enclosing segments resume in their directory.
                 while scope and seg.scope[:len(scope)] != scope:
                     scope, wd = entered.pop()
                 if seg.scope != scope:
                     entered.append((scope, wd))
+                    wd = next((branch_start[i] for i in reversed(seg.scope[len(scope):]) if i in branch_start), wd)
                     scope = seg.scope
+                for branch in seg.opens:
+                    branch_start[branch] = wd
                 self.shell_segments += 1
                 if seg.has_pathlike or seg.kind == "miss":
                     self.shell_pathlike += 1
@@ -342,7 +347,10 @@ class Footprint:
                     # destination is the nav argument itself, not a redirect listed before it.
                     dest = (next((u.path for u in seg.paths if u.role == "nav"), None)
                             if seg.verb not in {"popd", "pop-location"} else None)
-                    wd = UNRESOLVED if dest is None or dest == "-" else _join_dir(dest, wd if wd is not None else UNRESOLVED)
+                    # A piped nav ends with its stage in Bash (a subshell scope); in PowerShell its
+                    # timing against the other stages is unknown.
+                    wd = (UNRESOLVED if dest is None or dest == "-" or seg.piped
+                          else _join_dir(dest, wd if wd is not None else UNRESOLVED))
             for use in script:
                 self._touch(idx, use.path, "script", native=False)
 

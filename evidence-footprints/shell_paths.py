@@ -15,9 +15,11 @@ and classifies it by its verb:
   comment  a ``#`` line
 
 Command substitutions (``$(...)``, a leading ``(...)``) are parsed as commands
-of their own. Heredoc and here-string bodies are dropped from segmentation;
-quoted literals in them that look like paths are reported with role ``script``.
-Redirect targets are reported with role ``write`` (``>``) or ``read`` (``<``).
+of their own: a subshell in Bash, the current scope in PowerShell
+(``parse_command(text, shell="powershell")``). Heredoc and here-string bodies
+are dropped from segmentation; quoted literals in them that look like paths
+are reported with role ``script``. Redirect targets are reported with role
+``write`` (``>``) or ``read`` (``<``).
 
 A segment with a path-like token and an unknown verb, or a segment that fails
 to tokenize, is a *miss*: its paths cannot be attributed to a role. Misses are
@@ -30,6 +32,9 @@ import itertools
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import Literal
+
+Shell = Literal["bash", "powershell"]
 
 READ = {
     "cat", "type", "get-content", "gc", "head", "tail", "less", "more", "wc", "sed", "awk",
@@ -186,9 +191,15 @@ class Segment:
     queries: list[str] = field(default_factory=list)
     miss_reason: str | None = None
     has_pathlike: bool = False
-    # Subshells enclosing the segment, outermost first, each a unique id within the command
-    # (``( ... )`` and ``$( ... )``). A cd inside one does not move segments outside it.
+    # Scopes enclosing the segment, outermost first, each a unique id within the command: Bash
+    # subshells (``( ... )``, ``$( ... )``, a stage of a multi-stage pipeline) and branches (the
+    # pipeline after ``||``). A cd inside one does not move segments outside it.
     scope: tuple[int, ...] = ()
+    # Branch ids whose segments start in the directory in effect where this segment starts
+    # (set on the first segment of the pipeline before ``||``).
+    opens: tuple[int, ...] = ()
+    # Part of a pipeline of two or more stages.
+    piped: bool = False
 
 
 def _is_absolute(p: str) -> bool:
@@ -345,11 +356,24 @@ def extract_blocks(text: str) -> tuple[str, list[str], bool]:
     return "".join(out), inner, True
 
 
-def split_segments(text: str) -> tuple[list[str], bool]:
-    """Split on unquoted separators. Returns (segments, quotes balanced)."""
-    segs: list[str] = []
+def split_segments(text: str) -> tuple[list[tuple[str, str]], bool]:
+    """Split on unquoted separators. Returns ((separator before, segment) pairs, quotes balanced).
+
+    The separator is ``""`` for the first segment, else ``;``, a newline, ``&``, ``&&``, ``||``
+    or ``|``. An operator followed by a newline keeps the operator."""
+    segs: list[tuple[str, str]] = []
     buf: list[str] = []
+    sep = ""
     balanced = True
+
+    def flush(nxt_sep: str) -> None:
+        nonlocal sep
+        seg = "".join(buf).strip()
+        if seg:
+            segs.append((sep, seg))
+            sep = nxt_sep
+        elif sep not in {"&&", "||", "|"}:
+            sep = nxt_sep
     events = list(_scan(text))
     k = 0
     while k < len(events):
@@ -369,15 +393,16 @@ def split_segments(text: str) -> tuple[list[str], bool]:
             elif ch == "&" and not "".join(buf).strip() and nxt != "&":
                 buf.append(ch)  # PowerShell call operator
             else:
-                segs.append("".join(buf))
-                buf = []
-                if nxt == ch and ch in "|&":
+                doubled = nxt == ch and ch in "|&"
+                flush(ch * 2 if doubled else ch)
+                buf.clear()
+                if doubled:
                     k += 1
         else:
             buf.append(ch)
         k += 1
-    segs.append("".join(buf))
-    return [s.strip() for s in segs if s.strip()], balanced
+    flush("")
+    return segs, balanced
 
 
 def tokenize(seg: str) -> list[str] | None:
@@ -711,14 +736,17 @@ PLACEHOLDER_RE = re.compile(re.escape(SUB) + "|" + re.escape(BLOCK))
 
 
 def _parse_chunk(chunk: str, scope: tuple[int, ...], out: list[Segment], ids: Iterator[int],
-                 inherited_subs: list[str] | None = None) -> None:
+                 inherited_subs: list[str] | None = None, shell: Shell = "bash") -> None:
     """Append the chunk's segments to out in execution order.
 
     A substitution or block runs where it stands: its segments come before the segment that
     contains it, so each resolves against the working directory in effect at that position.
-    A substitution is a subshell (a scope of its own); a ``{ ... }`` block runs in the
-    current shell. ``inherited_subs`` are the substitutions already extracted from an
-    enclosing chunk whose placeholders sit inside this block."""
+    In Bash a substitution or group is a subshell (a scope of its own), and so is each stage
+    of a multi-stage pipeline; in PowerShell ``$( ... )`` and ``( ... )`` run in the current
+    scope. A ``{ ... }`` block runs in the current shell. The pipeline after ``||`` runs only
+    when the one before it failed: it is a branch scope that starts where that one started.
+    ``inherited_subs`` are the substitutions already extracted from an enclosing chunk whose
+    placeholders sit inside this block."""
     flat, subs = extract_subs(chunk)
     if inherited_subs:
         subs = inherited_subs  # the enclosing chunk already extracted every balanced group
@@ -726,42 +754,52 @@ def _parse_chunk(chunk: str, scope: tuple[int, ...], out: list[Segment], ids: It
     if not blocks_ok:
         out.append(Segment(flat, None, "miss", miss_reason="unbalanced_block", has_pathlike=True, scope=scope))
     segs, balanced = split_segments(flat)
-    parsed = [parse_segment(s) for s in segs]
+    parsed = [parse_segment(s) for _, s in segs]
     if not balanced and parsed and parsed[-1].kind != "miss":
         last = parsed[-1]
         parsed[-1] = Segment(last.text, last.verb, "miss", last.paths, last.queries,
                              "unbalanced_command", True)
     sub_q, block_q = list(subs), list(blocks)
 
-    def run_sub(inner: str) -> None:
-        _parse_chunk(inner, scope + (next(ids),), out, ids)
+    def run_sub(inner: str, at: tuple[int, ...]) -> None:
+        _parse_chunk(inner, at + (next(ids),) if shell == "bash" else at, out, ids, shell=shell)
 
-    def run_block(inner: str) -> None:
+    def run_block(inner: str, at: tuple[int, ...]) -> None:
         k = inner.count(SUB)
         own, sub_q[:] = sub_q[:k], sub_q[k:]
-        _parse_chunk(inner, scope, out, ids, own)
+        _parse_chunk(inner, at, out, ids, own, shell)
 
-    for text, seg in zip(segs, parsed):
+    pipe_first: int | None = None  # index in out of the current pipeline's first segment
+    pipe_scope = scope
+    for k, ((sep, text), seg) in enumerate(zip(segs, parsed)):
+        if sep != "|":  # a new pipeline
+            prev_first, pipe_first, pipe_scope = pipe_first, len(out), scope
+            if sep == "||" and prev_first is not None:
+                branch = next(ids)
+                out[prev_first].opens += (branch,)
+                pipe_scope = scope + (branch,)
+        seg.piped = sep == "|" or (k + 1 < len(segs) and segs[k + 1][0] == "|")
+        at = pipe_scope + (next(ids),) if seg.piped and shell == "bash" else pipe_scope
         for m in PLACEHOLDER_RE.finditer(text):
             if m.group(0) == SUB and sub_q:
-                run_sub(sub_q.pop(0))
+                run_sub(sub_q.pop(0), at)
             elif m.group(0) == BLOCK and block_q:
-                run_block(block_q.pop(0))
-        seg.scope = scope
+                run_block(block_q.pop(0), at)
+        seg.scope = at
         out.append(seg)
     # Placeholders the segment split did not carry (none expected): parsed after, as before.
     while block_q:
-        run_block(block_q.pop(0))
+        run_block(block_q.pop(0), scope)
     while sub_q:
-        run_sub(sub_q.pop(0))
+        run_sub(sub_q.pop(0), scope)
 
 
-def parse_command(text: str) -> tuple[list[Segment], list[PathUse]]:
+def parse_command(text: str, shell: Shell = "bash") -> tuple[list[Segment], list[PathUse]]:
     """Segments of a shell command (substitutions included) in execution order, plus
-    heredoc/here-string literals."""
+    heredoc/here-string literals. ``shell`` sets the scoping rules ("bash" or "powershell")."""
     body_free, bodies = strip_bodies(text)
     out: list[Segment] = []
-    _parse_chunk(body_free, (), out, itertools.count(1))
+    _parse_chunk(body_free, (), out, itertools.count(1), shell=shell)
     script = [PathUse(lit, "script", "heredoc") for line in bodies
               for _, lit in LITERAL_RE.findall(line) if is_pathlike(lit)]
     return out, script
