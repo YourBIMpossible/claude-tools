@@ -40,7 +40,7 @@ relative `cd` (a `..` above the filesystem root is unresolved), a `cd` inside `(
 with that subshell, one inside a `{ ...; }` group carries on. In PowerShell `$( ... )` and `( ... )` run in the
 current scope, so their `Set-Location` carries on. The pipeline after `||` starts where the one before it started
 (`cd src || cat a.py` reads `a.py`) and its own `cd` ends with it; a `cd` in a Bash pipeline stage ends with that
-stage, and one in a PowerShell pipeline leaves later relative paths unresolved. Two paths match when equal or when one ends with `/` plus the other, so
+stage, and one in a PowerShell pipeline leaves the rest of that pipeline unresolved and takes effect when it ends. Two paths match when equal or when one ends with `/` plus the other, so
 a path relative to a subdirectory matches its repo-relative form.
 
 When the brief's repository lives on a drive, the Git Bash, WSL and Cygwin spellings of a drive path (a single

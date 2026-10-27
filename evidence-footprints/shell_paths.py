@@ -198,8 +198,11 @@ class Segment:
     # Branch ids whose segments start in the directory in effect where this segment starts
     # (set on the first segment of the pipeline before ``||``).
     opens: tuple[int, ...] = ()
-    # Part of a pipeline of two or more stages.
-    piped: bool = False
+    # Id of the pipeline of two or more stages the segment is a stage of (None outside one).
+    pipeline: int | None = None
+    # Pipelines (ids) that have ended where this segment starts, so a location change made in one
+    # has taken effect (set on the first segment of the next pipeline outside a ``||`` branch).
+    ends: tuple[int, ...] = ()
     # Where a nav segment moves the working directory: its own argument, kept apart from
     # ``paths`` because '.' and '..' are not file arguments and a redirect is not the destination.
     nav_dest: str | None = None
@@ -775,15 +778,21 @@ def _parse_chunk(chunk: str, scope: tuple[int, ...], out: list[Segment], ids: It
 
     pipe_first: int | None = None  # index in out of the current pipeline's first segment
     pipe_scope = scope
+    pipeline: int | None = None  # id of the current pipeline when it has two or more stages
+    ended: tuple[int, ...] = ()  # pipelines outside a branch that ended since the last mark
     for k, ((sep, text), seg) in enumerate(zip(segs, parsed)):
-        if sep != "|":  # a new pipeline
+        mark = sep != "|"
+        if mark:  # a new pipeline
+            if pipeline is not None and pipe_scope == scope:
+                ended += (pipeline,)
             prev_first, pipe_first, pipe_scope = pipe_first, len(out), scope
             if sep == "||" and prev_first is not None:
                 branch = next(ids)
                 out[prev_first].opens += (branch,)
                 pipe_scope = scope + (branch,)
-        seg.piped = sep == "|" or (k + 1 < len(segs) and segs[k + 1][0] == "|")
-        at = pipe_scope + (next(ids),) if seg.piped and shell == "bash" else pipe_scope
+            pipeline = next(ids) if k + 1 < len(segs) and segs[k + 1][0] == "|" else None
+        seg.pipeline = pipeline
+        at = pipe_scope + (next(ids),) if pipeline is not None and shell == "bash" else pipe_scope
         for m in PLACEHOLDER_RE.finditer(text):
             if m.group(0) == SUB and sub_q:
                 run_sub(sub_q.pop(0), at)
@@ -791,6 +800,9 @@ def _parse_chunk(chunk: str, scope: tuple[int, ...], out: list[Segment], ids: It
                 run_block(block_q.pop(0), at)
         seg.scope = at
         out.append(seg)
+        if mark and ended and pipe_scope == scope:
+            out[pipe_first].ends += ended
+            ended = ()
     # Placeholders the segment split did not carry (none expected): parsed after, as before.
     while block_q:
         run_block(block_q.pop(0), scope)

@@ -528,7 +528,8 @@ def test_powershell_scope_and_conditional_nav() -> None:
     """SA26-20: a PowerShell ``$( ... )`` or ``( ... )`` runs in the current scope, so its Set-Location carries on;
     a Bash one is still a subshell. SA26-21: the pipeline after ``||`` runs only when the one before it failed, so
     it starts in the directory that one started in, and its own cd leaves the success path alone; a Bash pipeline
-    stage is a subshell, and a PowerShell nav inside a pipeline leaves later relative paths unresolved."""
+    stage is a subshell, and a PowerShell nav inside a pipeline leaves the rest of that pipeline unresolved and takes
+    effect when it ends."""
     def fp(cmd: str, tool: str = "Bash") -> fpm.Footprint:
         c = call(1, tool, {"command": cmd})
         c["cwd"] = WT
@@ -562,6 +563,20 @@ def test_powershell_scope_and_conditional_nav() -> None:
     check(later("cd src | cat; cat a.py") == (["a.py"], 0), "Bash: a piped cd does not move later segments")
     check(later("Set-Location src | Get-Content a.py", ps) == ([], 1),
           "PowerShell: a piped Set-Location leaves later relative paths unresolved")
+    check(later("Set-Location src | Out-Null; Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell: once the pipeline ends, its Set-Location has taken effect")
+    check(later("Push-Location src | Out-Null; Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell: the same for Push-Location")
+    check(later("Set-Location src | Out-Null && Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell: && also starts after the pipeline ends")
+    check(later("Set-Location src | Out-Null | Get-Content a.py; Get-Content b.py", ps) == (["src/b.py"], 1),
+          "PowerShell: unresolved for the rest of the pipeline, then the new location")
+    check(later("Set-Location src | Out-Null || Get-Content x.py; Get-Content a.py", ps) == (["x.py", "src/a.py"], 0),
+          "PowerShell: the || branch starts where the pipeline started; after it the location has changed")
+    check(later("x | y || Set-Location src | Out-Null; Get-Content a.py", ps) == (["a.py"], 0),
+          "PowerShell: a piped Set-Location in a || branch does not move the success path")
+    check(later("Set-Location src | Write-Output $(Get-Content a.py)", ps) == ([], 1),
+          "PowerShell: a substitution in a later stage is still inside the pipeline")
 
 
 def main() -> int:

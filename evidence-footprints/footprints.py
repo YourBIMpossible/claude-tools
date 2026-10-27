@@ -311,6 +311,7 @@ class Footprint:
             scope: tuple[int, ...] = ()
             entered: list[tuple[tuple[int, ...], str | None]] = []  # (enclosing scope, its cwd)
             branch_start: dict[int, str | None] = {}  # branch id -> the directory it starts in
+            pipe_dest: dict[int, str] = {}  # PowerShell pipeline id -> the directory it leaves
             for seg in segments:
                 # A subshell starts in the directory in effect where it stands, a branch (after
                 # ||) where the pipeline before it started; a cd inside either ends with it, so
@@ -321,6 +322,9 @@ class Footprint:
                     entered.append((scope, wd))
                     wd = next((branch_start[i] for i in reversed(seg.scope[len(scope):]) if i in branch_start), wd)
                     scope = seg.scope
+                for pipe in seg.ends:
+                    if pipe in pipe_dest:
+                        wd = pipe_dest.pop(pipe)
                 for branch in seg.opens:
                     branch_start[branch] = wd
                 self.shell_segments += 1
@@ -346,10 +350,16 @@ class Footprint:
                     # (cd -, popd, a variable) leaves later relative paths unattributed. The
                     # destination is the nav argument itself, not a redirect listed before it.
                     dest = seg.nav_dest if seg.verb not in {"popd", "pop-location"} else None
-                    # A piped nav ends with its stage in Bash (a subshell scope); in PowerShell its
-                    # timing against the other stages is unknown.
-                    wd = (UNRESOLVED if dest is None or dest == "-" or seg.piped
-                          else _join_dir(dest, wd if wd is not None else UNRESOLVED))
+                    new = (UNRESOLVED if dest is None or dest == "-"
+                           else _join_dir(dest, wd if wd is not None else UNRESOLVED))
+                    if seg.pipeline is not None:
+                        # A piped nav ends with its stage in Bash (a subshell scope). In PowerShell
+                        # its timing against the other stages is unknown, but it has taken effect
+                        # once the pipeline ends.
+                        if name == "PowerShell":
+                            pipe_dest[seg.pipeline] = new
+                        new = UNRESOLVED
+                    wd = new
             for use in script:
                 self._touch(idx, use.path, "script", native=False)
 
