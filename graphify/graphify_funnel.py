@@ -85,9 +85,17 @@ _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
 
 
 _QUOTED_SEPARATORS = str.maketrans(";&|()", "     ")
+# The end of a line that passes the next quoted argument to a shell as its script.
+_SHELL_SCRIPT_ARG_RE = re.compile(
+    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+-\w+)*\s+-\w*c\w*"
+    r"|(?P<ps>pwsh|powershell)(?:\.exe)?[\"']?(?:\s+[^\s\"']+)*?\s+-c(?:ommand)?"
+    r"|(?P<cmd>cmd)(?:\.exe)?[\"']?\s+/[ck])\s*$", re.I)
+_SHELLS = {"bash": "Bash", "sh": "Bash", "zsh": "Bash", "dash": "Bash", "cmd": "Bash",
+           "pwsh": "PowerShell", "powershell": "PowerShell"}
 
 
-def _blank_quoted_code(command: str, escape: str = "\\") -> str:
+def _blank_quoted_code(command: str, escape: str = "\\",
+                       scripts: list[tuple[str, str]] | None = None) -> str:
     """Replace each quoted string that spans a newline with "", and blank shell separators
     (;&|()) inside single-line quoted strings, so a search pattern such as a\\|graphify query
     in quotes gives `graphify` no command position. A double-quoted string containing $( keeps
@@ -123,6 +131,11 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
                 break
             span = command[i:j + 1]
             if "\n" in span:
+                if scripts is not None:
+                    head = "".join(out)
+                    m = _SHELL_SCRIPT_ARG_RE.search(head[head.rfind("\n") + 1:])
+                    if m:
+                        scripts.append((span[1:-1], "PowerShell" if m.group("ps") else "Bash"))
                 span = '""'
             elif not (ch == '"' and "$(" in span):
                 span = span.translate(_QUOTED_SEPARATORS)
@@ -140,6 +153,32 @@ def code_part(command: str, tool: str = "Bash") -> str:
     command = _HEREDOC_RE.sub("<<HEREDOC", command)
     command = _HERESTRING_RE.sub("@''@", command)
     return _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\")
+
+
+def shell_script_parts(command: str, tool: str = "Bash") -> list[str]:
+    """The code_part of each script the command hands to a shell, which code_part blanks: a
+    heredoc whose command is a shell (`bash <<'EOF'`), and a multi-line quoted argument of
+    `bash -c`, `pwsh -Command` or `cmd /c`. A heredoc fed to anything else (`cat > f`, a
+    commit message) is data and is not returned. Nested scripts are included."""
+    scripts: list[tuple[str, str]] = []
+
+    def heredoc(m: re.Match) -> str:
+        line = m.string[:m.start()]
+        words = re.split(r"[;&|(]", line[line.rfind("\n") + 1:])[-1].split()
+        name = re.split(r"[\\/]", words[0].strip("\"'"))[-1].lower() if words else ""
+        shell = _SHELLS.get(name.removesuffix(".exe"))
+        if shell:
+            body = m.group(0)
+            scripts.append((body[body.find("\n") + 1:body.rfind("\n")], shell))
+        return "<<HEREDOC"
+
+    command = _HEREDOC_RE.sub(heredoc, command)
+    command = _HERESTRING_RE.sub("@''@", command)
+    _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\", scripts)
+    parts: list[str] = []
+    for body, shell in scripts:
+        parts += [code_part(body, shell), *shell_script_parts(body, shell)]
+    return parts
 
 
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use
@@ -627,7 +666,8 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
             pending[call.tool_use_id] = call
         else:
             lk = shell_lookups(cmd, name, cwd)
-            searched = bool(SHELL_SEARCH_RE.search(code)) or lk.searched
+            searched = (any(SHELL_SEARCH_RE.search(part) for part in [code, *shell_script_parts(cmd, name)])
+                        or lk.searched)
             if searched or lk.read:          # paths only come with a search or a read
                 unit.lookups.append(Lookup(tool_id, searched, frozenset(lk.read_paths),
                                            frozenset(lk.search_paths)))

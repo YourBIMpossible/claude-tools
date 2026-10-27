@@ -280,6 +280,27 @@ class ShellLookups(FunnelCase):
         unit = gf.load_session(path).units["main"]
         self.assertEqual((unit.searches, unit.reads), (0, 1))
 
+    def unit_of(self, tool: str, cmd: str) -> gf.Unit:
+        path = Transcript(self.repo).tool(tool, {"command": cmd}).write(self.projects, "p", "s-one")
+        return gf.load_session(path).units["main"]
+
+    def test_a_search_in_a_script_fed_to_a_shell_is_counted(self):
+        # SA26-16: blanking heredocs and multi-line quotes must not hide a script a shell runs.
+        for tool, cmd in (("Bash", 'bash -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", "bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "sh <<'EOF'\nrg foo src\nEOF"),
+                          ("PowerShell", 'pwsh -NoProfile -Command "\n Select-String -Pattern foo -Path src\\a.py\n"')):
+            with self.subTest(cmd=cmd):
+                unit = self.unit_of(tool, cmd)
+                self.assertEqual((unit.searches, unit.reads), (1, 0))
+
+    def test_a_heredoc_that_is_data_is_not_a_search(self):
+        for cmd in ("git commit -m \"$(cat <<'EOF'\nfix: stop the grep fallback\nEOF\n)\"",
+                    "cat > notes.md <<'EOF'\nuse rg here\nEOF",
+                    "bash <<'EOF'\necho done  # grep later\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.unit_of("Bash", cmd).searches, 0)
+
     def test_unknown_commands_and_urls_contribute_nothing(self):
         lk = self.lookups("python build.py && curl https://x/a.py && echo backend/a.py")
         self.assertEqual((lk.searched, lk.read, lk.search_paths, lk.read_paths),
