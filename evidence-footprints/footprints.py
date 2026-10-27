@@ -338,8 +338,10 @@ class Footprint:
                     self._touch(idx, target, use.role, edit=edit, native=False)
                 if seg.kind == "nav":
                     # Later segments run in the new directory; one this parser cannot evaluate
-                    # (cd -, popd, a variable) leaves later relative paths unattributed.
-                    dest = seg.paths[0].path if seg.paths and seg.verb not in {"popd", "pop-location"} else None
+                    # (cd -, popd, a variable) leaves later relative paths unattributed. The
+                    # destination is the nav argument itself, not a redirect listed before it.
+                    dest = (next((u.path for u in seg.paths if u.role == "nav"), None)
+                            if seg.verb not in {"popd", "pop-location"} else None)
                     wd = UNRESOLVED if dest is None or dest == "-" else _join_dir(dest, wd if wd is not None else UNRESOLVED)
             for use in script:
                 self._touch(idx, use.path, "script", native=False)

@@ -486,6 +486,39 @@ def test_git_bash_drive_paths() -> None:
     check(counts(fp(f"cat {drv.lower()}/repo/src/a.py")) == inside, "lowercase drive form is unchanged")
 
 
+def test_nav_destination() -> None:
+    """SA26-7: ``cd ..`` and ``cd .`` move the cwd like any other relative cd, and a '..' that climbs above the
+    filesystem root stays unresolved. SA26-19: the nav destination is the cd's own argument, never a redirect
+    target that the parser lists first."""
+    def fp(cmd: str, cwd: str | None = WT, tool: str = "Bash") -> fpm.Footprint:
+        c = call(1, tool, {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def later(f: fpm.Footprint) -> tuple[list[str], int]:
+        return [t[1] for t in f.touches], f.unresolved
+
+    check(later(fp("cd src && cd .. && cat a.py")) == (["a.py"], 0), "cd src && cd ..: back in the starting directory")
+    check(later(fp("cd . && cat a.py")) == (["a.py"], 0), "cd .: the directory is unchanged")
+    check(later(fp("cd .. && cat a.py", WT + "/src")) == (["a.py"], 0), "cd .. from a subdirectory cwd")
+    check(later(fp("cd src; Set-Location ..; Get-Content a.py", tool="PowerShell")) == (["a.py"], 0),
+          "Set-Location .. is the parent, as cd .. is")
+    check(fp("cd src && cd .. && cat a.py").outside == fp(f"cd {WT} && cat a.py").outside,
+          "cd .. back to the root counts its argument exactly like cd <root>")
+    f = fp("cd .. && cat a.py", None)
+    check((f.touches, f.outside) == ([], 0), "cd .. with no recorded cwd: nothing touched, nothing outside")
+    f = fp("cd ../../../../../../../.. && cat a.py")
+    check((f.touches, f.outside) == ([], 0) and f.unresolved == 2,
+          "cd .. past the filesystem root: the argument and later relative paths are unresolved, not outside")
+    check(later(fp("cd src > out.log && cat a.py")) == (["out.log", "src/a.py"], 0),
+          "cd src > out.log: the redirect is a write, the destination is src")
+    check(later(fp("cd src 2> err.log && cat a.py")) == (["err.log", "src/a.py"], 0),
+          "cd src 2> err.log: a stderr redirect is not the destination")
+    check(later(fp("cd > out.log src && cat a.py")) == (["out.log", "src/a.py"], 0),
+          "a redirect before the argument is not the destination")
+
+
 def main() -> int:
     test_shell_paths()
     test_powershell_assignment_and_foreach()
@@ -495,6 +528,7 @@ def main() -> int:
     test_env_home_and_parent_segments()
     test_git_bash_drive_paths()
     test_block_and_subshell_cwd_scope()
+    test_nav_destination()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")

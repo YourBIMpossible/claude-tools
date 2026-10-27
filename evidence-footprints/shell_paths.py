@@ -678,7 +678,12 @@ def parse_segment(seg: str) -> Segment:
         add([a for a in pos if is_pathlike(a)], "exec")
     elif verb in NAV:
         s.kind = "nav"
-        add(pos[:1], "nav")
+        if pos[:1] and pos[0].strip() in {".", ".."}:
+            # The directory in effect and its parent, as for git -C: kept, although _clean_arg
+            # drops them as file arguments.
+            s.paths.append(PathUse(pos[0].strip(), "nav", verb))
+        else:
+            add(pos[:1], "nav")
     elif verb in NONFILE:
         s.kind = "nonfile"
     elif s.has_pathlike:
