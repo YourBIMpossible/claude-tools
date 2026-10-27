@@ -27,7 +27,23 @@ FAILED: list[str] = []
 
 
 def _spawn(*args: object) -> subprocess.Popen:
-    return subprocess.Popen(WORKER + [str(a) for a in args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    return subprocess.Popen(WORKER + [str(a) for a in args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            start_new_session=os.name != "nt")
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a worker and every process it started, then reap it: under a launcher
+    interpreter (a venv's ``python.exe`` on Windows) the real holder is the worker's child."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, check=False)
+    else:
+        try:
+            os.killpg(proc.pid, 9)
+        except ProcessLookupError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
 
 
 def _wait_for(path: Path, timeout_s: float = 60.0) -> None:
@@ -58,8 +74,7 @@ def test_live_holder_is_never_stolen(root: Path) -> None:
         assert not pipeline._wait_lock(lock, 0.5), "a live holder's lock was taken while waiting"
         assert holder.poll() is None
     finally:
-        holder.kill()
-        holder.wait()
+        _kill_tree(holder)
 
 
 def test_dead_holder_lock_is_free_at_once(root: Path) -> None:
@@ -67,8 +82,7 @@ def test_dead_holder_lock_is_free_at_once(root: Path) -> None:
     lock, ready = root / "locks" / "ep.lock", root / "ready"
     holder = _spawn("hold", lock, ready)
     _wait_for(ready)
-    holder.kill()
-    holder.wait()
+    _kill_tree(holder)
     assert lock.exists(), "a killed holder leaves its file behind (the case under test)"
     assert pipeline._wait_lock(lock, 5.0), "a dead holder's lock was not reacquirable"
     pipeline._unlock(lock)

@@ -43,12 +43,75 @@ REPORT: dict[str, object] = {}
 def _hold_lock(root: Path, lock: Path) -> subprocess.Popen:
     """A separate process that holds ``lock`` until killed (a live holder)."""
     ready = root / f"{lock.name}.ready"
-    proc = subprocess.Popen([sys.executable, str(HERE / "lockproc.py"), "hold", str(lock), str(ready)])
+    proc = subprocess.Popen([sys.executable, str(HERE / "lockproc.py"), "hold", str(lock), str(ready)],
+                            start_new_session=os.name != "nt")
     deadline = time.monotonic() + 30
     while not ready.exists():
         assert proc.poll() is None and time.monotonic() < deadline, "lock holder did not start"
         time.sleep(0.02)
     return proc
+
+
+def _hold_lock_through_parent(root: Path, lock: Path) -> tuple[subprocess.Popen, int]:
+    """A parent whose child holds ``lock``: the shape of a launcher interpreter (a venv's
+    ``python.exe`` on Windows runs the real interpreter as a child). Returns the parent and
+    the child's pid."""
+    ready = root / f"{lock.name}.ready"
+    pidfile = root / f"{lock.name}.childpid"
+    code = ("import subprocess, sys; "
+            "p = subprocess.Popen([sys.executable, sys.argv[1], 'hold', sys.argv[2], sys.argv[3]]); "
+            "open(sys.argv[4], 'w', encoding='utf-8').write(str(p.pid)); p.wait()")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(HERE / "lockproc.py"), str(lock), str(ready), str(pidfile)],
+                            start_new_session=os.name != "nt")
+    deadline = time.monotonic() + 30
+    while not (ready.exists() and pidfile.exists() and pidfile.read_text(encoding="utf-8").strip()):
+        assert proc.poll() is None and time.monotonic() < deadline, "lock holder did not start"
+        time.sleep(0.02)
+    return proc, int(pidfile.read_text(encoding="utf-8"))
+
+
+def _kill_holder(proc: subprocess.Popen) -> None:
+    """Kill a lock holder and every process it started, then reap it.
+
+    Killing only ``proc`` is not enough when ``sys.executable`` is a launcher (a venv's
+    ``python.exe`` on Windows runs the real interpreter as a child): the child keeps the
+    lock. Holders are started in their own process group on POSIX so the group can go."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, check=False)
+    else:
+        try:
+            os.killpg(proc.pid, 9)
+        except ProcessLookupError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
+def _reap_pid(pid: int) -> None:
+    """Make sure a process is gone, whatever a test's outcome (never leave a stray holder)."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+        return
+    try:
+        os.kill(pid, 9)
+    except ProcessLookupError:
+        pass
+
+
+def _eventually(check, timeout_s: float = 10.0) -> bool:
+    """Poll ``check`` until it is true or ``timeout_s`` passes.
+
+    The OS frees a dead process's byte-range lock asynchronously (Windows documents the
+    delay as depending on available system resources), so a lock freed by its holder's
+    death is awaited within a bound, never assumed the instant the holder is reaped."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if check():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _materialized(fx: Fixture) -> dict:
@@ -143,8 +206,7 @@ def test_backstop_reports_failures(root: Path) -> None:
     try:
         rec = backstop.run_backstop(fx.env, status=status, lock_wait_s=0)
     finally:
-        holder.kill()
-        holder.wait()
+        _kill_holder(holder)
     assert "maintenance_lock_held" in rec["problems"] and orphan.is_dir(), rec
 
     # 4. the status file cannot be written: still a failure, still on stderr and in the log
@@ -182,7 +244,7 @@ def test_backstop_waits_for_maintenance_child(root: Path) -> None:
     fx = Fixture(root)
     orphan = _orphan(fx, "cap_orphan000000002", age_days=100)
     holder = _hold_lock(root, fx.stores.meta / "maintain.lock")
-    threading.Timer(3.0, holder.kill).start()
+    threading.Timer(3.0, _kill_holder, args=(holder,)).start()
     t0 = time.monotonic()
     rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=30)
     waited = time.monotonic() - t0
@@ -202,11 +264,27 @@ def test_maintenance_due_probes_the_lock_not_the_file(root: Path) -> None:
     try:
         assert not pipeline.maintenance_due(fx.stores), "launched over a live maintenance run"
     finally:
-        holder.kill()
-        holder.wait()
-    assert pipeline.maintenance_due(fx.stores), "the lock stayed suppressed after its holder died"
+        _kill_holder(holder)
+    assert _eventually(lambda: pipeline.maintenance_due(fx.stores)), "the lock stayed suppressed after its holder died"
     (fx.stores.meta / pipeline.MAINTENANCE).write_text("{}", encoding="utf-8")
     assert not pipeline.maintenance_due(fx.stores), "a fresh pass is not due again"
+
+
+def test_maintenance_due_after_a_launched_holder_dies(root: Path) -> None:
+    """N23 under a launcher interpreter: killing the holder the test started frees the lock
+    even when the process that actually holds it is that holder's child."""
+    fx = Fixture(root)
+    lock = fx.stores.meta / "maintain.lock"
+    parent, child = _hold_lock_through_parent(root, lock)
+    try:
+        try:
+            assert not pipeline.maintenance_due(fx.stores), "launched over a live maintenance run"
+        finally:
+            _kill_holder(parent)
+        assert _eventually(lambda: pipeline.maintenance_due(fx.stores)), \
+            "the lock stayed suppressed after its holder died"
+    finally:
+        _reap_pid(child)
 
 
 def test_backstop_warns_on_undated_content(root: Path) -> None:
@@ -295,8 +373,7 @@ def test_busy_episode_is_reported_not_silent(root: Path) -> None:
     try:
         rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=0)
     finally:
-        holder.kill()
-        holder.wait()
+        _kill_holder(holder)
     assert rec["exit"] == backstop.EXIT_WARN and rec["counts"]["busy_skipped"] == 1, rec
     assert "episodes_busy: 1" in rec["warnings"] and not rec["problems"], rec
     rec = backstop.run_backstop(fx.env, status=root / "status.json", lock_wait_s=0)
@@ -406,8 +483,7 @@ def test_live_claim_is_not_taken_by_another_store(root: Path) -> None:
         res = pipeline.run_maintain(fx.stores, fx.env)
         assert res["pending_drained"] == 0 and live.exists(), ("a live claim was taken", res)
     finally:
-        holder.kill()
-        holder.wait()
+        _kill_holder(holder)
     res = pipeline.run_maintain(fx.stores, fx.env)
     assert res["pending_drained"] == 1 and not live.exists(), res
     assert not list(fx.tmp.glob(f"{pipeline.PENDING_NAME}.*.lock")), "claim locks left behind"
@@ -480,6 +556,7 @@ def test_maintenance_relinks_through_reconcile(root: Path) -> None:
 
 TESTS = [test_backstop_expires_without_prompts, test_backstop_reports_failures,
          test_backstop_waits_for_maintenance_child, test_maintenance_due_probes_the_lock_not_the_file,
+         test_maintenance_due_after_a_launched_holder_dies,
          test_backstop_warns_on_undated_content,
          test_checkpoint_notes_backstop, test_task_xml_is_reviewable_not_registered,
          test_episode_errors_fail_the_pass_and_expiry_still_runs, test_busy_episode_is_reported_not_silent,
