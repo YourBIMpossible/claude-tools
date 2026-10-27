@@ -533,6 +533,15 @@ def test_cd_parent_back_to_root_is_not_external(root: Path) -> None:
     for cmd in ("cd src && cd .. && cat a.py", "cd . && cat a.py"):
         obs, clean = screen._shell_observations(cmd, idx, screen.norm_path(repo), [])
         assert {c: v for c, v in obs.items() if v} == {} and clean, (cmd, obs)
+    # F-107: a trailing slash names the same directory, so the nav is not a path either
+    for cmd in ("cd src && cd ../ && cat a.py", "cd ../ && cat a.py", "cd ./ && cat a.py", "cd src && cd ..// && cat a.py",
+                "cd src/ && cd ../ && cat a.py"):
+        obs, clean = screen._shell_observations(cmd, idx, screen.norm_path(repo), [])
+        assert {c: v for c, v in obs.items() if v} == {} and clean, (cmd, obs)
+    # controls: a real external destination is still reported
+    for cmd in ("cd ../other && cat a.py", "cd ../other/ && cat a.py", "cd ../../x && cat a.py"):
+        obs, clean = screen._shell_observations(cmd, idx, screen.norm_path(repo), [])
+        assert obs.get("external_path"), (cmd, obs)
     turns = [{"prompt": "fix alpha", "tools": [
         {"name": "Bash", "input": {"command": "cd src && cd .. && cat src/alpha.py"}, "result": "def alpha"},
         {"name": "Edit", "input": {"file_path": str(repo / "src" / "alpha.py"), "old_string": "1", "new_string": "2"}}]}]

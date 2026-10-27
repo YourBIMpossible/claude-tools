@@ -709,10 +709,11 @@ def parse_segment(seg: str) -> Segment:
         add([a for a in pos if is_pathlike(a)], "exec")
     elif verb in NAV:
         s.kind = "nav"
-        if pos[:1] and pos[0].strip() in {".", ".."}:
+        head = pos[0].strip().rstrip("/\\") if pos[:1] else ""   # `cd ../` is `cd ..`: a trailing separator names the same directory
+        if head in {".", ".."}:
             # The directory in effect and its parent, as for git -C: a destination only, since
             # _clean_arg drops them as file arguments.
-            s.nav_dest = pos[0].strip()
+            s.nav_dest = head
         else:
             add(pos[:1], "nav")
             s.nav_dest = next((u.path for u in s.paths if u.role == "nav"), None)
