@@ -289,14 +289,23 @@ class ShellLookups(FunnelCase):
         for tool, cmd in (("Bash", 'bash -c "set -e\ngrep -rn foo src\n"'),
                           ("Bash", "bash <<'EOF'\ngrep -rn foo src\nEOF"),
                           ("Bash", "sh <<'EOF'\nrg foo src\nEOF"),
-                          ("PowerShell", 'pwsh -NoProfile -Command "\n Select-String -Pattern foo -Path src\\a.py\n"')):
+                          ("PowerShell", 'pwsh -NoProfile -Command "\n Select-String -Pattern foo -Path src\\a.py\n"'),
+                          ("Bash", "cat <<'EOF' | bash\ngrep -rn foo src\nEOF"),
+                          ("Bash", "sudo bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "ssh host bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "FOO=1 bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", 'bash --norc -c "set -e\ngrep -rn foo src\n"')):
             with self.subTest(cmd=cmd):
                 unit = self.unit_of(tool, cmd)
                 self.assertEqual((unit.searches, unit.reads), (1, 0))
 
     def test_a_heredoc_that_is_data_is_not_a_search(self):
         for cmd in ("git commit -m \"$(cat <<'EOF'\nfix: stop the grep fallback\nEOF\n)\"",
+                    "git commit -F - <<'EOF'\nfix: drop the grep fallback\nEOF",
                     "cat > notes.md <<'EOF'\nuse rg here\nEOF",
+                    "tee notes.md <<'EOF'\nuse grep here\nEOF",
+                    "python - <<'EOF'\nprint('run grep later')\nEOF",
+                    "node <<'EOF'\nconsole.log('use grep here')\nEOF",
                     "bash <<'EOF'\necho done  # grep later\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.unit_of("Bash", cmd).searches, 0)

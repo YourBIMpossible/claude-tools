@@ -87,7 +87,7 @@ _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
 _QUOTED_SEPARATORS = str.maketrans(";&|()", "     ")
 # The end of a line that passes the next quoted argument to a shell as its script.
 _SHELL_SCRIPT_ARG_RE = re.compile(
-    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+-\w+)*\s+-\w*c\w*"
+    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+--?[\w-]+)*\s+-\w*c\w*"
     r"|(?P<ps>pwsh|powershell)(?:\.exe)?[\"']?(?:\s+[^\s\"']+)*?\s+-c(?:ommand)?"
     r"|(?P<cmd>cmd)(?:\.exe)?[\"']?\s+/[ck])\s*$", re.I)
 _SHELLS = {"bash": "Bash", "sh": "Bash", "zsh": "Bash", "dash": "Bash", "cmd": "Bash",
@@ -155,20 +155,31 @@ def code_part(command: str, tool: str = "Bash") -> str:
     return _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\")
 
 
+def _shell_named_in(segment: str) -> str | None:
+    """The tool syntax of the first shell named by any word of a command segment, so a shell
+    run through a prefix (`sudo bash`, `FOO=1 bash`, `ssh host bash`) is found too."""
+    for word in segment.split():
+        name = re.split(r"[\\/]", word.strip("\"'"))[-1].lower().removesuffix(".exe")
+        if name in _SHELLS:
+            return _SHELLS[name]
+    return None
+
+
 def shell_script_parts(command: str, tool: str = "Bash") -> list[str]:
     """The code_part of each script the command hands to a shell, which code_part blanks: a
-    heredoc whose command is a shell (`bash <<'EOF'`), and a multi-line quoted argument of
+    heredoc whose command names a shell (`bash <<'EOF'`, `sudo bash <<'EOF'`) or whose
+    opening line pipes it to one (`cat <<'EOF' | bash`), and a multi-line quoted argument of
     `bash -c`, `pwsh -Command` or `cmd /c`. A heredoc fed to anything else (`cat > f`, a
     commit message) is data and is not returned. Nested scripts are included."""
     scripts: list[tuple[str, str]] = []
 
     def heredoc(m: re.Match) -> str:
         line = m.string[:m.start()]
-        words = re.split(r"[;&|(]", line[line.rfind("\n") + 1:])[-1].split()
-        name = re.split(r"[\\/]", words[0].strip("\"'"))[-1].lower() if words else ""
-        shell = _SHELLS.get(name.removesuffix(".exe"))
+        body = m.group(0)
+        shell = _shell_named_in(re.split(r"[;&|(]", line[line.rfind("\n") + 1:])[-1])
+        for piped in body[:body.find("\n")].split("|")[1:]:
+            shell = shell or _shell_named_in(re.split(r"[;&(]", piped)[0])
         if shell:
-            body = m.group(0)
             scripts.append((body[body.find("\n") + 1:body.rfind("\n")], shell))
         return "<<HEREDOC"
 
