@@ -82,13 +82,17 @@ BARE_CLI_RE = re.compile(
 GRAPHIFY_CALL_RE = re.compile(f"{WRAPPER_RE.pattern}|{BARE_CLI_RE.pattern}", re.I | re.M)
 _HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n.*?^[ \t]*\2[ \t]*$", re.S | re.M)
 _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
+# The same heredoc, with the rest of its opening line kept: `cat <<'EOF' | grep -c x` runs that grep.
+_HEREDOC_TAIL_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1(?P<tail>[^\n]*)\n.*?^[ \t]*\2[ \t]*$", re.S | re.M)
 
 
 _QUOTED_SEPARATORS = str.maketrans(";&|()", "     ")
-# The end of a line that passes the next quoted argument to a shell as its script.
+# The end of a line that passes the next quoted argument to a shell as its script. The words between
+# the shell and its -c cannot hold a command separator, so `bash build.sh; python -c "..."` is not bash's
+# script (the -c belongs to python).
 _SHELL_SCRIPT_ARG_RE = re.compile(
-    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+[^\s\"']+)*?\s+-\w*c\w*"
-    r"|(?P<ps>pwsh|powershell)(?:\.exe)?[\"']?(?:\s+[^\s\"']+)*?\s+-c(?:ommand)?"
+    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+[^\s\"';&|]+)*?\s+-\w*c\w*"
+    r"|(?P<ps>pwsh|powershell)(?:\.exe)?[\"']?(?:\s+[^\s\"';&|]+)*?\s+-c(?:ommand)?"
     r"|(?P<cmd>cmd)(?:\.exe)?[\"']?\s+/[ck])\s*$", re.I)
 _SHELLS = {"bash": "Bash", "sh": "Bash", "zsh": "Bash", "dash": "Bash", "cmd": "Bash",
            "pwsh": "PowerShell", "powershell": "PowerShell"}
@@ -100,8 +104,10 @@ def _blank_quoted_code(command: str, escape: str = "\\",
     (;&|()) inside single-line quoted strings, so a search pattern such as a\\|graphify query
     in quotes gives `graphify` no command position. A double-quoted string containing $( keeps
     all its separators, since that substitution runs a real command (so a pattern string that
-    also contains $( can still read as a call). Commands after a separator inside a quoted
-    `bash -c`, `pwsh -Command` or `cmd /c` argument are not counted: the string is an argument.
+    also contains $( can still read as a call). A quoted
+    `bash -c`, `pwsh -Command` or `cmd /c` argument, on one line or several, is a script the shell
+    runs: it is handed to `scripts` (when given) so it can be read as commands, while the string
+    itself stays an argument here.
 
     A regex would pair one line's closing quote with the next line's opening quote and blank
     the real command between them, so quotes are paired by walking the string: `escape`
@@ -130,12 +136,12 @@ def _blank_quoted_code(command: str, escape: str = "\\",
                 out.append(command[i:])
                 break
             span = command[i:j + 1]
+            if scripts is not None:
+                head = "".join(out)
+                m = _SHELL_SCRIPT_ARG_RE.search(head[head.rfind("\n") + 1:])
+                if m:
+                    scripts.append((span[1:-1], "PowerShell" if m.group("ps") else "Bash"))
             if "\n" in span:
-                if scripts is not None:
-                    head = "".join(out)
-                    m = _SHELL_SCRIPT_ARG_RE.search(head[head.rfind("\n") + 1:])
-                    if m:
-                        scripts.append((span[1:-1], "PowerShell" if m.group("ps") else "Bash"))
                 span = '""'
             elif not (ch == '"' and "$(" in span):
                 span = span.translate(_QUOTED_SEPARATORS)
@@ -147,10 +153,14 @@ def _blank_quoted_code(command: str, escape: str = "\\",
     return "".join(out)
 
 
-def code_part(command: str, tool: str = "Bash") -> str:
+def code_part(command: str, tool: str = "Bash", keep_heredoc_tail: bool = False) -> str:
     """The command with heredoc/here-string bodies and multi-line quoted strings blanked, and
-    shell separators inside single-line quoted strings neutralised."""
-    command = _HEREDOC_RE.sub("<<HEREDOC", command)
+    shell separators inside single-line quoted strings neutralised. The rest of a heredoc's opening
+    line goes with the body unless `keep_heredoc_tail` (the search count keeps it: `| grep x` runs)."""
+    if keep_heredoc_tail:
+        command = _HEREDOC_TAIL_RE.sub(lambda m: "<<HEREDOC" + m.group("tail"), command)
+    else:
+        command = _HEREDOC_RE.sub("<<HEREDOC", command)
     command = _HERESTRING_RE.sub("@''@", command)
     return _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\")
 
@@ -194,7 +204,25 @@ def shell_script_parts(command: str, tool: str = "Bash") -> list[str]:
 
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use
 QUESTION_RE = re.compile(r"(?:query_reranked\.py[\"']?|\s(?:query|explain))\s+\"([^\"]+)\"")
-SHELL_SEARCH_RE = re.compile(r"(?:^|[\s|;&(])(?:grep|rg|findstr|Select-String|git grep)\b", re.I)
+# A shell search is a search tool in COMMAND position, not a word of an argument (`echo "use grep here"`,
+# `Write-Host 'use Select-String'`, a commit message). Command positions: the start of a segment (after
+# ; & | ( ` or a newline), after `if`/`then`/`do`/`{` and the like, after a VAR=value prefix or an
+# assignment (`$r = `), after a wrapper (sudo, env, xargs, timeout, time, nohup, watch, ...) and its
+# options, behind `git`'s global options, and anywhere after a runner that takes a whole command line
+# (ssh, docker, kubectl, wsl, adb, su, eval, chroot, ...), which this cannot parse. (`find` is a search
+# command of its own, see SHELL_SEARCH_CMDS, so its -exec needs no rule.)
+SHELL_SEARCH_TOOLS = {"grep", "rg", "findstr", "select-string"}
+_SEARCH_KEYWORDS = {"if", "then", "else", "elif", "while", "until", "do", "!", "{"}
+_SEARCH_WRAPPER_VALUE_FLAGS = {          # wrapper -> its options that take a separate value
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-R", "-T"},
+    "doas": {"-u", "-C"}, "env": {"-u", "-C", "-S"},
+    "xargs": {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"},
+    "timeout": {"-s", "-k"}, "nice": {"-n"}, "ionice": {"-c", "-n", "-p", "-P", "-u"},
+    "stdbuf": {"-i", "-o", "-e"}, "nohup": set(), "command": set(), "exec": {"-a"}, "builtin": set(),
+    "time": {"-f", "-o"}, "watch": {"-n"}, "setsid": set(), "unbuffer": set(), "busybox": set(),
+    "parallel": {"-j", "-n", "-a", "-N"}, "strace": {"-o", "-e", "-p", "-s", "-u"}}
+_SEARCH_RUNNERS = {"ssh", "wsl", "docker", "podman", "kubectl", "adb", "su", "script", "eval", "chroot"}
+_GIT_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 WRAPPER_FAILURE_RE = re.compile(r"graphify query failed|Traceback \(most recent call last\)")
 
 SHELL_TOOLS = {"Bash", "PowerShell"}
@@ -677,7 +705,8 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
             pending[call.tool_use_id] = call
         else:
             lk = shell_lookups(cmd, name, cwd)
-            searched = (any(SHELL_SEARCH_RE.search(part) for part in [code, *shell_script_parts(cmd, name)])
+            tails = code_part(cmd, name, keep_heredoc_tail=True)
+            searched = (any(shell_searches(part, name) for part in [tails, *shell_script_parts(cmd, name)])
                         or lk.searched)
             if searched or lk.read:          # paths only come with a search or a read
                 unit.lookups.append(Lookup(tool_id, searched, frozenset(lk.read_paths),
@@ -702,6 +731,62 @@ def _shell_words(segment: str, tool: str) -> list[str]:
     except ValueError:
         words = segment.split()
     return [w[1:-1] if len(w) >= 2 and w[0] == w[-1] and w[0] in "\"'" else w for w in words]
+
+
+def _tool_name(word: str) -> str:
+    """A command word as a bare lower-case name: quotes off, `.exe` off (so `rg.exe` is `rg`)."""
+    return word.strip("\"'").lower().removesuffix(".exe")
+
+
+def _segment_searches(words: list[str]) -> bool:
+    """Whether a search tool is run as a command in one command segment (see SHELL_SEARCH_TOOLS)."""
+    want, runner, i, n = True, False, 0, len(words)
+    while i < n:
+        word = words[i]
+        name = _tool_name(word)
+        i += 1
+        if runner and not want:
+            first = word.split(None, 1)[0] if word.strip() else ""
+            if _tool_name(first) in SHELL_SEARCH_TOOLS:
+                return True                     # `ssh host grep ...`, `ssh host "grep ..."`
+        if not want:
+            want = word == "=" or word.endswith("{")      # `$r = <cmd>`, a block
+            continue
+        if re.match(r"[A-Za-z_]\w*=", word) or name in _SEARCH_KEYWORDS:
+            continue                            # VAR=value prefix, `then`, `do`, `{`
+        if name in SHELL_SEARCH_TOOLS:
+            return True
+        if name == "git":
+            while i < n and words[i].startswith("-"):      # git's global options, then the subcommand
+                i += 2 if words[i] in _GIT_VALUE_FLAGS else 1
+            if i < n and words[i].lower() == "grep":
+                return True
+            want = False
+        elif name in _SEARCH_WRAPPER_VALUE_FLAGS:
+            value_flags = _SEARCH_WRAPPER_VALUE_FLAGS[name]
+            first_flag = i
+            while i < n and words[i].startswith("-"):
+                i += 2 if words[i] in value_flags else 1
+            if name == "command" and {"-v", "-V"} & set(words[first_flag:i]):
+                want = False                    # `command -v rg` looks a tool up, it does not run it
+            if name == "timeout" and i < n and re.match(r"\d[\w.]*$", words[i]):
+                i += 1                          # timeout's duration
+        elif name in _SEARCH_RUNNERS:
+            runner, want = True, False
+        else:
+            want = False
+    return False
+
+
+def shell_searches(text: str, tool: str = "Bash") -> bool:
+    """Whether the (already blanked, see code_part) shell text runs grep, rg, findstr or Select-String
+    as a command. A tool name that is only a word of an argument or a string does not count."""
+    if tool != "PowerShell":
+        text = text.replace("`", ";")           # `cmd` substitution starts a command
+    parts = _SEGMENT_RE.split(text)
+    # a segment cut at find's escaped `\;` ends in a lone backslash, which would make the lexer fail
+    return any(_segment_searches(_shell_words(parts[i].rstrip().removesuffix("\\"), tool))
+               for i in range(0, len(parts), 2))
 
 
 def _shell_path(arg: str, base: str | None) -> str | None:
