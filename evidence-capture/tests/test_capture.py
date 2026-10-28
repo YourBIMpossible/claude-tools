@@ -111,6 +111,7 @@ def transcript_lines(turns: list[dict], version: str = "9.9.9") -> list[str]:
         for k, tool in enumerate(t.get("tools", [])):
             tid = f"toolu_{n}_{k}"
             lines.append(json.dumps({"type": "assistant", "timestamp": ts, "sessionId": SESSION, "version": version,
+                                     **({"cwd": tool["cwd"]} if tool.get("cwd") else {}),
                                      "message": {"id": f"msg_{n}_{k}", "role": "assistant", "content": [
                                          {"type": "tool_use", "id": tid, "name": tool["name"], "input": tool["input"]}]}}))
             result = {"type": "user", "timestamp": ts, "sessionId": SESSION,
@@ -1184,6 +1185,84 @@ def test_prior_context_artifact_match_is_whole_segment(root: Path) -> None:
         assert ("prompt_names_earlier_artifact" in kinds) == (want == "yes"), (prompt, kinds)
         assert m["prior_context"]["prior_conversation_required"] == want, (prompt, m["prior_context"])
 
+
+def test_shell_repo_mutation_blocks_x2_yes(root: Path) -> None:
+    """A shell write or git mutation inside the repository is not 'no repository edit' (X2)."""
+    repo = make_repo(root)
+    other = make_repo(root, "other")
+    msys = "/" + str(repo)[0].lower() + str(repo)[2:].replace("\\", "/")
+    cases = {
+        "commit via shell": (f"cd '{repo}' && D=docs && cat >> \"$D/NOTES.md\" <<'X'\nline\nX\ngit add -A && git commit -qm n",
+                             {"content_write:write:cat", "git_index:git add", "git_history:git commit"}, False),
+        **({"msys cd then redirect": (f"cd {msys}; echo x > out.txt", {"content_write:write:echo"}, False)}
+           if os.name == "nt" else {}),  # the Git-Bash form of a fixture path only exists for a drive-letter root
+        "unknown cd then commit": ("cd \"$SOMEWHERE\" && git commit -qm n", {"unresolved_target:git commit"}, False),
+        "inline interpreter in repo": ("python - <<'PY'\nprint(1)\nPY", {"unresolved_effect:inline:python"}, False),
+        "test runner in repo": ("python -m pytest tests", {"unresolved_effect:exec:python"}, False),
+        "repo script": ("node scripts/build.mjs", {"unresolved_effect:exec:node"}, False),
+        "checkout": ("git switch -c topic", {"git_worktree:git switch"}, False),
+        "failed commit": ("git commit -qm n", {"git_history:git commit:failed"}, True),
+        "call operator on a variable": ("& $exe --version", {"unresolved_effect:exec:$exe"}, False),
+    }
+    for label, (cmd, want, err) in cases.items():
+        turns = [{"prompt": f"task {label}", "tools": [{"name": "Bash", "input": {"command": cmd}, "error": err}]}]
+        m = joined(root, repo, turns, 0)
+        got = set(m["observation"]["shell_repo_mutations"])
+        assert want <= got, (label, got)
+        assert rule(m, "X2") == "unknown", (label, m["exclusions"])
+        assert m["edited_files"] == []  # the file set is not invented from a shell command
+    # pre-classification record entries map to a class conservatively
+    assert [screen.mutation_class(e) for e in ("git commit", "write:cat", "unresolved:git add", "unresolved:inline:py")] \
+        == ["git_history", "content_write", "unresolved_target", "unresolved_effect"]
+    # mutations in another repository, temp files and plain reads leave X2 = yes
+    for cmd in (f"cd '{other}' && git add -A && git commit -qm n", "git status && git log -3 > /dev/null",
+                "echo x > /tmp/scratch.txt", f"git -C '{other}' switch main", f"cd '{other}' && python -m pytest",
+                "Get-ChildItem | ForEach-Object { $_.FullName }; $i++; $false"):
+        m = joined(root, repo, [{"prompt": "look only", "tools": [{"name": "Bash", "input": {"command": cmd}}]}], 0)
+        assert m["observation"]["shell_repo_mutations"] == [], (cmd, m["observation"])
+        assert rule(m, "X2") == "yes", (cmd, m["exclusions"], m["observation"])
+
+
+def test_msys_drive_paths_resolve_like_windows_paths(root: Path) -> None:
+    """A Git-Bash ``/f/...`` path to a repository file is in-repo, not an external dependency."""
+    repo = make_repo(root)
+    other = make_repo(root, "other")
+
+    def msys(p: Path) -> str:
+        return "/" + str(p)[0].lower() + str(p)[2:].replace("\\", "/")
+
+    if os.name == "nt":  # the Git-Bash form of a fixture path only exists for a drive-letter root
+        m = joined(root, repo, [{"prompt": "look", "tools": [
+            {"name": "Bash", "input": {"command": f"cat {msys(repo)}/README.md && cd {msys(repo)} && cat README.md"}}]}], 0)
+        assert m["deps"]["external_path"]["observed"] == 0, m["deps"]["external_path"]
+        assert m["deps"]["external_repository"]["observed"] == 0 and rule(m, "X2") == "yes"
+        # a genuinely external file and another repository stay external
+        m = joined(root, repo, [{"prompt": "look", "tools": [
+            {"name": "Bash", "input": {"command": f"cat {msys(other)}/README.md"}}]}], 0)
+        assert m["deps"]["external_repository"]["observed"] == 1, m["deps"]
+    assert screen.msys_to_windows("/tmp/x") == "/tmp/x" and screen.msys_to_windows("/f/a/b") == "F:/a/b"
+
+
+
+def test_shell_call_uses_its_own_recorded_cwd(root: Path) -> None:
+    """A call's recorded cwd wins over the episode fallback (the transcript's last cwd, which
+    may come from a later turn in another directory)."""
+    repo = make_repo(root)
+    other = make_repo(root, "other")
+    turns = [{"prompt": "run", "tools": [{"name": "Bash", "cwd": str(repo),
+                                           "input": {"command": "node -e \"require('fs')\"; ./build.sh"}}]}]
+    tr = write_transcript(root, turns)
+    m = base_manifest("run", started="2026-09-26T10:01:00.000000Z")
+    m["repo"]["head"] = head(repo)
+    obs = join.join(m, tr)
+    assert obs is not None and obs["tool_calls"][0]["cwd"] == str(repo)
+    screen.screen(m, obs, repo, cwd=str(other))
+    muts = m["observation"]["shell_repo_mutations"]
+    assert "unresolved_effect:inline:node" in muts and "unresolved_effect:exec:build.sh" in muts, muts
+    # without a recorded cwd the episode fallback still applies
+    del obs["tool_calls"][0]["cwd"]
+    screen.screen(m, obs, repo, cwd=str(other))
+    assert m["observation"]["shell_repo_mutations"] == [], m["observation"]
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 

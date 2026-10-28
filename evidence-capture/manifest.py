@@ -92,6 +92,11 @@ def evaluate_rules(m: dict[str, Any], owner: dict[str, Any] | None = None) -> li
 
     if m["edited_files"]:
         out.append({"rule": "X2", "state": "no", "evidence": f"{len(m['edited_files'])} repository file(s) edited"})
+    elif m.get("observation", {}).get("shell_repo_mutations"):
+        # Content writes, git state changes or unresolved runs: none names an edited-file set,
+        # so the rule can be neither "no" nor "yes".
+        muts = m["observation"]["shell_repo_mutations"]
+        out.append({"rule": "X2", "state": "unknown", "evidence": "shell repository effect: " + ",".join(muts[:6])})
     elif sufficient:
         out.append({"rule": "X2", "state": "yes", "evidence": "no repository edit observed in a complete transcript"})
     else:
