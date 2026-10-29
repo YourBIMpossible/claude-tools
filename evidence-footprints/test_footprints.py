@@ -523,6 +523,30 @@ def test_nav_destination() -> None:
     check(later(fp("cd > out.log src && cat a.py")) == (["out.log", "src/a.py"], 0),
           "a redirect before the argument is not the destination")
 
+    # F-107: a trailing slash (or backslash) on . or .. names the same directory as without it
+    f = fp("cd ./ && cat a.py")
+    check((later(f), f.outside) == ((["a.py"], 0), 0), "cd ./ is cd .: the directory is unchanged, nothing outside")
+    f = fp("cd src && cd ../ && cat a.py")
+    check((later(f), f.outside) == ((["a.py"], 0), 0), "cd src && cd ../ is cd src && cd ..: back in the root, nothing outside")
+    f = fp("cd src; Set-Location ../; Get-Content a.py", tool="PowerShell")
+    check((later(f), f.outside) == ((["a.py"], 0), 0), "Set-Location ../ is Set-Location ..")
+    for tail, want in (("../", ".."), ("..//", ".."), ("..\\", ".."), ("./", "."), (".//", "."), (".\\", ".")):
+        seg = sp.parse_command(f"cd {tail} > out.log")[0][0]
+        check(seg.nav_dest == want and [(u.path, u.role) for u in seg.paths] == [("out.log", "write")],
+              f"cd {tail}: the destination is {want}, kept apart from the segment's paths")
+    for slashed, plain in (("cd ../ && cat a.py", "cd .. && cat a.py"), ("cd ../ && cd ./ && cat a.py", "cd .. && cd . && cat a.py"),
+                           ("cd ..// && cat a.py", "cd .. && cat a.py")):
+        a, b = fp(slashed, REPO), fp(plain, REPO)
+        check((a.touches, a.outside, a.unresolved) == (b.touches, b.outside, b.unresolved),
+              f"{slashed!r} leaves the repository exactly as {plain!r} does")
+    # controls: a real destination is still a destination, and still outside when it leaves the repository
+    leave = fp("cd .. && cat a.py", REPO).outside
+    for cmd in ("cd ../other && cat a.py", "cd ../other/ && cat a.py", "cd ../../x && cat a.py"):
+        check(fp(cmd, REPO).outside > leave, f"{cmd!r} is still flagged outside")
+    check(later(fp("cd src/ && cat a.py")) == (["src/a.py"], 0), "cd src/ is still src")
+    check(fp("cd / && cat a.py").unresolved == 1, "cd / is unchanged: the root is not a . or ..")
+    check(sp.parse_command("cd // > out.log")[0][0].nav_dest == "//", "cd // is not read as . or ..")
+
 
 def test_powershell_scope_and_conditional_nav() -> None:
     """SA26-20: a PowerShell ``$( ... )`` or ``( ... )`` runs in the current scope, so its Set-Location carries on;
