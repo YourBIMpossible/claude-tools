@@ -313,6 +313,117 @@ class ShellLookups(FunnelCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.unit_of("Bash", cmd).searches, 0)
 
+    def searches_of(self, cmd: str, tool: str = "Bash") -> tuple[int, int]:
+        unit = self.unit_of(tool, cmd)
+        return unit.searches, unit.reads
+
+    def test_a_search_word_counts_only_at_a_command_position(self):
+        # SA26 G-1: a tool name inside an argument, an echo or a string is not a search.
+        for tool, cmd in (("Bash", 'echo "use grep here"'),
+                          ("Bash", "echo use rg later"),
+                          ("Bash", "printf '%s\n' grep rg findstr"),
+                          ("Bash", "taskset -c 0 echo use grep here"),
+                          ("Bash", "flock /tmp/l echo use rg here"),
+                          ("Bash", "taskset -p 1234"),
+                          ("Bash", "man grep"),
+                          ("Bash", "which rg"),
+                          ("Bash", "type grep"),
+                          ("Bash", "command -v rg"),
+                          ("Bash", 'git commit -m "drop the grep fallback"'),
+                          ("PowerShell", "Write-Host 'use Select-String'"),
+                          ("Bash", 'bash -c "echo use grep later\nls"'),
+                          ("Bash", "bash <<'EOF'\necho use grep later\nEOF"),
+                          ("PowerShell", 'pwsh -Command "\nWrite-Host \'use Select-String\'\n"')):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.searches_of(cmd, tool)[0], 0)
+
+    def test_every_form_that_runs_a_search_tool_is_still_counted(self):
+        # SA26 G-1: command positions are the start of a segment, after a pipe, a subshell, a block or a
+        # keyword, and after a wrapper (xargs, timeout, sudo, env, VAR=x, ...) or a remote runner.
+        for tool, cmd in (("Bash", "grep -rn foo src"),
+                          ("Bash", "cd src && rg foo"),
+                          ("Bash", "git log | grep fix"),
+                          ("Bash", "ls | xargs grep foo"),
+                          ("Bash", "ls | xargs -n 1 grep foo"),
+                          ("Bash", "find . -name '*.py' -exec grep -l foo {} +"),
+                          ("Bash", "sudo grep -rn foo /etc"),
+                          ("Bash", "sudo -u bob grep -rn foo src"),
+                          ("Bash", "timeout 10 rg foo src"),
+                          ("Bash", "env FOO=1 rg foo src"),
+                          ("Bash", "FOO=1 grep -rn foo src"),
+                          ("Bash", "nohup rg foo src"),
+                          ("Bash", "for f in a b; do grep -n foo $f; done"),
+                          ("Bash", "if grep -q foo a.txt; then echo y; fi"),
+                          ("Bash", "echo $(grep -c foo a.txt)"),
+                          ("Bash", "{ grep -rn foo src; }"),
+                          ("Bash", "git -C src grep foo"),
+                          ("Bash", "git --no-pager grep -n foo"),
+                          ("Bash", "ssh host grep -rn foo src"),
+                          ("Bash", "docker exec c grep -rn foo /src"),
+                          ("Bash", "rg.exe foo src"),
+                          ("Bash", "time -p grep -rn foo src"),
+                          ("Bash", "watch -n 5 grep -rn foo src"),
+                          ("Bash", "taskset -c 0 grep -rn foo src"),
+                          ("Bash", "taskset 0x3 grep -rn foo src"),
+                          ("Bash", "taskset --cpu-list 0,1 rg foo src"),
+                          ("Bash", "numactl --cpunodebind=0 grep -rn foo src"),
+                          ("Bash", "numactl -N 0 -m 0 rg foo src"),
+                          ("Bash", "flock /tmp/l grep -rn foo src"),
+                          ("Bash", "flock -n -w 5 /tmp/l grep -rn foo src"),
+                          ("Bash", "chronic grep -rn foo src"),
+                          ("Bash", "caffeinate -i grep -rn foo src"),
+                          ("Bash", "caffeinate -t 60 grep -rn foo src"),
+                          ("Bash", "ltrace grep -rn foo src"),
+                          ("Bash", "ltrace -o out.txt grep -rn foo src"),
+                          ("Bash", "valgrind grep -rn foo src"),
+                          ("Bash", "valgrind --tool=memcheck grep -rn foo src"),
+                          ("Bash", "nsenter -t 1 -m grep -rn foo src"),
+                          ("Bash", "nsenter --target 1 --mount grep -rn foo src"),
+                          ("Bash", "gdb --args grep -rn foo src"),
+                          ("Bash", "gdb -batch -ex run --args rg foo src"),
+                          ("Bash", "eval grep -rn foo src"),
+                          ("Bash", 'FOO="a b" grep -rn foo src'),
+                          ("Bash", 'FOO="a b" grep -rn foo src \\\n  extra'),
+                          ("Bash", "cd src && \\\n grep -rn foo ."),
+                          ("Bash", "find . -exec grep -l foo {} \\;"),
+                          ("Bash", "cat <<'EOF' | grep -c bash\nuse rg later\nEOF"),
+                          ("PowerShell", "$r = Select-String -Pattern foo -Path a.py"),
+                          ("PowerShell", "Select-String -Pattern foo -Path a.py"),
+                          ("PowerShell", "Get-ChildItem -Recurse | Select-String foo"),
+                          ("PowerShell", "Get-ChildItem | ForEach-Object { Select-String foo $_ }")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.searches_of(cmd, tool)[0], 1)
+
+    def test_a_one_line_shell_c_script_is_scanned_like_a_multi_line_one(self):
+        # SA26 G-2: `bash -c "grep ..."`, `sh -c '...'`, `pwsh -Command "..."` and `cmd /c "..."` on one line.
+        for tool, cmd in (("Bash", 'bash -c "grep -rn foo src"'),
+                          ("Bash", "sh -c 'rg foo src'"),
+                          ("Bash", 'bash -lc "cd /r && grep -rn foo src"'),
+                          ("Bash", 'bash -o pipefail -c "grep -rn foo src"'),
+                          ("Bash", 'sudo bash -c "grep -rn foo src"'),
+                          ("Bash", 'cmd /c "findstr /s foo *.py"'),
+                          ("PowerShell", 'pwsh -NoProfile -Command "Select-String -Pattern foo -Path a.py"'),
+                          ("PowerShell", "powershell -Command 'Get-ChildItem | Select-String foo'")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.searches_of(cmd, tool), (1, 0))
+        for tool, cmd in (("Bash", 'bash -c "echo use grep here"'),
+                          ("Bash", "sh -c 'echo rg'"),
+                          ("Bash", 'bash -c "ls -la"'),
+                          ("PowerShell", "pwsh -Command \"Write-Host 'use Select-String'\"")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.searches_of(cmd, tool), (0, 0))
+
+    def test_the_c_option_word_pattern_does_not_cross_a_separator(self):
+        # SA26 G-3: `bash build.sh; python -c "..."` is not bash's script.
+        for shell in ("bash build.sh", "pwsh build.ps1", "powershell build.ps1"):
+            for sep in (";", "&&", "|", "&"):
+                for body in ('"x\ngrep -rn foo src\n"', '"grep -rn foo src"'):
+                    cmd = f"{shell} {sep} python -c {body}"
+                    with self.subTest(cmd=cmd):
+                        self.assertEqual(self.searches_of(cmd)[0], 0)
+        # the same flag, with its words on one side of the separator, still hides nothing
+        self.assertEqual(self.searches_of('bash -o pipefail -c "set -e\ngrep -rn foo src\n"')[0], 1)
+
     def test_unknown_commands_and_urls_contribute_nothing(self):
         lk = self.lookups("python build.py && curl https://x/a.py && echo backend/a.py")
         self.assertEqual((lk.searched, lk.read, lk.search_paths, lk.read_paths),
