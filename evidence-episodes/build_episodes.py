@@ -733,8 +733,24 @@ def summarize(rows: list[dict[str, Any]], cohorts: list[Cohort], issues: Counter
 
 # ---------------------------------------------------------------- main
 
+def duplicate_names(specs: list[tuple[str, Path]]) -> list[str]:
+    """Names given more than once, in first-seen order."""
+    seen: set[str] = set()
+    dups: list[str] = []
+    for name, _ in specs:
+        if name in seen and name not in dups:
+            dups.append(name)
+        seen.add(name)
+    return dups
+
+
 def build(sources: list[tuple[str, Path]], transcript_roots: list[tuple[str, Path]],
           cohort_specs: list[tuple[str, Path]], out: Path) -> dict[str, Any]:
+    # Names key the precedence ranks and the per-cohort summary: a repeated one would let the
+    # last occurrence win silently and hide an ambiguous copy.
+    for kind, specs in (("source", sources), ("transcript root", transcript_roots), ("cohort", cohort_specs)):
+        if dups := duplicate_names(specs):
+            raise ValueError(f"{kind} names must be unique, repeated: {', '.join(dups)}")
     copies, trees, issues = discover_packets(sources)
     cohorts = [load_cohort(name, path) for name, path in cohort_specs]
     for c in cohorts:
@@ -815,9 +831,9 @@ def main(argv: list[str] | None = None) -> int:
     roots = [_named(s, "--transcripts") if "=" in s else (f"t{i}", Path(s))
              for i, s in enumerate(args.transcripts)]
     cohorts = [_named(s, "--cohort") for s in args.cohort]
-    names = [n for n, _ in sources]
-    if len(set(names)) != len(names):
-        ap.error("source names must be unique")
+    for flag, specs in (("--source", sources), ("--transcripts", roots), ("--cohort", cohorts)):
+        if dups := duplicate_names(specs):
+            ap.error(f"{flag} names must be unique, repeated: {', '.join(dups)}")
     for _, p in sources + roots + cohorts:
         if not p.exists():
             ap.error(f"input not found: {p}")
