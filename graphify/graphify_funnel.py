@@ -731,6 +731,12 @@ def _shell_path(arg: str, base: str | None) -> str | None:
     return norm_path(arg.rstrip("/\\") or arg)
 
 
+def _tool_path_arg(arg: str, tool: str) -> str:
+    """PowerShell takes backslash and slash as path separators on every platform; use slash so a POSIX host
+    reading a Windows transcript still splits the path."""
+    return arg.replace("\\", "/") if tool == "PowerShell" else arg
+
+
 def shell_lookups(command: str, tool: str, cwd: str | None) -> ShellLookups:
     """Searches and reads in a shell command, with the paths they touched.
 
@@ -755,13 +761,13 @@ def shell_lookups(command: str, tool: str, cwd: str | None) -> ShellLookups:
             head = head[:-4]
         if head == "git":
             while len(args) >= 2 and args[0] == "-C":
-                here = _shell_path(args[1], here) or here
+                here = _shell_path(_tool_path_arg(args[1], tool), here) or here
                 args = args[2:]
             if args:
                 head, args = f"git {args[0].lower()}", args[1:]
         if head in SHELL_CD_CMDS:
             target = next((a for a in args if not a.startswith("-")), None)
-            dest = _shell_path(target, base) if target else None
+            dest = _shell_path(_tool_path_arg(target, tool), base) if target else None
             if dest:
                 base = dest
             continue
@@ -783,7 +789,7 @@ def shell_lookups(command: str, tool: str, cwd: str | None) -> ShellLookups:
             positional.append(a)
         if head in SHELL_PATTERN_FIRST and not pattern_given:
             positional = positional[1:]
-        found = {p for p in (_shell_path(a, here) for a in positional) if p}
+        found = {p for p in (_shell_path(_tool_path_arg(a, tool), here) for a in positional) if p}
         if is_search:
             out.searched = True
             if not found and here and here != (norm_path(cwd) if cwd else None) and not piped:
