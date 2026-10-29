@@ -148,7 +148,9 @@ class FunnelCase(unittest.TestCase):
         scan = gf.discover_sessions(self.projects, SINCE, UNTIL)
         records = gf.load_log(self.log if log is None else log, SINCE, UNTIL)
         cfg = gf.parse_config(self.cfg, self.root)
-        return gf.analyse(scan, records, self.resolver, cfg, SINCE, UNTIL)
+        # Agent definitions come from the fixture, never the real user-level agents folder.
+        return gf.analyse(scan, records, self.resolver, cfg, SINCE, UNTIL,
+                          user_agents=self.root / "user-agents")
 
     def write_cfg(self, cfg: dict, folder: Path | None = None) -> Path:
         path = (folder or self.root) / "graphify.local.json"
@@ -206,6 +208,139 @@ class Routing(FunnelCase):
         files = [lane / f"m{i}.py" for i in range(3)]
         Transcript(self.repo).greps(6).reads(files).write(self.projects, "p", "s-lane")
         self.assertEqual(self.run_funnel()["routing"]["exploration_units"], 1)
+
+
+class AnyAgentType(FunnelCase):
+    def test_custom_agent_type_counts_as_exploration(self):
+        sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))
+        Transcript(self.repo).subagent("c1", "backend-endpoint-reviewer", sub) \
+            .write(self.projects, "p", "s-custom")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["exploration_units"], 1)
+        self.assertIn("backend-endpoint-reviewer:c1", out["bypassed"][0])
+
+    def test_unknown_type_is_judged_shell_capable(self):
+        sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))
+        Transcript(self.repo).subagent("u1", "", sub).write(self.projects, "p", "s-untyped")
+        out = self.run_funnel()
+        self.assertEqual(out["routing"]["verdict"], gf.FAIL)
+        self.assertIn("judged shell-capable", " ".join(out["inputs"]["problems"]))
+
+
+class ShellLookups(FunnelCase):
+    def lookups(self, cmd: str, tool: str = "Bash", cwd: Path | None = None) -> gf.ShellLookups:
+        return gf.shell_lookups(cmd, tool, str(cwd or self.other))
+
+    def test_cd_then_relative_grep_resolves_against_cd_target(self):
+        lk = self.lookups(f'cd "{self.repo.as_posix()}" && grep -rn "def sync" backend/aec')
+        self.assertTrue(lk.searched)
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend" / "aec"))})
+
+    def test_pattern_and_option_values_are_not_paths(self):
+        lk = self.lookups(f'grep -rn -A 3 "a/b.py" {self.repo.as_posix()}/backend')
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
+        lk = self.lookups("sed -n '1,40p' backend/router.py", cwd=self.repo)
+        self.assertTrue(lk.read)
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "backend" / "router.py"))})
+        lk = self.lookups("rg -e x/y.py -g '*.py' backend/", cwd=self.repo)
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
+
+    def test_bare_search_after_cd_searches_the_cd_target(self):
+        lk = self.lookups(f"cd {self.repo.as_posix()}/backend && rg sync_rooms")
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
+        # a search fed by a pipe reads stdin, not the cd target
+        lk = self.lookups(f"cd {self.repo.as_posix()}/backend && git log | grep fix")
+        self.assertEqual(lk.search_paths, set())
+
+    def test_git_show_ref_path_and_git_dash_c(self):
+        lk = self.lookups(f"git -C {self.repo.as_posix()} show HEAD:backend/m0.py")
+        self.assertTrue(lk.read)
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "backend" / "m0.py"))})
+
+    def test_powershell_reads_and_globs(self):
+        lk = self.lookups(f"Get-Content -Path '{self.repo}\\backend\\m1.py' -TotalCount 20", "PowerShell")
+        self.assertTrue(lk.read)
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "backend" / "m1.py"))})
+        lk = self.lookups(f"Select-String -Pattern sync -Path {self.repo}\\backend\\*.py", "PowerShell")
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
+
+    def test_unknown_commands_and_urls_contribute_nothing(self):
+        lk = self.lookups("python build.py && curl https://x/a.py && echo backend/a.py")
+        self.assertEqual((lk.searched, lk.read, lk.search_paths, lk.read_paths),
+                         (False, False, set(), set()))
+
+    def test_shell_exploration_is_covered(self):
+        repo = self.repo.as_posix()
+        sub = Transcript(self.other) \
+            .tool("Bash", {"command": f"cd {repo} && grep -rn sync backend/"}) \
+            .tool("Bash", {"command": f"cat {repo}/backend/m0.py"}) \
+            .tool("Bash", {"command": f"sed -n 1,50p {repo}/backend/m1.py"})
+        Transcript(self.repo).subagent("b1", "general-purpose", sub).write(self.projects, "p", "s-sh")
+        # the subagent's own cwd is outside the graph: not a routing unit
+        self.assertEqual(self.run_funnel()["routing"]["exploration_units"], 0)
+        sub2 = Transcript(self.repo) \
+            .tool("Bash", {"command": "grep -rn sync backend/"}) \
+            .tool("Bash", {"command": "cat backend/m0.py"}) \
+            .tool("Bash", {"command": "sed -n 1,50p backend/m1.py"})
+        Transcript(self.repo).subagent("b2", "general-purpose", sub2).write(self.projects, "p", "s-sh2")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["exploration_units"], 1)
+        self.assertIn("in_graph=3", out["bypassed"][0])
+        self.assertEqual(out["lookup_units_without_path_evidence"], 0)
+
+
+class PerUnitCwd(FunnelCase):
+    def test_subagent_outside_graph_in_graph_backed_session_is_not_a_unit(self):
+        sub = Transcript(self.other).greps(3, self.repo / "backend").reads(self.backend_files(3))
+        Transcript(self.repo).hint().subagent("o1", "Explore", sub).write(self.projects, "p", "s-moved")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["graph_backed_units"], 1)   # the main thread only
+        self.assertEqual(out["exploration_units"], 0)
+
+    def test_subagent_in_graph_from_graphless_session_is_a_unit(self):
+        sub = Transcript(self.repo).greps(3).reads(self.backend_files(3))
+        Transcript(self.other).hint().subagent("i1", "Explore", sub).write(self.projects, "p", "s-into")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["graph_backed_units"], 1)
+        self.assertEqual(out["exploration_units"], 1)
+        self.assertIn("cwd=" + str(self.repo), out["bypassed"][0])
+
+
+class GraphUnusable(FunnelCase):
+    def agent(self, folder: Path, name: str, tools: str) -> None:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{name}.md").write_text(f"---\nname: {name}\ntools: {tools}\n---\nbody\n",
+                                           encoding="utf-8")
+
+    def session_with(self, agent_type: str, sid: str) -> None:
+        sub = Transcript(self.repo).greps(3).reads(self.backend_files(3))
+        Transcript(self.repo).subagent("r1", agent_type, sub).write(self.projects, "p", sid)
+
+    def test_project_agent_without_shell_is_unusable_not_bypass(self):
+        self.agent(self.repo / ".claude" / "agents", "reviewer", "Read, Grep, Glob")
+        self.session_with("reviewer", "s-noshell")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["verdict"], gf.INSUFFICIENT)
+        self.assertEqual((out["exploration_units"], out["graph_unusable_units"]), (0, 1))
+        self.assertEqual(out["bypassed"], [])
+        self.assertIn("reviewer:r1", out["graph_unusable"][0])
+        self.assertEqual(out["eligibility_unknown_sessions"], 0)
+
+    def test_user_agent_with_shell_pattern_is_still_a_bypass(self):
+        self.agent(self.root / "user-agents", "runner", '[Read, "Bash(git:*)"]')
+        self.session_with("runner", "s-shell")
+        out = self.run_funnel()["routing"]
+        self.assertEqual((out["verdict"], out["graph_unusable_units"]), (gf.FAIL, 0))
+
+    def test_builtin_no_shell_agent_is_unusable(self):
+        self.session_with("claude-code-guide", "s-guide")
+        self.assertEqual(self.run_funnel()["routing"]["graph_unusable_units"], 1)
+
+    def test_frontmatter_parser(self):
+        fm = gf.parse_frontmatter("---\nname: a\ntools:\n  - Read\n  - Bash\n---\n")
+        self.assertEqual(fm, {"name": "a", "tools": ["Read", "Bash"]})
+        self.assertIsNone(gf.parse_frontmatter("---\nname: a\n"))
+        self.assertIsNone(gf.parse_frontmatter("no frontmatter"))
 
 
 class Execution(FunnelCase):
