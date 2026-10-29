@@ -39,6 +39,12 @@ in effect at its position in the command: a `cd` inside `( ... )` or `$( ... )` 
 with that subshell, one inside a `{ ...; }` group carries on. Two paths match when equal or when one ends with `/` plus the other, so
 a path relative to a subdirectory matches its repo-relative form.
 
+When the brief's repository lives on a drive, the Git Bash, WSL and Cygwin spellings of a drive path (a single
+letter right after the root, `mnt` or `cygdrive`) are read as the same place as the drive-letter form, so an
+in-repo touch spelled that way is scored, not counted in `outside_repo`. Anything that is not a single drive
+letter (`/tmp`, a longer first segment) and any UNC share keep their meaning, and a repository that is not on
+a drive (Linux, macOS, a share) is never reinterpreted.
+
 ## Metrics
 
 `null` whenever the denominator is empty.

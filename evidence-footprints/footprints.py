@@ -116,10 +116,31 @@ def main_root(repo_root: str) -> str:
     return MAIN_ROOT_RE.sub("", repo_root.replace("\\", "/").rstrip("/"))
 
 
+# Git Bash, WSL and Cygwin spell a drive as a single letter right after the root (or after mnt or cygdrive), which
+# is the same place as the drive-letter form. Anything else (/tmp, /usr, a multi-letter first segment, a mount
+# that is not a single letter) is a POSIX location and is left alone, as is a UNC share.
+DRIVE_ROOT_RE = re.compile(r"^[a-z]:/")
+MSYS_DRIVE_RE = re.compile(r"^/(?:(?:mnt|cygdrive)/)?([a-z])(?=/|$)")
+
+
+def drive_form(p: str) -> str:
+    """A lowercase, forward-slash path with a Git Bash, WSL or Cygwin drive prefix rewritten as a drive-letter path."""
+    m = MSYS_DRIVE_RE.match(p)
+    return f"{m.group(1)}:/{p[m.end():].lstrip('/')}" if m else p
+
+
 def norm(raw: str, roots: Iterable[str]) -> str | None:
-    """Repo-relative lowercase path; None when absolute outside every root or empty."""
+    """Repo-relative lowercase path; None when absolute outside every root or empty.
+
+    On a repository that lives on a drive, Git Bash, WSL and Cygwin drive paths are read as the same
+    drive-letter path first (SA26-2). A repository that is not on a drive (Linux, macOS, a UNC share)
+    is never reinterpreted.
+    """
     p = raw.replace("\\", "/").strip().strip("'\"").lower()
-    for root in sorted({r.replace("\\", "/").rstrip("/").lower() for r in roots}, key=len, reverse=True):
+    ordered = sorted({r.replace("\\", "/").rstrip("/").lower() for r in roots}, key=len, reverse=True)
+    if any(DRIVE_ROOT_RE.match(r) for r in ordered):
+        p = drive_form(p)
+    for root in ordered:
         if p == root:
             return None
         if p.startswith(root + "/"):
