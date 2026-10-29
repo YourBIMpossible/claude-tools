@@ -364,5 +364,11 @@
     "rule": "windows-drive-path",
     "line_sha256": "d4e2dbdea6478cb0eece4f1925bb6c8aba27662c942f207ca52687b836daee8a",
     "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
+  },
+  {
+    "path": ".gitignore",
+    "rule": "claude-worktree-path",
+    "line_sha256": "9a3ade7cd53e732191ebb88bb9bb16f98ee475646143f458019c46403f38dc17",
+    "reason": "Functional ignore rule: keeps Claude Code worktrees created inside this repo from ever being staged; a relative pattern with no machine-specific prefix."
   }
 ]
