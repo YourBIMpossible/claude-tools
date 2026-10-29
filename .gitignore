@@ -10,6 +10,10 @@
 # ctxdex/data = FTS indexes built from private repos (regenerable)
 /ctxdex/data/
 
+# Claude Code worktrees made inside this public repo (one checkout per parallel session):
+# a stray `git add -A` must never stage another session's checkout
+/.claude/worktrees/
+
 # Vendored third-party binaries (download at setup — see bin/README.md)
 /bin/*.exe
 
@@ -62,6 +66,12 @@
 # last-known-good python/dashboard settings the health check falls back to when the config is unparseable
 /graphify/publish-settings.lkg.json
 *.bak-cutover-*
+
+# Local-only folders and safety copies: machine-local working data that must never be staged in this public repo
+/backups/
+/downloads/
+/fleet-setup/dist/
+*.pre-completion.bak
 
 # Secrets / local env
 .env

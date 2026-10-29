@@ -370,5 +370,11 @@
     "rule": "windows-drive-path",
     "line_sha256": "aea2cc086a7dc822ef05cf4712b4651b55b7bb79f9f8237f8af17d30205117e0",
     "reason": "Synthetic fixture asserting the MSYS-to-Windows drive mapping (a slash-letter prefix to a drive-letter prefix); no machine-specific path."
+  },
+  {
+    "path": ".gitignore",
+    "rule": "claude-worktree-path",
+    "line_sha256": "9a3ade7cd53e732191ebb88bb9bb16f98ee475646143f458019c46403f38dc17",
+    "reason": "Functional ignore rule: keeps Claude Code worktrees created inside this repo from ever being staged; a relative pattern with no machine-specific prefix."
   }
 ]
