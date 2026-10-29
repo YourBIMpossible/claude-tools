@@ -366,6 +366,12 @@
     "reason": "Synthetic path fixture for the evidence-capture path-normalisation and attribution tests (placeholder drive, 'someone', 'repo'); no real user, host or machine path."
   },
   {
+    "path": "evidence-capture/tests/test_capture.py",
+    "rule": "windows-drive-path",
+    "line_sha256": "aea2cc086a7dc822ef05cf4712b4651b55b7bb79f9f8237f8af17d30205117e0",
+    "reason": "Synthetic fixture asserting the MSYS-to-Windows drive mapping (a slash-letter prefix to a drive-letter prefix); no machine-specific path."
+  },
+  {
     "path": ".gitignore",
     "rule": "claude-worktree-path",
     "line_sha256": "9a3ade7cd53e732191ebb88bb9bb16f98ee475646143f458019c46403f38dc17",
