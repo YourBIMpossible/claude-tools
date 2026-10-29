@@ -50,6 +50,7 @@ Step "local-audit census-only guard" { python local-audit/test_local_audit.py }
 Step "slop_prepass self-test" { python local-audit/slop_prepass.py --self-test }
 Step "graphify refresh failure-accounting tests" { python graphify/test_refresh_graphs.py }
 Step "graphify health-check boundary tests" { python graphify/test_health_check.py }
+Step "scheduling hidden-launcher tests" { python scheduling/test_run_hidden.py }
 Step "graphify adoption-funnel tests" { python graphify/test_graphify_funnel.py }
 Step "evidence-relevance tests" { python evidence-relevance/test_measure_relevance.py }
 Step "evidence-archive evacuation tests" { python evidence-archive/test_evacuate_worktree.py }

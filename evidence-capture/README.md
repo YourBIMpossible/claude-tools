@@ -67,7 +67,10 @@ Two directories, named by `EC_CAPTURE_META` and `EC_CAPTURE_CONTENT` or by
   future prompts or on a detached child surviving: a hook killed at its timeout takes
   its detached child with it. The checkpoint report notes a backstop that failed or has
   not succeeded for 48 hours. `--task-xml PATH` writes a Task Scheduler definition for
-  review; nothing here registers it.
+  review; nothing here registers it. The action it writes is the hidden launcher
+  (`wscript.exe //B //Nologo scheduling/run-hidden.js python.exe capture.py backstop`, see
+  `scheduling/README.md`): a console action flashes a window on every run, and the launcher passes the
+  exit code through.
 
 Every failure exits 0 with one log line. A failure that cannot be written to the
 stores goes to `ec-capture-pending.jsonl` in the temp directory and becomes a failed
