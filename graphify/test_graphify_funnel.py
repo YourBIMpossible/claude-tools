@@ -264,6 +264,55 @@ class ShellLookups(FunnelCase):
         lk = self.lookups(f"Select-String -Pattern sync -Path {self.repo}\\backend\\*.py", "PowerShell")
         self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
 
+    def test_commands_inside_a_comment_are_not_lookups(self):
+        # SA26-16: a search named in a trailing comment never ran.
+        lk = self.lookups("cat a.py  # later; grep -rn foo backend/b.py", cwd=self.repo)
+        self.assertFalse(lk.searched)
+        self.assertEqual(lk.search_paths, set())
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "a.py"))})
+
+    def test_a_commented_out_search_is_not_counted_in_the_unit(self):
+        # SA26-16: the unit's search count must ignore the comment too, not just shell_lookups.
+        path = Transcript(self.repo) \
+            .tool("Bash", {"command": "cat a.py  # later; grep -rn foo backend/b.py"}) \
+            .tool("Bash", {"command": "ls  # rg later"}) \
+            .write(self.projects, "p", "s-comment")
+        unit = gf.load_session(path).units["main"]
+        self.assertEqual((unit.searches, unit.reads), (0, 1))
+
+    def unit_of(self, tool: str, cmd: str) -> gf.Unit:
+        path = Transcript(self.repo).tool(tool, {"command": cmd}).write(self.projects, "p", "s-one")
+        return gf.load_session(path).units["main"]
+
+    def test_a_search_in_a_script_fed_to_a_shell_is_counted(self):
+        # SA26-16: blanking heredocs and multi-line quotes must not hide a script a shell runs.
+        for tool, cmd in (("Bash", 'bash -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", "bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "sh <<'EOF'\nrg foo src\nEOF"),
+                          ("PowerShell", 'pwsh -NoProfile -Command "\n Select-String -Pattern foo -Path src\\a.py\n"'),
+                          ("Bash", "cat <<'EOF' | bash\ngrep -rn foo src\nEOF"),
+                          ("Bash", "sudo bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "ssh host bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "FOO=1 bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", 'bash --norc -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash -o pipefail -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash --rcfile x -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash -euo pipefail -c "set -e\ngrep -rn foo src\n"')):
+            with self.subTest(cmd=cmd):
+                unit = self.unit_of(tool, cmd)
+                self.assertEqual((unit.searches, unit.reads), (1, 0))
+
+    def test_a_heredoc_that_is_data_is_not_a_search(self):
+        for cmd in ("git commit -m \"$(cat <<'EOF'\nfix: stop the grep fallback\nEOF\n)\"",
+                    "git commit -F - <<'EOF'\nfix: drop the grep fallback\nEOF",
+                    "cat > notes.md <<'EOF'\nuse rg here\nEOF",
+                    "tee notes.md <<'EOF'\nuse grep here\nEOF",
+                    "python - <<'EOF'\nprint('run grep later')\nEOF",
+                    "node <<'EOF'\nconsole.log('use grep here')\nEOF",
+                    "bash <<'EOF'\necho done  # grep later\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.unit_of("Bash", cmd).searches, 0)
+
     def test_unknown_commands_and_urls_contribute_nothing(self):
         lk = self.lookups("python build.py && curl https://x/a.py && echo backend/a.py")
         self.assertEqual((lk.searched, lk.read, lk.search_paths, lk.read_paths),
@@ -473,6 +522,16 @@ class Execution(FunnelCase):
         self.assertEqual(ex["calls"], 5)
         self.assertEqual(ex["bare_cli_calls"], 3)
 
+    def test_a_mention_inside_a_comment_is_not_a_call(self):
+        # SA26-16: text after `#` is a comment; a separator in it is no command position.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'cat a.py  # later; graphify query "foo"'}) \
+            .tool("PowerShell", {"command": 'Get-Content a.py # then; python /x/query_reranked.py "q"'}) \
+            .write(self.projects, "p", "s-comment")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 0)
+        self.assertEqual(ex["bare_cli_calls"], 0)
+
     def test_commands_inside_a_quoted_shell_argument_are_not_counted(self):
         # Accepted limit of the quoted-separator rule: the inner command is an argument string.
         Transcript(self.repo) \
@@ -557,12 +616,121 @@ class OrganicSeparation(FunnelCase):
         self.assertEqual(out["execution"]["calls"], 1)
         self.assertEqual(out["execution"]["copied_calls_excluded"], 1)
 
+    def test_forked_exploration_counts_once_in_routing(self):
+        # SA26-6: the fork repeats the original's lookups (same tool_use ids); one real unit.
+        t = Transcript(self.repo).greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "p", "s-orig")
+        t.write(self.projects, "p", "s-fork")
+        r = self.run_funnel()["routing"]
+        self.assertEqual((r["graph_backed_units"], r["exploration_units"], len(r["bypassed"])), (2, 1, 1))
+
+    def test_continuation_call_covers_its_copied_exploration(self):
+        # SA26-6: a continued transcript holds the earlier lookups and then queries graphify
+        # itself; the conversation is one used unit, not a bypass plus a used unit.
+        t = Transcript(self.repo).greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "p", "s-orig")
+        t.query("later q")
+        for rec in t.lines[-2:]:
+            rec["sessionId"] = "s-cont"
+        t.write(self.projects, "p", "s-cont")
+        self.log_record("later q", t.t)
+        r = self.run_funnel()["routing"]
+        self.assertEqual((r["verdict"], r["exploration_units"], r["bypassed"]), (gf.PASS, 1, []))
+        self.assertEqual(r["used_graphify"], ["s-cont/main"])
+        self.assertEqual(r["non_exploration_callers"], 0)
+
     def test_repeated_tool_ids_are_counted_once(self):
         t = Transcript(self.repo)
         for _ in range(3):
             t.tool("Grep", {"pattern": "x"}, tool_id="toolu_same")
         path = t.write(self.projects, "p", "s-rep")
         self.assertEqual(gf.load_session(path).units["main"].searches, 1)
+
+
+class CallWindow(FunnelCase):
+    """SA26-4/5: the log is windowed per record, so calls are too; a session is kept whole."""
+
+    def test_call_before_the_window_in_a_spanning_session_is_not_judged(self):
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)).query("q-early")
+        self.log_record("q-early", t.t)          # logged, but before the window
+        t.t = SINCE + timedelta(hours=1)
+        t.greps(1).write(self.projects, "p", "s-span")
+        out = self.run_funnel()
+        self.assertEqual(out["sessions"]["total"], 1)
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"]),
+                         (0, gf.INSUFFICIENT, []))
+        self.assertEqual(ex["calls_outside_window_excluded"], 1)
+
+    def test_fork_of_a_pre_window_session_drops_the_copied_call(self):
+        orig = Transcript(self.repo, SINCE - timedelta(days=2)).query("q-old")
+        for rec in orig.lines:
+            rec["sessionId"] = "s-orig"
+        self.log_record("q-old", orig.t)
+        path = orig.write(self.projects, "p", "s-orig")
+        old = (SINCE - timedelta(days=1)).timestamp()
+        os.utime(path, (old, old))               # below the mtime floor: never loaded
+        fork = Transcript(self.repo, SINCE + timedelta(hours=1)).greps(1)
+        for rec in fork.lines:
+            rec["sessionId"] = "s-fork"
+        fork.lines = [dict(r) for r in orig.lines] + fork.lines
+        fork.write(self.projects, "p", "s-fork")
+        out = self.run_funnel()
+        self.assertEqual(out["sessions"]["total"], 1)
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"]),
+                         (0, gf.INSUFFICIENT, []))
+
+    def test_call_inside_the_window_is_still_judged(self):
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)).greps(1)
+        t.t = SINCE + timedelta(hours=1)
+        t.query("q-late").write(self.projects, "p", "s-span2")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["calls_outside_window_excluded"]),
+                         (1, gf.FAIL, 0))
+
+    def edge_call(self, session_id: str, start: datetime, end: datetime) -> None:
+        """A wrapper call that starts at `start` and returns, and is logged, at `end`."""
+        t = Transcript(self.repo, start - timedelta(seconds=1))
+        tid = f"toolu_{session_id}"
+        t.lines.append({"timestamp": iso(start), "cwd": t.cwd, "type": "assistant",
+                        "message": {"content": [{"type": "tool_use", "id": tid, "name": "Bash", "input": {
+                            "command": 'python "/x/query_reranked.py" "q-edge" --graph "/x/graph.json"'}}]}})
+        t.lines.append({"timestamp": iso(end), "cwd": t.cwd, "type": "user",
+                        "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                                 "is_error": False, "content": "NODE x [src=a.py]"}]}})
+        t.write(self.projects, "p", session_id)
+        self.log_record("q-edge", end)
+
+    def test_call_ending_after_the_window_is_not_judged(self):
+        # The wrapper logs at the call's end, past the log window: no false FAIL.
+        self.edge_call("s-upper", UNTIL - timedelta(seconds=2), UNTIL + timedelta(seconds=8))
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"],
+                          ex["calls_outside_window_excluded"]), (0, gf.INSUFFICIENT, [], 1))
+
+    def test_call_starting_before_the_window_but_ending_in_it_is_judged(self):
+        # Its record is in the log window, so the call is measured, not silently dropped.
+        self.edge_call("s-lower", SINCE - timedelta(seconds=10), SINCE + timedelta(seconds=1))
+        out = self.run_funnel()
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["calls_outside_window_excluded"]),
+                         (1, gf.PASS, 0))
+        self.assertEqual(out["measurement"]["reranked"]["n"], 1)
+
+    def test_test_run_before_the_window_is_not_an_excluded_call(self):
+        # A redirected-log test run is never a call, inside the window or outside it.
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)) \
+            .query("redirected", extra="GRAPHIFY_QUERY_LOG=/tmp/x.log ")
+        t.t = SINCE + timedelta(hours=1)
+        t.greps(1).write(self.projects, "p", "s-test-early")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["calls_outside_window_excluded"], ex["test_alt_log_calls"]),
+                         (0, 0, 0))
 
 
 class Availability(FunnelCase):
@@ -873,6 +1041,32 @@ class InputVisibility(FunnelCase):
         self.assertEqual(out["inputs"]["query_log"]["corrupt_lines"], 2)
         self.assertEqual(out["inputs"]["query_log"]["records_in_window"], 1)
         self.assert_problem(out, "query log has 2 corrupt line(s)")
+
+    def test_query_records_without_a_usable_ts_are_counted(self):
+        # SA26-17: a query record that cannot be placed in time is reported, not dropped.
+        with self.log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"kind": "query", "question": "a", "duration_ms": 5}) + "\n")
+            fh.write(json.dumps({"ts": "not-a-date", "kind": "query", "question": "b"}) + "\n")
+            fh.write(json.dumps({"kind": "refresh"}) + "\n")      # not a query: not counted
+        out = self.run_funnel()
+        q = out["inputs"]["query_log"]
+        self.assertEqual((q["records_in_window"], q["undated_records"]), (0, 2))
+        self.assert_problem(out, "query log has 2 query record(s) without a usable ts")
+
+    def test_undecodable_lines_are_counted_as_corrupt(self):
+        # SA26-18: invalid UTF-8 is a corrupt line in the log and in a transcript.
+        at = T0.isoformat().encode()
+        with self.log.open("ab") as fh:
+            fh.write(b'{"ts": "' + at + b'", "kind": "query", "question": "\xff\xfe"}\n')
+        path = Transcript(self.repo).greps(1).write(self.projects, "p", "s-bytes")
+        with path.open("ab") as fh:
+            fh.write(b'{"timestamp": "' + at + b'", "cwd": "\xff\xfe"}\n')
+        out = self.run_funnel()
+        q = out["inputs"]["query_log"]
+        self.assertEqual((q["records_in_window"], q["corrupt_lines"]), (0, 1))
+        self.assertEqual(out["inputs"]["transcript_corrupt_lines"], 1)
+        self.assert_problem(out, "query log has 1 corrupt line(s)")
+        self.assert_problem(out, "1 corrupt transcript line(s)")
 
     def test_missing_projects_folder(self):
         out = self.run_funnel()

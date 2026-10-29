@@ -85,9 +85,17 @@ _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
 
 
 _QUOTED_SEPARATORS = str.maketrans(";&|()", "     ")
+# The end of a line that passes the next quoted argument to a shell as its script.
+_SHELL_SCRIPT_ARG_RE = re.compile(
+    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+[^\s\"']+)*?\s+-\w*c\w*"
+    r"|(?P<ps>pwsh|powershell)(?:\.exe)?[\"']?(?:\s+[^\s\"']+)*?\s+-c(?:ommand)?"
+    r"|(?P<cmd>cmd)(?:\.exe)?[\"']?\s+/[ck])\s*$", re.I)
+_SHELLS = {"bash": "Bash", "sh": "Bash", "zsh": "Bash", "dash": "Bash", "cmd": "Bash",
+           "pwsh": "PowerShell", "powershell": "PowerShell"}
 
 
-def _blank_quoted_code(command: str, escape: str = "\\") -> str:
+def _blank_quoted_code(command: str, escape: str = "\\",
+                       scripts: list[tuple[str, str]] | None = None) -> str:
     """Replace each quoted string that spans a newline with "", and blank shell separators
     (;&|()) inside single-line quoted strings, so a search pattern such as a\\|graphify query
     in quotes gives `graphify` no command position. A double-quoted string containing $( keeps
@@ -98,8 +106,9 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
     A regex would pair one line's closing quote with the next line's opening quote and blank
     the real command between them, so quotes are paired by walking the string: `escape`
     (backslash for a POSIX shell, backtick for PowerShell) escapes the next character inside
-    "..." and outside quotes, and a `#` comment runs to end of
-    line, so an apostrophe in it opens nothing. An unclosed quote leaves the rest as is.
+    "..." and outside quotes, and a `#` comment runs to end of line and is blanked, so an
+    apostrophe in it opens nothing and a command named in it is no invocation or lookup.
+    An unclosed quote leaves the rest as is.
     """
     out: list[str] = []
     i, n = 0, len(command)
@@ -108,7 +117,7 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
         if ch == "#" and (i == 0 or command[i - 1] in " \t\n;"):
             end = command.find("\n", i)
             end = n if end < 0 else end
-            out.append(command[i:end])
+            out.append(" " * (end - i))
             i = end
         elif ch == escape and i + 1 < n:
             out.append(command[i:i + 2])
@@ -122,6 +131,11 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
                 break
             span = command[i:j + 1]
             if "\n" in span:
+                if scripts is not None:
+                    head = "".join(out)
+                    m = _SHELL_SCRIPT_ARG_RE.search(head[head.rfind("\n") + 1:])
+                    if m:
+                        scripts.append((span[1:-1], "PowerShell" if m.group("ps") else "Bash"))
                 span = '""'
             elif not (ch == '"' and "$(" in span):
                 span = span.translate(_QUOTED_SEPARATORS)
@@ -139,6 +153,43 @@ def code_part(command: str, tool: str = "Bash") -> str:
     command = _HEREDOC_RE.sub("<<HEREDOC", command)
     command = _HERESTRING_RE.sub("@''@", command)
     return _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\")
+
+
+def _shell_named_in(segment: str) -> str | None:
+    """The tool syntax of the first shell named by any word of a command segment, so a shell
+    run through a prefix (`sudo bash`, `FOO=1 bash`, `ssh host bash`) is found too."""
+    for word in segment.split():
+        name = re.split(r"[\\/]", word.strip("\"'"))[-1].lower().removesuffix(".exe")
+        if name in _SHELLS:
+            return _SHELLS[name]
+    return None
+
+
+def shell_script_parts(command: str, tool: str = "Bash") -> list[str]:
+    """The code_part of each script the command hands to a shell, which code_part blanks: a
+    heredoc whose command names a shell (`bash <<'EOF'`, `sudo bash <<'EOF'`) or whose
+    opening line pipes it to one (`cat <<'EOF' | bash`), and a multi-line quoted argument of
+    `bash -c`, `pwsh -Command` or `cmd /c`. A heredoc fed to anything else (`cat > f`, a
+    commit message) is data and is not returned. Nested scripts are included."""
+    scripts: list[tuple[str, str]] = []
+
+    def heredoc(m: re.Match) -> str:
+        line = m.string[:m.start()]
+        body = m.group(0)
+        shell = _shell_named_in(re.split(r"[;&|(]", line[line.rfind("\n") + 1:])[-1])
+        for piped in body[:body.find("\n")].split("|")[1:]:
+            shell = shell or _shell_named_in(re.split(r"[;&(]", piped)[0])
+        if shell:
+            scripts.append((body[body.find("\n") + 1:body.rfind("\n")], shell))
+        return "<<HEREDOC"
+
+    command = _HEREDOC_RE.sub(heredoc, command)
+    command = _HERESTRING_RE.sub("@''@", command)
+    _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\", scripts)
+    parts: list[str] = []
+    for body, shell in scripts:
+        parts += [code_part(body, shell), *shell_script_parts(body, shell)]
+    return parts
 
 
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use
@@ -219,21 +270,51 @@ class Call:
         return "ok"
 
 
+@dataclass(frozen=True)
+class Lookup:
+    """One search or read tool use and the paths it touched."""
+    tool_use_id: str
+    search: bool
+    files: frozenset[str] = frozenset()          # Read targets, shell read arguments
+    search_paths: frozenset[str] = frozenset()   # Grep/Glob paths, shell search paths
+
+
 @dataclass
 class Unit:
     session: "Session"
     unit_id: str                  # "main", an agent id, or "sidechain"
     agent_type: str | None
-    searches: int = 0
-    reads: int = 0
-    files: set[str] = field(default_factory=set)          # Read targets, shell read arguments
-    search_paths: set[str] = field(default_factory=set)   # Grep/Glob paths, shell search paths
+    lookups: list[Lookup] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
     skill_selected: bool = False
     spawned: list[dict] = field(default_factory=list)   # Agent calls made by this unit
     cwd: str | None = None              # first cwd in this unit's own records
     resolved: dict | None = None        # the graph for that cwd (set by analyse)
     repo: str | None = None
+    routing_copies: set[str] = field(default_factory=set)   # tool_use ids routing counts elsewhere
+
+    def _kept(self) -> list[Lookup]:
+        return [lk for lk in self.lookups if lk.tool_use_id not in self.routing_copies]
+
+    @property
+    def searches(self) -> int:
+        return sum(1 for lk in self._kept() if lk.search)
+
+    @property
+    def reads(self) -> int:
+        return sum(1 for lk in self._kept() if not lk.search)
+
+    @property
+    def files(self) -> set[str]:
+        return {f for lk in self._kept() for f in lk.files}
+
+    @property
+    def search_paths(self) -> set[str]:
+        return {p for lk in self._kept() for p in lk.search_paths}
+
+    def routing_calls(self) -> list[Call]:
+        """Real (not redirected-log) calls that routing credits to this unit."""
+        return [c for c in self.calls if not c.alt_log and c.tool_use_id not in self.routing_copies]
 
     @property
     def label(self) -> str:
@@ -295,6 +376,7 @@ class QueryLog:
     records: list[dict] = field(default_factory=list)
     corrupt_lines: int = 0
     error: str | None = None
+    undated_records: int = 0     # query records whose ts is missing or unparseable
 
 
 @dataclass
@@ -341,15 +423,16 @@ def norm_path(p: str) -> str:
 
 
 def iter_json_lines(path: Path, stats: ReadStats) -> Iterable[dict]:
-    """Yield the JSON objects in a JSONL file; corrupt lines and read errors go to `stats`."""
+    """Yield the JSON objects in a JSONL file. Corrupt lines (invalid UTF-8, invalid JSON, or
+    not an object) and read errors go to `stats`."""
     try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if not line.strip():
+        with path.open("rb") as fh:
+            for raw in fh:
+                if not raw.strip():
                     continue
                 try:
-                    rec = json.loads(line)
-                except ValueError:
+                    rec = json.loads(raw.decode("utf-8"))
+                except ValueError:       # UnicodeDecodeError is a ValueError
                     stats.corrupt_lines += 1
                     continue
                 if isinstance(rec, dict):
@@ -565,15 +648,16 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
 def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, Call],
               origin_session: str | None = None, cwd: str | None = None) -> None:
     name = block.get("name", "")
+    tool_id = str(block.get("id", ""))
     inp = block.get("input") if isinstance(block.get("input"), dict) else {}
     if name in SEARCH_TOOLS:
-        unit.searches += 1
-        if isinstance(inp.get("path"), str) and inp["path"]:
-            unit.search_paths.add(norm_path(inp["path"]))
+        path = inp.get("path")
+        unit.lookups.append(Lookup(tool_id, True, search_paths=frozenset(
+            [norm_path(path)] if isinstance(path, str) and path else [])))
     elif name == "Read":
-        unit.reads += 1
-        if isinstance(inp.get("file_path"), str):
-            unit.files.add(norm_path(inp["file_path"]))
+        path = inp.get("file_path")
+        unit.lookups.append(Lookup(tool_id, False, files=frozenset(
+            [norm_path(path)] if isinstance(path, str) else [])))
     elif name == "Skill" and str(inp.get("skill", "")).split(":")[-1] == "graphify":
         unit.skill_selected = True
     elif name in AGENT_TOOLS:
@@ -586,19 +670,18 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
         code = code_part(cmd, name)
         if GRAPHIFY_CALL_RE.search(code):
             m = QUESTION_RE.search(cmd)
-            call = Call(unit, str(block.get("id", "")), ts, cmd, m.group(1) if m else None,
+            call = Call(unit, tool_id, ts, cmd, m.group(1) if m else None,
                         bool(WRAPPER_RE.search(code)), bool(ALT_LOG_RE.search(cmd)),
                         origin_session=origin_session)
             unit.calls.append(call)
             pending[call.tool_use_id] = call
         else:
             lk = shell_lookups(cmd, name, cwd)
-            if SHELL_SEARCH_RE.search(cmd) or lk.searched:
-                unit.searches += 1
-            elif lk.read:
-                unit.reads += 1
-            unit.search_paths |= lk.search_paths
-            unit.files |= lk.read_paths
+            searched = (any(SHELL_SEARCH_RE.search(part) for part in [code, *shell_script_parts(cmd, name)])
+                        or lk.searched)
+            if searched or lk.read:          # paths only come with a search or a read
+                unit.lookups.append(Lookup(tool_id, searched, frozenset(lk.read_paths),
+                                           frozenset(lk.search_paths)))
 
 
 @dataclass
@@ -787,14 +870,18 @@ def load_log(path: Path | None, since: datetime, until: datetime) -> QueryLog:
     if not path.is_file():
         return QueryLog(path, "not-a-file")
     stats = ReadStats()
-    recs = []
+    recs, undated = [], 0
     for r in iter_json_lines(path, stats):
+        if r.get("kind") != "query":
+            continue
         ts = parse_ts(r.get("ts"))
-        if r.get("kind") == "query" and ts and since - MATCH_SLACK <= ts <= until + MATCH_SLACK:
+        if ts is None:
+            undated += 1          # cannot be placed in any window: reported, never dropped silently
+        elif since - MATCH_SLACK <= ts <= until + MATCH_SLACK:
             r["_ts"] = ts
             recs.append(r)
     return QueryLog(path, "unreadable" if stats.error else "ok", recs,
-                    stats.corrupt_lines, stats.error)
+                    stats.corrupt_lines, stats.error, undated)
 
 
 def finite_duration(value: Any) -> float | None:
@@ -811,9 +898,8 @@ def mark_copied_calls(sessions: list[Session]) -> int:
     the earlier history, so one real invocation shows up in every copy, yet the query log has
     one record for it. The copy kept is the one in the session named by the record's own
     sessionId (copies keep the originating id); without that, the earliest-starting session.
-    Copies leave execution and measurement but stay in routing: the copied transcript also
-    carries the original's searches and reads, so dropping only the call would turn the
-    copying unit into a false "bypassed".
+    Copies leave execution and measurement; routing dedupes on its own terms
+    (mark_routing_copies).
     """
     def rank(c: Call) -> tuple:
         s = c.unit.session
@@ -831,6 +917,34 @@ def mark_copied_calls(sessions: list[Session]) -> int:
         for c in sorted(copies, key=rank)[1:]:
             c.copy = True
             marked += 1
+    return marked
+
+
+def mark_routing_copies(units: list[Unit]) -> int:
+    """Count each lookup and call once in routing; return how many copies were set aside.
+
+    A continued or forked transcript repeats the earlier history under the same tool_use
+    ids, so without this one exploration shows up as one unit per transcript. Each id stays
+    with the holder whose session ran latest: the continuation carries the whole conversation
+    plus what it did after, so its own graphify call covers the lookups it copied. The other
+    holders drop it from routing (execution keeps its own owner rule, mark_copied_calls).
+    """
+    def latest(u: Unit) -> tuple:
+        return (u.session.last_ts or datetime.min.replace(tzinfo=timezone.utc), u.session.session_id)
+
+    holders: dict[str, list[Unit]] = {}
+    for u in units:
+        for tid in {lk.tool_use_id for lk in u.lookups} | {c.tool_use_id for c in u.calls}:
+            if tid:
+                holders.setdefault(tid, []).append(u)
+    marked = 0
+    for tid, us in holders.items():
+        if len(us) > 1:
+            keep = max(us, key=latest)
+            for u in us:
+                if u is not keep:
+                    u.routing_copies.add(tid)
+                    marked += 1
     return marked
 
 
@@ -1013,6 +1127,8 @@ def input_problems(inputs: dict) -> list[str]:
                    + ": execution and measurement have no complete log evidence")
     if q["corrupt_lines"]:
         out.append(f"query log has {q['corrupt_lines']} corrupt line(s), skipped")
+    if q["undated_records"]:
+        out.append(f"query log has {q['undated_records']} query record(s) without a usable ts, skipped")
     if inputs["projects_dir_missing"]:
         out.append("transcript projects folder missing: no sessions could be read")
     for key, text in (("transcripts_unstatable", "transcript(s) could not be stat'ed"),
@@ -1055,10 +1171,22 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     copied_calls = mark_copied_calls(sessions)
     all_calls = [c for s in sessions for u in s.units.values() for c in u.calls if not c.copy]
     match_records(all_calls, records)
+
+    # A session is kept whole when it overlaps the window, but the log is windowed per
+    # record, so execution and measurement judge only calls made inside the window (same
+    # slack as the log); an undated call stays in. The wrapper logs when the call ends, so
+    # a call is placed by its result time when it has one. Records of boundary calls are
+    # still matched above, so they never read as unattributed.
+    def in_window(c: Call) -> bool:
+        t = c.result_ts or c.ts
+        return t is None or since - MATCH_SLACK <= t <= until + MATCH_SLACK
+
+    outside_window = sum(1 for s in organic for u in s.units.values() for c in u.calls
+                         if not c.alt_log and not c.copy and not in_window(c))
     organic_calls = [c for s in organic for u in s.units.values() for c in u.calls
-                     if not c.alt_log and not c.copy]
+                     if not c.alt_log and not c.copy and in_window(c)]
     alt_log_calls = sum(1 for s in organic for u in s.units.values() for c in u.calls
-                        if c.alt_log and not c.copy)
+                        if c.alt_log and not c.copy and in_window(c))
 
     # ---- stage 1: availability
     def post_hint(s: Session) -> bool:
@@ -1114,6 +1242,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
                 graph_cache[u.cwd] = (dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r,
                                       repo_identity(u.cwd, resolver))
             u.resolved, u.repo = graph_cache[u.cwd]
+    routing_copies = mark_routing_copies([u for s in organic for u in s.units.values()])
     units = [u for s in organic for u in s.units.values() if u.resolved]
     scope_of = {id(u): coverage_for(u.resolved, u.repo) for u in units}
     eligible = [u for u in units if u.is_exploration(scope_of[id(u)])]
@@ -1123,13 +1252,10 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
                 and agent_has_shell(u.agent_type, u.cwd, user_agents) is False]
     exploration = [u for u in eligible if u not in unusable]
     no_path_evidence = [u for u in units if u.enough_lookups() and not (u.files | u.search_paths)]
-    def real_calls(u: Unit) -> list[Call]:
-        return [c for c in u.calls if not c.alt_log]
-
-    used = [u for u in exploration if real_calls(u)]
-    bypassed = sorted((u for u in exploration if not real_calls(u)),
+    used = [u for u in exploration if u.routing_calls()]
+    bypassed = sorted((u for u in exploration if not u.routing_calls()),
                       key=lambda u: -(u.searches + u.reads))
-    other_callers = [u for u in units if real_calls(u) and u not in eligible]
+    other_callers = [u for u in units if u.routing_calls() and u not in eligible]
     after_hint = [u for u in exploration if post_hint(u.session)]
     spawns = [sp for u in units for sp in u.spawned if sp["type"] in EXPLORE_AGENT_TYPES]
     if bypassed:
@@ -1198,6 +1324,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     inputs = {
         "query_log": {"path": str(log.path) if log.path else None, "status": log.status,
                       "error": log.error, "corrupt_lines": log.corrupt_lines,
+                      "undated_records": log.undated_records,
                       "records_in_window": len(records)},
         "projects_dir_missing": scan.projects_missing,
         "transcripts_unstatable": scan.unstatable,
@@ -1230,13 +1357,14 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             "graph_backed_units": len(units), "exploration_units": len(exploration),
             "used_graphify": [u.label for u in used],
             "after_hint_live": {"exploration_units": len(after_hint),
-                                "used_graphify": sum(1 for u in after_hint if real_calls(u)),
+                                "used_graphify": sum(1 for u in after_hint if u.routing_calls()),
                                 "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} "
                                              f"transcript={u.session.path}"
-                                             for u in after_hint if not real_calls(u)]},
+                                             for u in after_hint if not u.routing_calls()]},
             "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} files={len(u.files)} "
                          f"in_graph={u.covered(scope_of[id(u)])} "
                          f"cwd={u.cwd}" for u in bypassed],
+            "copied_tool_uses_excluded": routing_copies,
             "graph_unusable_units": len(unusable),
             "graph_unusable": [f"{u.label} searches={u.searches} reads={u.reads} "
                                f"in_graph={u.covered(scope_of[id(u)])} cwd={u.cwd}"
@@ -1253,6 +1381,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             "logged": sum(1 for c in ok_calls if c.record is not None),
             "unlogged_ok_wrapper_calls": [c.unit.label for c in unlogged],
             "copied_calls_excluded": copied_calls,
+            "calls_outside_window_excluded": outside_window,
             "wrapper_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in wrapper_errors],
             "unrecovered_shell_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in unrecovered],
             "recovered_shell_errors": [f"{c.unit.label}: {c.command[:160]!r} -> {c.output[:160]!r}"
@@ -1319,7 +1448,9 @@ def render(summary: dict) -> str:
           "only lookups inside that graph's coverage count. "
           f"{r['eligibility_unknown_sessions']} sessions with graph-backed units had no exploration unit by this rule: "
           "their eligibility is unknown, not zero demand.", "",
-          f"- Graph-backed units: {r['graph_backed_units']}; exploration units: {r['exploration_units']}",
+          f"- Graph-backed units: {r['graph_backed_units']}; exploration units: {r['exploration_units']}; "
+          f"lookups/calls repeated by continued/forked transcripts, counted once: "
+          f"{r['copied_tool_uses_excluded']}",
           f"- Subagents without a shell (graph unusable, not bypasses): {r['graph_unusable_units']}",
           f"- Units with enough lookups but no file/path evidence (eligibility unknown): "
           f"{r['lookup_units_without_path_evidence']}",
@@ -1341,7 +1472,9 @@ def render(summary: dict) -> str:
                   f"{len(r['bypassed'])}, full list in the JSON summary):**", *[f"- {x}" for x in shown]]
     L += ["", "## 3 Execution", "",
           f"- Calls: {e['calls']} by status {e['by_status']}; logged: {e['logged']}; bare CLI (outside wrapper): {e['bare_cli_calls']}; "
-          f"copies from continued/forked transcripts excluded: {e['copied_calls_excluded']}",
+          f"copies from continued/forked transcripts excluded: {e['copied_calls_excluded']}; "
+          f"calls made outside the window (in sessions overlapping it) excluded: "
+          f"{e['calls_outside_window_excluded']}",
           f"- Test runs against a redirected GRAPHIFY_QUERY_LOG (not counted): {e['test_alt_log_calls']}"]
     for title, key in (("Completed wrapper calls with no log record", "unlogged_ok_wrapper_calls"),
                        ("Wrapper/query errors", "wrapper_errors"),
