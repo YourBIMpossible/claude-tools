@@ -63,6 +63,8 @@ def summary(m: dict[str, Any]) -> dict[str, Any]:
             "rules": {e["rule"]: e["state"] for e in m["exclusions"]},
             "dependency_screen_clear": bool(m["funnel"].get("dependency_screen_clear")),
             "edited_files": len(m.get("edited_files") or []),
+            # X2 evidence: a reclassified effect must be persisted even when no rule state moves.
+            "shell_repo_mutations": list(m["observation"].get("shell_repo_mutations") or []),
             "task_class": (m.get("task_class") or {}).get("mechanical")}
 
 
@@ -119,7 +121,9 @@ def rescreen_one(stores: Stores, m: dict[str, Any], env: dict[str, str]) -> str:
     """Re-join and re-screen ``m`` in place; the outcome label."""
     tr = find_transcript(m["session_id"], env)
     if tr is None:
-        if m["observation"].get("sufficient") and _delegated(m):
+        # A sufficient judgement that cannot be re-derived under the current rules (delegated
+        # work, or a stored "no edit" the current shell-effect rules never saw) is withdrawn.
+        if m["observation"].get("sufficient") and (_delegated(m) or not m.get("edited_files")):
             invalidate(m, "rescreen_transcript_unavailable")
             return "invalidated_transcript_unavailable"
         return "transcript_unavailable"
@@ -149,8 +153,11 @@ def rescreen_one(stores: Stores, m: dict[str, Any], env: dict[str, str]) -> str:
 
 
 def run_child(stores: Stores, m: dict[str, Any], env: dict[str, str], timeout_s: float,
-              argv: tuple[str, ...] = CHILD_ARGV) -> tuple[str, dict[str, Any] | None]:
+              argv: tuple[str, ...] = CHILD_ARGV, *,
+              causes: list[str] | None = None) -> tuple[str, dict[str, Any] | None]:
     """Re-screen ``m`` in a child process; (outcome, re-screened manifest or None).
+    When the child fails, one line naming why (exit code and the tail of its stderr) is
+    appended to ``causes``.
 
     The child gets the manifest and store paths on stdin and is killed after
     ``timeout_s``; a timeout, crash or unreadable reply is an outcome, never a hang.
@@ -167,21 +174,32 @@ def run_child(stores: Stores, m: dict[str, Any], env: dict[str, str], timeout_s:
         try:
             proc = subprocess.Popen(list(argv), stdin=fin, stdout=fout, stderr=ferr,
                                     env={**env, "PYTHONIOENCODING": "utf-8"}, **_GROUP_KW)
-        except OSError:
+        except OSError as exc:
+            if causes is not None:
+                causes.append(f"spawn: {type(exc).__name__}: {exc}"[:500])
             return "child_failed", None
         tree = _ProcessTree(proc)
+
+        def why(head: str) -> None:
+            if causes is None:
+                return
+            ferr.seek(0)
+            tail = ferr.read()[-400:].decode("utf-8", "replace").strip()
+            causes.append(f"{head}: {tail}" if tail else head)
         try:
             try:
                 rc = proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 return "timeout", None
             if rc != 0:
+                why(f"exit {rc}")
                 return "child_failed", None
             fout.seek(0)
             try:
                 rep = json.loads(fout.read().decode("utf-8"))
                 return str(rep["outcome"]), rep["manifest"]
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError) as exc:
+                why(f"unreadable reply: {type(exc).__name__}")
                 return "child_failed", None
         finally:
             tree.kill()
@@ -325,6 +343,7 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
     try:
         scan = scan_manifests(stores)
         befores, afters, changed, busy, deferred = [], [], [], [], []
+        child_failures: list[dict[str, str]] = []
         outcomes: Counter[str] = Counter()
         touched = []
         deadline = time.monotonic() + run_budget_s
@@ -345,7 +364,9 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
             try:
                 before = summary(m)
                 join_before = dict(m["capture"].get("join") or {})
-                outcome, done = run_child(stores, m, env, episode_timeout_s, child_argv)
+                causes: list[str] = []
+                outcome, done = run_child(stores, m, env, episode_timeout_s, child_argv, causes=causes)
+                child_failures.extend({"episode_id": ep, "cause": c} for c in causes)
                 if done is not None:
                     m = done
                 else:
@@ -369,7 +390,7 @@ def run_rescreen(stores: Stores, env: dict[str, str], *, now: str | None = None,
         rec = {"kind": "rescreen", "at": now, "tool_commit": tool_commit, "outcomes": dict(sorted(outcomes.items())),
                "busy_skipped": busy, "deferred": deferred,
                "limits": {"episode_timeout_s": episode_timeout_s, "run_budget_s": run_budget_s}, "before": _counts(befores), "after": _counts(afters),
-               "changed": changed, "manifests_unreadable": len(scan.unreadable),
+               "changed": changed, "child_failures": child_failures, "manifests_unreadable": len(scan.unreadable),
                "manifests_malformed": sorted(str(m.get("episode_id")) for m in malformed)}
         path = _new_record_path(stores.meta / "corrections", f"{now.replace(':', '').replace('-', '')}-rescreen")
         write_json_atomic(path, rec)

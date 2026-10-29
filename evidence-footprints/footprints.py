@@ -116,10 +116,31 @@ def main_root(repo_root: str) -> str:
     return MAIN_ROOT_RE.sub("", repo_root.replace("\\", "/").rstrip("/"))
 
 
+# Git Bash, WSL and Cygwin spell a drive as a single letter right after the root (or after mnt or cygdrive), which
+# is the same place as the drive-letter form. Anything else (/tmp, /usr, a multi-letter first segment, a mount
+# that is not a single letter) is a POSIX location and is left alone, as is a UNC share.
+DRIVE_ROOT_RE = re.compile(r"^[a-z]:/")
+MSYS_DRIVE_RE = re.compile(r"^/(?:(?:mnt|cygdrive)/)?([a-z])(?=/|$)")
+
+
+def drive_form(p: str) -> str:
+    """A lowercase, forward-slash path with a Git Bash, WSL or Cygwin drive prefix rewritten as a drive-letter path."""
+    m = MSYS_DRIVE_RE.match(p)
+    return f"{m.group(1)}:/{p[m.end():].lstrip('/')}" if m else p
+
+
 def norm(raw: str, roots: Iterable[str]) -> str | None:
-    """Repo-relative lowercase path; None when absolute outside every root or empty."""
+    """Repo-relative lowercase path; None when absolute outside every root or empty.
+
+    On a repository that lives on a drive, Git Bash, WSL and Cygwin drive paths are read as the same
+    drive-letter path first (SA26-2). A repository that is not on a drive (Linux, macOS, a UNC share)
+    is never reinterpreted.
+    """
     p = raw.replace("\\", "/").strip().strip("'\"").lower()
-    for root in sorted({r.replace("\\", "/").rstrip("/").lower() for r in roots}, key=len, reverse=True):
+    ordered = sorted({r.replace("\\", "/").rstrip("/").lower() for r in roots}, key=len, reverse=True)
+    if any(DRIVE_ROOT_RE.match(r) for r in ordered):
+        p = drive_form(p)
+    for root in ordered:
         if p == root:
             return None
         if p.startswith(root + "/"):
@@ -285,18 +306,27 @@ class Footprint:
             if isinstance(inp.get("path"), str):
                 self._touch(idx, inp["path"], "search", native=True)
         elif name in SHELL_TOOLS and isinstance(inp.get("command"), str):
-            segments, script = sp.parse_command(inp["command"])
+            segments, script = sp.parse_command(inp["command"], shell="powershell" if name == "PowerShell" else "bash")
             wd: str | None = call.get("cwd")
             scope: tuple[int, ...] = ()
             entered: list[tuple[tuple[int, ...], str | None]] = []  # (enclosing scope, its cwd)
+            branch_start: dict[int, str | None] = {}  # branch id -> the directory it starts in
+            pipe_dest: dict[int, str] = {}  # PowerShell pipeline id -> the directory it leaves
             for seg in segments:
-                # A subshell starts in the directory in effect where it stands; its own cd
-                # ends with it, so the enclosing segments resume in their directory.
+                # A subshell starts in the directory in effect where it stands, a branch (after
+                # ||) where the pipeline before it started; a cd inside either ends with it, so
+                # the enclosing segments resume in their directory.
                 while scope and seg.scope[:len(scope)] != scope:
                     scope, wd = entered.pop()
                 if seg.scope != scope:
                     entered.append((scope, wd))
+                    wd = next((branch_start[i] for i in reversed(seg.scope[len(scope):]) if i in branch_start), wd)
                     scope = seg.scope
+                for pipe in seg.ends:
+                    if pipe in pipe_dest:
+                        wd = pipe_dest.pop(pipe)
+                for branch in seg.opens:
+                    branch_start[branch] = wd
                 self.shell_segments += 1
                 if seg.has_pathlike or seg.kind == "miss":
                     self.shell_pathlike += 1
@@ -317,9 +347,19 @@ class Footprint:
                     self._touch(idx, target, use.role, edit=edit, native=False)
                 if seg.kind == "nav":
                     # Later segments run in the new directory; one this parser cannot evaluate
-                    # (cd -, popd, a variable) leaves later relative paths unattributed.
-                    dest = seg.paths[0].path if seg.paths and seg.verb not in {"popd", "pop-location"} else None
-                    wd = UNRESOLVED if dest is None or dest == "-" else _join_dir(dest, wd if wd is not None else UNRESOLVED)
+                    # (cd -, popd, a variable) leaves later relative paths unattributed. The
+                    # destination is the nav argument itself, not a redirect listed before it.
+                    dest = seg.nav_dest if seg.verb not in {"popd", "pop-location"} else None
+                    new = (UNRESOLVED if dest is None or dest == "-"
+                           else _join_dir(dest, wd if wd is not None else UNRESOLVED))
+                    if seg.pipeline is not None:
+                        # A piped nav ends with its stage in Bash (a subshell scope). In PowerShell
+                        # its timing against the other stages is unknown, but it has taken effect
+                        # once the pipeline ends.
+                        if name == "PowerShell":
+                            pipe_dest[seg.pipeline] = new
+                        new = UNRESOLVED
+                    wd = new
             for use in script:
                 self._touch(idx, use.path, "script", native=False)
 

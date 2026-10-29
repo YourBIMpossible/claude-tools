@@ -138,3 +138,7 @@ jobs:
 
       - name: graphify health-check boundary tests (5.1)
         run: python graphify/test_health_check.py
+
+      - name: scheduling hidden-launcher tests (Windows)
+        # Drives the real wscript.exe launcher; the no-window check reports SKIP if the runner cannot show a window.
+        run: python scheduling/test_run_hidden.py

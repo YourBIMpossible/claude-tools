@@ -50,6 +50,7 @@ import json
 import math
 import os
 import re
+import shlex
 import statistics
 import sys
 import tempfile
@@ -83,24 +84,39 @@ BARE_CLI_RE = re.compile(
 GRAPHIFY_CALL_RE = re.compile(f"{WRAPPER_RE.pattern}|{BARE_CLI_RE.pattern}", re.I | re.M)
 _HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n.*?^[ \t]*\2[ \t]*$", re.S | re.M)
 _HERESTRING_RE = re.compile(r"@(['\"])[ \t]*\n.*?\n\1@", re.S)
+# The same heredoc, with the rest of its opening line kept: `cat <<'EOF' | grep -c x` runs that grep.
+_HEREDOC_TAIL_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1(?P<tail>[^\n]*)\n.*?^[ \t]*\2[ \t]*$", re.S | re.M)
 
 
 _QUOTED_SEPARATORS = str.maketrans(";&|()", "     ")
+# The end of a line that passes the next quoted argument to a shell as its script. The words between
+# the shell and its -c cannot hold a command separator, so `bash build.sh; python -c "..."` is not bash's
+# script (the -c belongs to python).
+_SHELL_SCRIPT_ARG_RE = re.compile(
+    r"(?:^|[\s;&|(/\\])(?:(?P<posix>bash|sh|zsh|dash)(?:\.exe)?[\"']?(?:\s+[^\s\"';&|]+)*?\s+-\w*c\w*"
+    r"|(?P<ps>pwsh|powershell)(?:\.exe)?[\"']?(?:\s+[^\s\"';&|]+)*?\s+-c(?:ommand)?"
+    r"|(?P<cmd>cmd)(?:\.exe)?[\"']?\s+/[ck])\s*$", re.I)
+_SHELLS = {"bash": "Bash", "sh": "Bash", "zsh": "Bash", "dash": "Bash", "cmd": "Bash",
+           "pwsh": "PowerShell", "powershell": "PowerShell"}
 
 
-def _blank_quoted_code(command: str, escape: str = "\\") -> str:
+def _blank_quoted_code(command: str, escape: str = "\\",
+                       scripts: list[tuple[str, str]] | None = None) -> str:
     """Replace each quoted string that spans a newline with "", and blank shell separators
     (;&|()) inside single-line quoted strings, so a search pattern such as a\\|graphify query
     in quotes gives `graphify` no command position. A double-quoted string containing $( keeps
     all its separators, since that substitution runs a real command (so a pattern string that
-    also contains $( can still read as a call). Commands after a separator inside a quoted
-    `bash -c`, `pwsh -Command` or `cmd /c` argument are not counted: the string is an argument.
+    also contains $( can still read as a call). A quoted
+    `bash -c`, `pwsh -Command` or `cmd /c` argument, on one line or several, is a script the shell
+    runs: it is handed to `scripts` (when given) so it can be read as commands, while the string
+    itself stays an argument here.
 
     A regex would pair one line's closing quote with the next line's opening quote and blank
     the real command between them, so quotes are paired by walking the string: `escape`
     (backslash for a POSIX shell, backtick for PowerShell) escapes the next character inside
-    "..." and outside quotes, and a `#` comment runs to end of
-    line, so an apostrophe in it opens nothing. An unclosed quote leaves the rest as is.
+    "..." and outside quotes, and a `#` comment runs to end of line and is blanked, so an
+    apostrophe in it opens nothing and a command named in it is no invocation or lookup.
+    An unclosed quote leaves the rest as is.
     """
     out: list[str] = []
     i, n = 0, len(command)
@@ -109,7 +125,7 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
         if ch == "#" and (i == 0 or command[i - 1] in " \t\n;"):
             end = command.find("\n", i)
             end = n if end < 0 else end
-            out.append(command[i:end])
+            out.append(" " * (end - i))
             i = end
         elif ch == escape and i + 1 < n:
             out.append(command[i:i + 2])
@@ -122,6 +138,11 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
                 out.append(command[i:])
                 break
             span = command[i:j + 1]
+            if scripts is not None:
+                head = "".join(out)
+                m = _SHELL_SCRIPT_ARG_RE.search(head[head.rfind("\n") + 1:])
+                if m:
+                    scripts.append((span[1:-1], "PowerShell" if m.group("ps") else "Bash"))
             if "\n" in span:
                 span = '""'
             elif not (ch == '"' and "$(" in span):
@@ -134,26 +155,118 @@ def _blank_quoted_code(command: str, escape: str = "\\") -> str:
     return "".join(out)
 
 
-def code_part(command: str, tool: str = "Bash") -> str:
+def code_part(command: str, tool: str = "Bash", keep_heredoc_tail: bool = False) -> str:
     """The command with heredoc/here-string bodies and multi-line quoted strings blanked, and
-    shell separators inside single-line quoted strings neutralised."""
-    command = _HEREDOC_RE.sub("<<HEREDOC", command)
+    shell separators inside single-line quoted strings neutralised. The rest of a heredoc's opening
+    line goes with the body unless `keep_heredoc_tail` (the search count keeps it: `| grep x` runs)."""
+    if keep_heredoc_tail:
+        command = _HEREDOC_TAIL_RE.sub(lambda m: "<<HEREDOC" + m.group("tail"), command)
+    else:
+        command = _HEREDOC_RE.sub("<<HEREDOC", command)
     command = _HERESTRING_RE.sub("@''@", command)
     return _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\")
 
 
+def _shell_named_in(segment: str) -> str | None:
+    """The tool syntax of the first shell named by any word of a command segment, so a shell
+    run through a prefix (`sudo bash`, `FOO=1 bash`, `ssh host bash`) is found too."""
+    for word in segment.split():
+        name = re.split(r"[\\/]", word.strip("\"'"))[-1].lower().removesuffix(".exe")
+        if name in _SHELLS:
+            return _SHELLS[name]
+    return None
+
+
+def shell_script_parts(command: str, tool: str = "Bash") -> list[str]:
+    """The code_part of each script the command hands to a shell, which code_part blanks: a
+    heredoc whose command names a shell (`bash <<'EOF'`, `sudo bash <<'EOF'`) or whose
+    opening line pipes it to one (`cat <<'EOF' | bash`), and a multi-line quoted argument of
+    `bash -c`, `pwsh -Command` or `cmd /c`. A heredoc fed to anything else (`cat > f`, a
+    commit message) is data and is not returned. Nested scripts are included."""
+    scripts: list[tuple[str, str]] = []
+
+    def heredoc(m: re.Match) -> str:
+        line = m.string[:m.start()]
+        body = m.group(0)
+        shell = _shell_named_in(re.split(r"[;&|(]", line[line.rfind("\n") + 1:])[-1])
+        for piped in body[:body.find("\n")].split("|")[1:]:
+            shell = shell or _shell_named_in(re.split(r"[;&(]", piped)[0])
+        if shell:
+            scripts.append((body[body.find("\n") + 1:body.rfind("\n")], shell))
+        return "<<HEREDOC"
+
+    command = _HEREDOC_RE.sub(heredoc, command)
+    command = _HERESTRING_RE.sub("@''@", command)
+    _blank_quoted_code(command, "`" if tool == "PowerShell" else "\\", scripts)
+    parts: list[str] = []
+    for body, shell in scripts:
+        parts += [code_part(body, shell), *shell_script_parts(body, shell)]
+    return parts
+
+
 ALT_LOG_RE = re.compile(r"GRAPHIFY_QUERY_LOG\W{0,3}[=:]")   # redirected log = a test run, not organic use
 QUESTION_RE = re.compile(r"(?:query_reranked\.py[\"']?|\s(?:query|explain))\s+\"([^\"]+)\"")
-SHELL_SEARCH_RE = re.compile(r"(?:^|[\s|;&(])(?:grep|rg|findstr|Select-String|git grep)\b", re.I)
+# A shell search is a search tool in COMMAND position, not a word of an argument (`echo "use grep here"`,
+# `Write-Host 'use Select-String'`, a commit message). Command positions: the start of a segment (after
+# ; & | ( ` or a newline), after `if`/`then`/`do`/`{` and the like, after a VAR=value prefix or an
+# assignment (`$r = `), after a wrapper (sudo, env, xargs, timeout, time, nohup, watch, taskset, numactl,
+# flock, nsenter, gdb --args, ...) and its
+# options, behind `git`'s global options, and anywhere after a runner that takes a whole command line
+# (ssh, docker, kubectl, wsl, adb, su, eval, chroot, ...), which this cannot parse. (`find` is a search
+# command of its own, see SHELL_SEARCH_CMDS, so its -exec needs no rule.)
+SHELL_SEARCH_TOOLS = {"grep", "rg", "findstr", "select-string"}
+_SEARCH_KEYWORDS = {"if", "then", "else", "elif", "while", "until", "do", "!", "{"}
+_SEARCH_WRAPPER_VALUE_FLAGS = {          # wrapper -> its options that take a separate value
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-R", "-T"},
+    "doas": {"-u", "-C"}, "env": {"-u", "-C", "-S"},
+    "xargs": {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"},
+    "timeout": {"-s", "-k"}, "nice": {"-n"}, "ionice": {"-c", "-n", "-p", "-P", "-u"},
+    "stdbuf": {"-i", "-o", "-e"}, "nohup": set(), "command": set(), "exec": {"-a"}, "builtin": set(),
+    "time": {"-f", "-o"}, "watch": {"-n"}, "setsid": set(), "unbuffer": set(), "busybox": set(),
+    "parallel": {"-j", "-n", "-a", "-N"}, "strace": {"-o", "-e", "-p", "-s", "-u"},
+    "taskset": {"-c", "--cpu-list"}, "chronic": set(), "caffeinate": {"-t", "-w"}, "valgrind": set(),
+    "numactl": {"-N", "-m", "-C", "-i", "-p", "--cpunodebind", "--membind", "--physcpubind", "--interleave",
+                "--preferred"},
+    "flock": {"-w", "-E", "--timeout", "--wait", "--conflict-exit-code"},
+    "ltrace": {"-o", "-e", "-p", "-s", "-u", "-n", "-l", "-a", "-A", "-F", "-x", "-w"},
+    "nsenter": {"-t", "--target", "-S", "--setuid", "-G", "--setgid"},
+    "gdb": {"-ex", "-iex", "-x", "-ix", "-d", "-cd", "-p", "-pid", "-c", "-core", "-s", "-e", "-se", "-tty",
+            "-b", "-l", "-D", "-directory"}}      # gdb: the program follows --args
+_SEARCH_RUNNERS = {"ssh", "wsl", "docker", "podman", "kubectl", "adb", "su", "script", "eval", "chroot"}
+_GIT_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 WRAPPER_FAILURE_RE = re.compile(r"graphify query failed|Traceback \(most recent call last\)")
 
 SHELL_TOOLS = {"Bash", "PowerShell"}
 SEARCH_TOOLS = {"Grep", "Glob"}
 AGENT_TOOLS = {"Agent", "Task"}
-EXPLORE_AGENT_TYPES = {"Explore", "general-purpose", "Plan"}
+EXPLORE_AGENT_TYPES = {"Explore", "general-purpose", "Plan"}   # spawn statistics only
+# Built-in subagent types without a shell; custom ones are judged by their definition.
+NO_SHELL_AGENTS = {"claude-code-guide", "statusline-setup"}
+
+# Shell commands read from a Bash/PowerShell call, per command segment (lowercased).
+SHELL_CD_CMDS = {"cd", "pushd", "chdir", "set-location", "sl", "push-location"}
+SHELL_READ_CMDS = {"cat", "head", "tail", "sed", "less", "more", "nl", "get-content", "gc", "type",
+                   "git show", "git blame"}
+SHELL_SEARCH_CMDS = {"grep", "egrep", "fgrep", "rg", "findstr", "select-string", "sls", "find", "fd",
+                     "get-childitem", "gci", "git grep", "git ls-files"}
+# The first positional argument of these is a pattern or script, not a path.
+SHELL_PATTERN_FIRST = {"grep", "egrep", "fgrep", "rg", "findstr", "sed", "git grep"}
+SHELL_PATTERN_OPTS = {"-e", "--regexp", "-f", "--file", "-pattern"}
+# Options whose value is not a path. Short options are case-sensitive (grep -A vs -a);
+# longer ones (PowerShell, find) are compared lowercased.
+SHELL_VALUE_OPTS = {"-e", "--regexp", "-g", "--glob", "--include", "--exclude", "--exclude-dir",
+                    "-t", "--type", "-A", "-B", "-C", "-m", "--max-count", "-pattern", "-filter",
+                    "-include", "-exclude", "-name", "-iname", "-encoding"}
+_SEGMENT_RE = re.compile(r"(&&|\|\||[;|&\n()])")
+_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_PATHLIKE_RE = re.compile(r"^[\w.~\-\\/: ]+$")
+_GLOB_CHARS = "*?[{"
 
 # Routing heuristic thresholds (tool counts are a proxy for "cross-file exploration").
-SUBAGENT_MIN_LOOKUPS = 3      # searches + reads for an explore-type subagent
+SHELL_TOOLS = ("Bash", "PowerShell")
+AGENT_DEF_MAX_BYTES = 256 << 10
+_LIST_SPLIT_RE = re.compile(r",(?![^()]*\))")  # commas outside Bash(...) patterns
+SUBAGENT_MIN_LOOKUPS = 3      # searches + reads for a subagent of any type
 MAIN_MIN_SEARCHES = 6         # searches for a main thread
 MAIN_MIN_FILES = 3            # distinct files read by that main thread
 MATCH_SLACK = timedelta(seconds=5)
@@ -196,18 +309,51 @@ class Call:
         return "ok"
 
 
+@dataclass(frozen=True)
+class Lookup:
+    """One search or read tool use and the paths it touched."""
+    tool_use_id: str
+    search: bool
+    files: frozenset[str] = frozenset()          # Read targets, shell read arguments
+    search_paths: frozenset[str] = frozenset()   # Grep/Glob paths, shell search paths
+
+
 @dataclass
 class Unit:
     session: "Session"
     unit_id: str                  # "main", an agent id, or "sidechain"
     agent_type: str | None
-    searches: int = 0
-    reads: int = 0
-    files: set[str] = field(default_factory=set)          # Read targets
-    search_paths: set[str] = field(default_factory=set)   # Grep/Glob path arguments
+    lookups: list[Lookup] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
     skill_selected: bool = False
     spawned: list[dict] = field(default_factory=list)   # Agent calls made by this unit
+    cwd: str | None = None              # first cwd in this unit's own records
+    resolved: dict | None = None        # the graph for that cwd (set by analyse)
+    repo: str | None = None
+    routing_copies: set[str] = field(default_factory=set)   # tool_use ids routing counts elsewhere
+
+    def _kept(self) -> list[Lookup]:
+        return [lk for lk in self.lookups if lk.tool_use_id not in self.routing_copies]
+
+    @property
+    def searches(self) -> int:
+        return sum(1 for lk in self._kept() if lk.search)
+
+    @property
+    def reads(self) -> int:
+        return sum(1 for lk in self._kept() if not lk.search)
+
+    @property
+    def files(self) -> set[str]:
+        return {f for lk in self._kept() for f in lk.files}
+
+    @property
+    def search_paths(self) -> set[str]:
+        return {p for lk in self._kept() for p in lk.search_paths}
+
+    def routing_calls(self) -> list[Call]:
+        """Real (not redirected-log) calls that routing credits to this unit."""
+        return [c for c in self.calls if not c.alt_log and c.tool_use_id not in self.routing_copies]
 
     @property
     def label(self) -> str:
@@ -221,8 +367,7 @@ class Unit:
     def enough_lookups(self) -> bool:
         if self.unit_id == "main":
             return self.searches >= MAIN_MIN_SEARCHES and len(self.files) >= MAIN_MIN_FILES
-        return (self.agent_type in EXPLORE_AGENT_TYPES
-                and self.searches + self.reads >= SUBAGENT_MIN_LOOKUPS)
+        return self.searches + self.reads >= SUBAGENT_MIN_LOOKUPS
 
     def is_exploration(self, in_scope: Callable[[str], bool]) -> bool:
         """Heuristic eligibility: enough lookups, and they land in code the graph covers."""
@@ -270,6 +415,7 @@ class QueryLog:
     records: list[dict] = field(default_factory=list)
     corrupt_lines: int = 0
     error: str | None = None
+    undated_records: int = 0     # query records whose ts is missing or unparseable
 
 
 @dataclass
@@ -316,15 +462,16 @@ def norm_path(p: str) -> str:
 
 
 def iter_json_lines(path: Path, stats: ReadStats) -> Iterable[dict]:
-    """Yield the JSON objects in a JSONL file; corrupt lines and read errors go to `stats`."""
+    """Yield the JSON objects in a JSONL file. Corrupt lines (invalid UTF-8, invalid JSON, or
+    not an object) and read errors go to `stats`."""
     try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if not line.strip():
+        with path.open("rb") as fh:
+            for raw in fh:
+                if not raw.strip():
                     continue
                 try:
-                    rec = json.loads(line)
-                except ValueError:
+                    rec = json.loads(raw.decode("utf-8"))
+                except ValueError:       # UnicodeDecodeError is a ValueError
                     stats.corrupt_lines += 1
                     continue
                 if isinstance(rec, dict):
@@ -497,11 +644,14 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
         if ts:
             session.first_ts = min(filter(None, [session.first_ts, ts]))
             session.last_ts = max(filter(None, [session.last_ts, ts]))
-        if session.cwd is None and isinstance(rec.get("cwd"), str):
-            session.cwd = rec["cwd"]
+        cwd = rec.get("cwd") if isinstance(rec.get("cwd"), str) else None
+        if session.cwd is None and cwd:
+            session.cwd = cwd
         target = unit
         if track_sidechain and rec.get("isSidechain"):
             target = session.unit("sidechain", "subagent")
+        if target.cwd is None and cwd:
+            target.cwd = cwd
 
         att = rec.get("attachment")
         if isinstance(att, dict) and att.get("type") == "hook_additional_context":
@@ -524,7 +674,8 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
                     continue    # resumed/forked transcripts repeat earlier records
                 session.seen_tool_ids.add(tool_id)
                 origin = rec.get("sessionId")
-                _tool_use(target, block, ts, pending, origin if isinstance(origin, str) else None)
+                _tool_use(target, block, ts, pending, origin if isinstance(origin, str) else None,
+                          cwd or target.cwd)
             elif block.get("type") == "tool_result":
                 call = pending.pop(block.get("tool_use_id", ""), None)
                 if call is not None:
@@ -534,17 +685,18 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
 
 
 def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, Call],
-              origin_session: str | None = None) -> None:
+              origin_session: str | None = None, cwd: str | None = None) -> None:
     name = block.get("name", "")
+    tool_id = str(block.get("id", ""))
     inp = block.get("input") if isinstance(block.get("input"), dict) else {}
     if name in SEARCH_TOOLS:
-        unit.searches += 1
-        if isinstance(inp.get("path"), str) and inp["path"]:
-            unit.search_paths.add(norm_path(inp["path"]))
+        path = inp.get("path")
+        unit.lookups.append(Lookup(tool_id, True, search_paths=frozenset(
+            [norm_path(path)] if isinstance(path, str) and path else [])))
     elif name == "Read":
-        unit.reads += 1
-        if isinstance(inp.get("file_path"), str):
-            unit.files.add(norm_path(inp["file_path"]))
+        path = inp.get("file_path")
+        unit.lookups.append(Lookup(tool_id, False, files=frozenset(
+            [norm_path(path)] if isinstance(path, str) else [])))
     elif name == "Skill" and str(inp.get("skill", "")).split(":")[-1] == "graphify":
         unit.skill_selected = True
     elif name in AGENT_TOOLS:
@@ -557,13 +709,197 @@ def _tool_use(unit: Unit, block: dict, ts: datetime | None, pending: dict[str, C
         code = code_part(cmd, name)
         if GRAPHIFY_CALL_RE.search(code):
             m = QUESTION_RE.search(cmd)
-            call = Call(unit, str(block.get("id", "")), ts, cmd, m.group(1) if m else None,
+            call = Call(unit, tool_id, ts, cmd, m.group(1) if m else None,
                         bool(WRAPPER_RE.search(code)), bool(ALT_LOG_RE.search(cmd)),
                         origin_session=origin_session)
             unit.calls.append(call)
             pending[call.tool_use_id] = call
-        elif SHELL_SEARCH_RE.search(cmd):
-            unit.searches += 1
+        else:
+            lk = shell_lookups(cmd, name, cwd)
+            tails = code_part(cmd, name, keep_heredoc_tail=True)
+            searched = (any(shell_searches(part, name) for part in [tails, *shell_script_parts(cmd, name)])
+                        or lk.searched)
+            if searched or lk.read:          # paths only come with a search or a read
+                unit.lookups.append(Lookup(tool_id, searched, frozenset(lk.read_paths),
+                                           frozenset(lk.search_paths)))
+
+
+@dataclass
+class ShellLookups:
+    searched: bool = False
+    read: bool = False
+    search_paths: set[str] = field(default_factory=set)
+    read_paths: set[str] = field(default_factory=set)
+
+
+def _shell_words(segment: str, tool: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(segment, posix=tool != "PowerShell", punctuation_chars=False)
+        lexer.whitespace_split = True
+        if tool == "PowerShell":
+            lexer.escape = ""     # backslashes are path separators there, and ` is not modelled
+        words = list(lexer)
+    except ValueError:
+        words = segment.split()
+    return [w[1:-1] if len(w) >= 2 and w[0] == w[-1] and w[0] in "\"'" else w for w in words]
+
+
+def _tool_name(word: str) -> str:
+    """A command word as a bare lower-case name: quotes off, `.exe` off (so `rg.exe` is `rg`)."""
+    return word.strip("\"'").lower().removesuffix(".exe")
+
+
+def _segment_searches(words: list[str]) -> bool:
+    """Whether a search tool is run as a command in one command segment (see SHELL_SEARCH_TOOLS)."""
+    want, runner, i, n = True, False, 0, len(words)
+    while i < n:
+        word = words[i]
+        name = _tool_name(word)
+        i += 1
+        if runner and not want:
+            first = word.split(None, 1)[0] if word.strip() else ""
+            if _tool_name(first) in SHELL_SEARCH_TOOLS:
+                return True                     # `ssh host grep ...`, `ssh host "grep ..."`
+        if not want:
+            want = word == "=" or word.endswith("{")      # `$r = <cmd>`, a block
+            continue
+        if re.match(r"[A-Za-z_]\w*=", word) or name in _SEARCH_KEYWORDS:
+            continue                            # VAR=value prefix, `then`, `do`, `{`
+        if name in SHELL_SEARCH_TOOLS:
+            return True
+        if name == "git":
+            while i < n and words[i].startswith("-"):      # git's global options, then the subcommand
+                i += 2 if words[i] in _GIT_VALUE_FLAGS else 1
+            if i < n and words[i].lower() == "grep":
+                return True
+            want = False
+        elif name in _SEARCH_WRAPPER_VALUE_FLAGS:
+            value_flags = _SEARCH_WRAPPER_VALUE_FLAGS[name]
+            first_flag = i
+            while i < n and words[i].startswith("-"):
+                i += 2 if words[i] in value_flags else 1
+            if name == "command" and {"-v", "-V"} & set(words[first_flag:i]):
+                want = False                    # `command -v rg` looks a tool up, it does not run it
+            if name == "timeout" and i < n and re.match(r"\d[\w.]*$", words[i]):
+                i += 1                          # timeout's duration
+            elif (name == "taskset" and i < n and not {"-c", "--cpu-list"} & set(words[first_flag:i])
+                  and re.match(r"(0x)?[0-9a-fA-F][0-9a-fA-F,-]*$", words[i])):
+                i += 1                          # taskset's CPU mask, when no -c list was given
+            elif name == "flock" and i < n:
+                i += 1                          # flock's lock file or directory
+        elif name in _SEARCH_RUNNERS:
+            runner, want = True, False
+        else:
+            want = False
+    return False
+
+
+def shell_searches(text: str, tool: str = "Bash") -> bool:
+    """Whether the (already blanked, see code_part) shell text runs grep, rg, findstr or Select-String
+    as a command. A tool name that is only a word of an argument or a string does not count."""
+    if tool != "PowerShell":
+        text = text.replace("`", ";")           # `cmd` substitution starts a command
+    parts = _SEGMENT_RE.split(text)
+    # a segment cut at find's escaped `\;` ends in a lone backslash, which would make the lexer fail
+    return any(_segment_searches(_shell_words(parts[i].rstrip().removesuffix("\\"), tool))
+               for i in range(0, len(parts), 2))
+
+
+def _shell_path(arg: str, base: str | None) -> str | None:
+    """A normalised path for a command argument that names a file or folder, else None.
+
+    Accepts absolute paths (a drive letter, a Git Bash drive prefix, a home tilde) and relative ones that contain a
+    separator or end in a file extension; a git `<ref>:<path>` keeps the path; a glob is cut
+    back to the folder before its first wildcard. Relative paths need `base` (the cd target,
+    else the record's cwd).
+    """
+    if not arg or arg.startswith("-") or "://" in arg or "$" in arg:
+        return None
+    if not _DRIVE_RE.match(arg) and ":" in arg:
+        arg = arg.rsplit(":", 1)[1]
+    cut = min((arg.find(c) for c in _GLOB_CHARS if c in arg), default=-1)
+    if cut >= 0:
+        arg = arg[:max(arg.rfind("/", 0, cut), arg.rfind("\\", 0, cut)) + 1]
+    if not arg or not _PATHLIKE_RE.match(arg) or arg in (".", ".."):
+        return None
+    if arg.startswith("~"):
+        arg = os.path.expanduser(arg)
+    absolute = bool(_DRIVE_RE.match(arg)) or arg.startswith("/")
+    if not absolute:
+        if not (re.search(r"[\\/]", arg) or re.search(r"\.\w{1,8}$", arg)) or not base:
+            return None
+        arg = os.path.join(base, arg)
+    return norm_path(arg.rstrip("/\\") or arg)
+
+
+def _tool_path_arg(arg: str, tool: str) -> str:
+    """PowerShell takes backslash and slash as path separators on every platform; use slash so a POSIX host
+    reading a Windows transcript still splits the path."""
+    return arg.replace("\\", "/") if tool == "PowerShell" else arg
+
+
+def shell_lookups(command: str, tool: str, cwd: str | None) -> ShellLookups:
+    """Searches and reads in a shell command, with the paths they touched.
+
+    Splits the command (heredoc bodies and quoted separators already blanked) into
+    segments, follows `cd`/`Set-Location`/`git -C` so relative arguments resolve against
+    where the command ran, and keeps only path-like arguments of search and read commands.
+    A search with no path argument after a `cd` searched the cd target. Commands it does
+    not know (python, git log, ...) contribute nothing.
+    """
+    out = ShellLookups()
+    base = norm_path(cwd) if cwd else None
+    parts = _SEGMENT_RE.split(code_part(command, tool))
+    for i in range(0, len(parts), 2):
+        piped = i > 0 and parts[i - 1] == "|"
+        words = _shell_words(parts[i], tool)
+        while words and re.match(r"^\w+=", words[0]):
+            words.pop(0)                  # VAR=value prefixes
+        if not words:
+            continue
+        head, args, here = words[0].lower(), words[1:], base
+        if head.endswith(".exe"):
+            head = head[:-4]
+        if head == "git":
+            while len(args) >= 2 and args[0] == "-C":
+                here = _shell_path(_tool_path_arg(args[1], tool), here) or here
+                args = args[2:]
+            if args:
+                head, args = f"git {args[0].lower()}", args[1:]
+        if head in SHELL_CD_CMDS:
+            target = next((a for a in args if not a.startswith("-")), None)
+            dest = _shell_path(_tool_path_arg(target, tool), base) if target else None
+            if dest:
+                base = dest
+            continue
+        is_read, is_search = head in SHELL_READ_CMDS, head in SHELL_SEARCH_CMDS
+        if not (is_read or is_search):
+            continue
+        positional: list[str] = []
+        pattern_given, skip = False, False
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            opt = a.split("=", 1)[0]
+            opt = opt if len(opt) <= 2 else opt.lower()
+            if a.startswith("-"):
+                pattern_given |= opt in SHELL_PATTERN_OPTS
+                skip = opt in SHELL_VALUE_OPTS and "=" not in a
+                continue
+            positional.append(a)
+        if head in SHELL_PATTERN_FIRST and not pattern_given:
+            positional = positional[1:]
+        found = {p for p in (_shell_path(_tool_path_arg(a, tool), here) for a in positional) if p}
+        if is_search:
+            out.searched = True
+            if not found and here and here != (norm_path(cwd) if cwd else None) and not piped:
+                found = {here}
+            out.search_paths |= found
+        else:
+            out.read = True
+            out.read_paths |= found
+    return out
 
 
 def load_session(path: Path) -> Session:
@@ -575,7 +911,7 @@ def load_session(path: Path) -> Session:
         for sub in sorted(sub_dir.glob("agent-*.jsonl")):
             agent_type, problem = read_agent_type(sub.with_suffix(".meta.json"))
             if problem:
-                # The unit stays in the session but cannot be judged explore-type: say so.
+                # The unit stays in the session; with no type it is judged shell-capable: say so.
                 session.meta_problems.append(f"{sub.name}: {problem}")
             unit = session.unit(sub.stem.removeprefix("agent-"), agent_type)
             _ingest(session, unit, sub, pending, track_sidechain=False)
@@ -635,14 +971,18 @@ def load_log(path: Path | None, since: datetime, until: datetime) -> QueryLog:
     if not path.is_file():
         return QueryLog(path, "not-a-file")
     stats = ReadStats()
-    recs = []
+    recs, undated = [], 0
     for r in iter_json_lines(path, stats):
+        if r.get("kind") != "query":
+            continue
         ts = parse_ts(r.get("ts"))
-        if r.get("kind") == "query" and ts and since - MATCH_SLACK <= ts <= until + MATCH_SLACK:
+        if ts is None:
+            undated += 1          # cannot be placed in any window: reported, never dropped silently
+        elif since - MATCH_SLACK <= ts <= until + MATCH_SLACK:
             r["_ts"] = ts
             recs.append(r)
     return QueryLog(path, "unreadable" if stats.error else "ok", recs,
-                    stats.corrupt_lines, stats.error)
+                    stats.corrupt_lines, stats.error, undated)
 
 
 def finite_duration(value: Any) -> float | None:
@@ -659,9 +999,8 @@ def mark_copied_calls(sessions: list[Session]) -> int:
     the earlier history, so one real invocation shows up in every copy, yet the query log has
     one record for it. The copy kept is the one in the session named by the record's own
     sessionId (copies keep the originating id); without that, the earliest-starting session.
-    Copies leave execution and measurement but stay in routing: the copied transcript also
-    carries the original's searches and reads, so dropping only the call would turn the
-    copying unit into a false "bypassed".
+    Copies leave execution and measurement; routing dedupes on its own terms
+    (mark_routing_copies).
     """
     def rank(c: Call) -> tuple:
         s = c.unit.session
@@ -682,6 +1021,34 @@ def mark_copied_calls(sessions: list[Session]) -> int:
     return marked
 
 
+def mark_routing_copies(units: list[Unit]) -> int:
+    """Count each lookup and call once in routing; return how many copies were set aside.
+
+    A continued or forked transcript repeats the earlier history under the same tool_use
+    ids, so without this one exploration shows up as one unit per transcript. Each id stays
+    with the holder whose session ran latest: the continuation carries the whole conversation
+    plus what it did after, so its own graphify call covers the lookups it copied. The other
+    holders drop it from routing (execution keeps its own owner rule, mark_copied_calls).
+    """
+    def latest(u: Unit) -> tuple:
+        return (u.session.last_ts or datetime.min.replace(tzinfo=timezone.utc), u.session.session_id)
+
+    holders: dict[str, list[Unit]] = {}
+    for u in units:
+        for tid in {lk.tool_use_id for lk in u.lookups} | {c.tool_use_id for c in u.calls}:
+            if tid:
+                holders.setdefault(tid, []).append(u)
+    marked = 0
+    for tid, us in holders.items():
+        if len(us) > 1:
+            keep = max(us, key=latest)
+            for u in us:
+                if u is not keep:
+                    u.routing_copies.add(tid)
+                    marked += 1
+    return marked
+
+
 def match_records(calls: list[Call], records: list[dict]) -> None:
     free = list(records)
     for call in sorted(calls, key=lambda c: c.ts or datetime.min.replace(tzinfo=timezone.utc)):
@@ -699,17 +1066,21 @@ def match_records(calls: list[Call], records: list[dict]) -> None:
 
 
 def coverage(session: Session) -> Callable[[str], bool]:
-    """Path predicate for the code the session's graph covers.
+    return coverage_for(session.resolved, session.repo)
 
-    Covers the graph root, the session's local mapping of it, and the same relative
-    folder inside any worktree lane under the repo, so sessions from worktrees
+
+def coverage_for(resolved: dict | None, repo: str | None) -> Callable[[str], bool]:
+    """Path predicate for the code a resolved graph covers.
+
+    Covers the graph root, the local mapping of it, and the same relative
+    folder inside any worktree lane under the repo, so units from worktrees
     that were deleted since (they now resolve to the main checkout) still count.
     """
-    r = session.resolved or {}
+    r = resolved or {}
     roots = {norm(r["graph_root"]), norm(r["local_root"])} if r else set()
     patterns = []
-    if r and session.repo:
-        repo = norm(session.repo)
+    if r and repo:
+        repo = norm(repo)
         graph_root = norm(r["graph_root"])
         rel = os.path.relpath(graph_root, repo) if graph_root.startswith(repo) else None
         if rel is not None and not rel.startswith(".."):
@@ -741,6 +1112,110 @@ def repo_of(session: Session, resolver) -> str | None:
     return repo_identity(session.cwd, resolver) if session.cwd else None
 
 
+# --------------------------------------------------------------------------- agent definitions
+# Ported from the profile's graphify hint hook (the hook may not import from here, and
+# this repo cannot import the hook): keep the two in step. Definitions are read as they are
+# now, not as they were when the session ran.
+
+def _unquote(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
+def _scalar_or_list(value: str) -> str | list[str]:
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        return [_unquote(v) for v in _LIST_SPLIT_RE.split(value[1:-1]) if v.strip()]
+    return _unquote(value)
+
+
+def parse_frontmatter(text: str) -> dict[str, str | list[str]] | None:
+    """Top-level keys of a `---` frontmatter block; None if there is none or it is unterminated."""
+    lines = text.lstrip("\ufeff").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    out: dict[str, str | list[str]] = {}
+    key: str | None = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return out
+        item = re.match(r"\s*-\s+(.*)$", line)
+        if item and key is not None and isinstance(out.get(key), list):
+            out[key].append(_unquote(item.group(1)))  # type: ignore[union-attr]
+            continue
+        m = re.match(r"([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+        if m:
+            key, value = m.group(1), m.group(2)
+            out[key] = _scalar_or_list(value) if value.strip() else []
+    return None
+
+
+def _tool_names(value: str | list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    items = value if isinstance(value, list) else _LIST_SPLIT_RE.split(value)
+    return [t.strip() for t in items if t.strip()]
+
+
+def find_agent_definition(agent_type: str, cwd: str | None,
+                          user_agents: Path | None) -> dict[str, str | list[str]] | None:
+    """Frontmatter of the agent file whose `name` (or file stem) is agent_type.
+
+    Searched in .claude/agents from cwd upward (nearest wins), then in user_agents.
+    """
+    dirs: list[Path] = []
+    if cwd:
+        here = Path(cwd)
+        dirs = [d / ".claude" / "agents" for d in (here, *here.parents)]
+    if user_agents is not None:
+        dirs.append(user_agents)
+    for d in dirs:
+        try:
+            paths = sorted(d.glob("*.md")) if d.is_dir() else []
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                with open(path, "rb") as f:
+                    text = f.read(AGENT_DEF_MAX_BYTES).decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            fm = parse_frontmatter(text)
+            if fm is None:
+                continue
+            name = fm.get("name")
+            if (name if isinstance(name, str) and name else path.stem) == agent_type:
+                return fm
+    return None
+
+
+def agent_has_shell(agent_type: str | None, cwd: str | None,
+                    user_agents: Path | None) -> bool | None:
+    """False when the agent provably has no Bash/PowerShell; None when its definition is unknown.
+
+    A `tools` field absent or `*` means every tool; a pattern grant such as Bash(git:*)
+    counts as a shell; only a bare entry in disallowedTools removes one.
+    """
+    if not agent_type:
+        return None
+    if agent_type in NO_SHELL_AGENTS:
+        return False
+    if ":" in agent_type:
+        return None
+    fm = find_agent_definition(agent_type, cwd, user_agents)
+    if fm is None:
+        return None
+    tools = _tool_names(fm.get("tools"))
+    denied = set(_tool_names(fm.get("disallowedTools")) or [])
+    if not tools or "*" in tools:
+        granted = set(SHELL_TOOLS)
+    else:
+        granted = {t.split("(", 1)[0].strip() for t in tools} & set(SHELL_TOOLS)
+    return bool(granted - denied)
+
+
 def input_problems(inputs: dict) -> list[str]:
     """One line per kind of unusable input; empty when every input was read cleanly."""
     q, out = inputs["query_log"], []
@@ -753,13 +1228,15 @@ def input_problems(inputs: dict) -> list[str]:
                    + ": execution and measurement have no complete log evidence")
     if q["corrupt_lines"]:
         out.append(f"query log has {q['corrupt_lines']} corrupt line(s), skipped")
+    if q["undated_records"]:
+        out.append(f"query log has {q['undated_records']} query record(s) without a usable ts, skipped")
     if inputs["projects_dir_missing"]:
         out.append("transcript projects folder missing: no sessions could be read")
     for key, text in (("transcripts_unstatable", "transcript(s) could not be stat'ed"),
                       ("transcripts_unreadable", "transcript file(s) could not be read"),
                       ("transcripts_undated", "transcript(s) had no timestamped record and were left out"),
                       ("subagent_metadata_problems", "subagent(s) without readable metadata "
-                                                     "(type unknown, so never routing-eligible)"),
+                                                     "(type unknown, judged shell-capable)"),
                       ("sessions_without_cwd", "session(s) without a cwd (repo and graph unknown)")):
         if inputs[key]:
             out.append(f"{len(inputs[key])} {text}")
@@ -769,7 +1246,9 @@ def input_problems(inputs: dict) -> list[str]:
 
 
 def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
-            since: datetime, until: datetime) -> dict:
+            since: datetime, until: datetime, user_agents: Path | None = None) -> dict:
+    if user_agents is None:
+        user_agents = Path.home() / ".claude" / "agents"
     sessions, records = scan.sessions, log.records
     excludes = cfg.exclude_sessions
     hint_live = cfg.hint_live_since
@@ -793,10 +1272,22 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     copied_calls = mark_copied_calls(sessions)
     all_calls = [c for s in sessions for u in s.units.values() for c in u.calls if not c.copy]
     match_records(all_calls, records)
+
+    # A session is kept whole when it overlaps the window, but the log is windowed per
+    # record, so execution and measurement judge only calls made inside the window (same
+    # slack as the log); an undated call stays in. The wrapper logs when the call ends, so
+    # a call is placed by its result time when it has one. Records of boundary calls are
+    # still matched above, so they never read as unattributed.
+    def in_window(c: Call) -> bool:
+        t = c.result_ts or c.ts
+        return t is None or since - MATCH_SLACK <= t <= until + MATCH_SLACK
+
+    outside_window = sum(1 for s in organic for u in s.units.values() for c in u.calls
+                         if not c.alt_log and not c.copy and not in_window(c))
     organic_calls = [c for s in organic for u in s.units.values() for c in u.calls
-                     if not c.alt_log and not c.copy]
+                     if not c.alt_log and not c.copy and in_window(c)]
     alt_log_calls = sum(1 for s in organic for u in s.units.values() for c in u.calls
-                        if c.alt_log and not c.copy)
+                        if c.alt_log and not c.copy and in_window(c))
 
     # ---- stage 1: availability
     def post_hint(s: Session) -> bool:
@@ -839,18 +1330,33 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     v1 = FAIL if FAIL in (v1a, v1b) else PASS if (v1a, v1b) == (PASS, PASS) else INSUFFICIENT
 
     # ---- stage 2: routing
-    scopes = {s.session_id: coverage(s) for s in graph_backed}
-    units = [u for s in graph_backed for u in s.units.values()]
-    exploration = [u for u in units if u.is_exploration(scopes[u.session.session_id])]
+    # Each unit is judged against the graph of its own cwd: a subagent may run elsewhere
+    # than its session started, and a graph-less session may spawn one inside a graph.
+    graph_cache: dict[str, tuple[dict | None, str | None]] = {}
+    for s in organic:
+        for u in s.units.values():
+            u.cwd = u.cwd or s.cwd
+            if not u.cwd:
+                continue
+            if u.cwd not in graph_cache:
+                r = resolver.resolve(u.cwd)
+                graph_cache[u.cwd] = (dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r,
+                                      repo_identity(u.cwd, resolver))
+            u.resolved, u.repo = graph_cache[u.cwd]
+    routing_copies = mark_routing_copies([u for s in organic for u in s.units.values()])
+    units = [u for s in organic for u in s.units.values() if u.resolved]
+    scope_of = {id(u): coverage_for(u.resolved, u.repo) for u in units}
+    eligible = [u for u in units if u.is_exploration(scope_of[id(u)])]
+    # A subagent without a shell cannot run graphify: its lookups show the graph was
+    # unusable to it, not that it was bypassed.
+    unusable = [u for u in eligible if u.unit_id != "main"
+                and agent_has_shell(u.agent_type, u.cwd, user_agents) is False]
+    exploration = [u for u in eligible if u not in unusable]
     no_path_evidence = [u for u in units if u.enough_lookups() and not (u.files | u.search_paths)]
-    def real_calls(u: Unit) -> list[Call]:
-        return [c for c in u.calls if not c.alt_log]
-
-    used = [u for u in exploration if real_calls(u)]
-    bypassed = sorted((u for u in exploration if not real_calls(u)),
+    used = [u for u in exploration if u.routing_calls()]
+    bypassed = sorted((u for u in exploration if not u.routing_calls()),
                       key=lambda u: -(u.searches + u.reads))
-    other_callers = [u for u in units
-                     if real_calls(u) and not u.is_exploration(scopes[u.session.session_id])]
+    other_callers = [u for u in units if u.routing_calls() and u not in eligible]
     after_hint = [u for u in exploration if post_hint(u.session)]
     spawns = [sp for u in units for sp in u.spawned if sp["type"] in EXPLORE_AGENT_TYPES]
     if bypassed:
@@ -925,6 +1431,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     inputs = {
         "query_log": {"path": str(log.path) if log.path else None, "status": log.status,
                       "error": log.error, "corrupt_lines": log.corrupt_lines,
+                      "undated_records": log.undated_records,
                       "records_in_window": len(records)},
         "projects_dir_missing": scan.projects_missing,
         "transcripts_unstatable": scan.unstatable,
@@ -957,25 +1464,32 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             "graph_backed_units": len(units), "exploration_units": len(exploration),
             "used_graphify": [u.label for u in used],
             "after_hint_live": {"exploration_units": len(after_hint),
-                                "used_graphify": sum(1 for u in after_hint if real_calls(u)),
+                                "used_graphify": sum(1 for u in after_hint if u.routing_calls()),
                                 "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} "
                                              f"transcript={u.session.path}"
-                                             for u in after_hint if not real_calls(u)]},
+                                             for u in after_hint if not u.routing_calls()]},
             "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} files={len(u.files)} "
-                         f"in_graph={u.covered(scopes[u.session.session_id])} "
-                         f"cwd={u.session.cwd}" for u in bypassed],
+                         f"in_graph={u.covered(scope_of[id(u)])} "
+                         f"cwd={u.cwd}" for u in bypassed],
+            "copied_tool_uses_excluded": routing_copies,
+            "graph_unusable_units": len(unusable),
+            "graph_unusable": [f"{u.label} searches={u.searches} reads={u.reads} "
+                               f"in_graph={u.covered(scope_of[id(u)])} cwd={u.cwd}"
+                               for u in unusable],
             "non_exploration_callers": len(other_callers),
             "skill_selected_units": sum(1 for u in units if u.skill_selected),
             "explore_spawns": len(spawns),
             "explore_spawns_passed_graph": sum(1 for sp in spawns if sp["passed_graph"]),
             "lookup_units_without_path_evidence": len(no_path_evidence),
-            "eligibility_unknown_sessions": len(graph_backed) - len({u.session.session_id for u in exploration})},
+            "eligibility_unknown_sessions": len({u.session.session_id for u in units}
+                                                - {u.session.session_id for u in eligible})},
         "execution": {
             "verdict": v3, "calls": len(organic_calls), "by_status": by_status,
             "logged": sum(1 for c in ok_calls if c.record is not None),
             "unlogged_ok_wrapper_calls": [c.unit.label for c in unlogged],
             "unlogged_reading": unlogged_reading,
             "copied_calls_excluded": copied_calls,
+            "calls_outside_window_excluded": outside_window,
             "wrapper_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in wrapper_errors],
             "unrecovered_shell_errors": [f"{c.unit.label}: {c.output[:160]!r}" for c in unrecovered],
             "recovered_shell_errors": [f"{c.unit.label}: {c.command[:160]!r} -> {c.output[:160]!r}"
@@ -1036,13 +1550,17 @@ def render(summary: dict) -> str:
         if items:
             L += ["", f"**{title}:**", *[f"- {x}" for x in items]]
     L += ["", "## 2 Routing", "",
-          f"Eligibility is a heuristic (explore-type subagent with >= {SUBAGENT_MIN_LOOKUPS} lookups, or a main "
-          f"thread with >= {MAIN_MIN_SEARCHES} searches over >= {MAIN_MIN_FILES} files). "
-          "Only lookups inside the graph's coverage count. "
-          f"{r['eligibility_unknown_sessions']} graph-backed sessions had no exploration unit by this rule: "
+          f"Eligibility is a heuristic (a subagent of any type with >= {SUBAGENT_MIN_LOOKUPS} lookups, or a main "
+          f"thread with >= {MAIN_MIN_SEARCHES} searches over >= {MAIN_MIN_FILES} files; shell searches and reads "
+          "count with the paths they name). Each unit is judged against the graph of its own cwd, and "
+          "only lookups inside that graph's coverage count. "
+          f"{r['eligibility_unknown_sessions']} sessions with graph-backed units had no exploration unit by this rule: "
           "their eligibility is unknown, not zero demand.", "",
-          f"- Graph-backed units: {r['graph_backed_units']}; exploration units: {r['exploration_units']}",
-          f"- Units with enough lookups but no file/path evidence (shell-only, eligibility unknown): "
+          f"- Graph-backed units: {r['graph_backed_units']}; exploration units: {r['exploration_units']}; "
+          f"lookups/calls repeated by continued/forked transcripts, counted once: "
+          f"{r['copied_tool_uses_excluded']}",
+          f"- Subagents without a shell (graph unusable, not bypasses): {r['graph_unusable_units']}",
+          f"- Units with enough lookups but no file/path evidence (eligibility unknown): "
           f"{r['lookup_units_without_path_evidence']}",
           f"- Queried graphify: {len(r['used_graphify'])} {r['used_graphify'] or ''}",
           f"- **Decisive line — after the hint went live: {r['after_hint_live']['used_graphify']}/"
@@ -1053,13 +1571,18 @@ def render(summary: dict) -> str:
     if r["after_hint_live"]["bypassed"]:
         L += ["", "**Bypassed after go-live (open these transcripts first):**",
               *[f"- {x}" for x in r["after_hint_live"]["bypassed"][:BYPASS_SHOWN]]]
+    if r["graph_unusable"]:
+        L += ["", "**Graph unusable (subagent definition grants no Bash/PowerShell):**",
+              *[f"- {x}" for x in r["graph_unusable"][:BYPASS_SHOWN]]]
     if r["bypassed"]:
         shown = r["bypassed"][:BYPASS_SHOWN]
         L += ["", f"**Bypassed (routing failures to investigate this week; largest {len(shown)} of "
                   f"{len(r['bypassed'])}, full list in the JSON summary):**", *[f"- {x}" for x in shown]]
     L += ["", "## 3 Execution", "",
           f"- Calls: {e['calls']} by status {e['by_status']}; logged: {e['logged']}; bare CLI (outside wrapper): {e['bare_cli_calls']}; "
-          f"copies from continued/forked transcripts excluded: {e['copied_calls_excluded']}",
+          f"copies from continued/forked transcripts excluded: {e['copied_calls_excluded']}; "
+          f"calls made outside the window (in sessions overlapping it) excluded: "
+          f"{e['calls_outside_window_excluded']}",
           f"- Test runs against a redirected GRAPHIFY_QUERY_LOG (not counted): {e['test_alt_log_calls']}"]
     for title, key in (("Completed wrapper calls with no log record", "unlogged_ok_wrapper_calls"),
                        ("Wrapper/query errors", "wrapper_errors"),

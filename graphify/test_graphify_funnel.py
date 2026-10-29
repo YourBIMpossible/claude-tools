@@ -148,7 +148,9 @@ class FunnelCase(unittest.TestCase):
         scan = gf.discover_sessions(self.projects, SINCE, UNTIL)
         records = gf.load_log(self.log if log is None else log, SINCE, UNTIL)
         cfg = gf.parse_config(self.cfg, self.root)
-        return gf.analyse(scan, records, self.resolver, cfg, SINCE, UNTIL)
+        # Agent definitions come from the fixture, never the real user-level agents folder.
+        return gf.analyse(scan, records, self.resolver, cfg, SINCE, UNTIL,
+                          user_agents=self.root / "user-agents")
 
     def write_cfg(self, cfg: dict, folder: Path | None = None) -> Path:
         path = (folder or self.root) / "graphify.local.json"
@@ -206,6 +208,299 @@ class Routing(FunnelCase):
         files = [lane / f"m{i}.py" for i in range(3)]
         Transcript(self.repo).greps(6).reads(files).write(self.projects, "p", "s-lane")
         self.assertEqual(self.run_funnel()["routing"]["exploration_units"], 1)
+
+
+class AnyAgentType(FunnelCase):
+    def test_custom_agent_type_counts_as_exploration(self):
+        sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))
+        Transcript(self.repo).subagent("c1", "backend-endpoint-reviewer", sub) \
+            .write(self.projects, "p", "s-custom")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["exploration_units"], 1)
+        self.assertIn("backend-endpoint-reviewer:c1", out["bypassed"][0])
+
+    def test_unknown_type_is_judged_shell_capable(self):
+        sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))
+        Transcript(self.repo).subagent("u1", "", sub).write(self.projects, "p", "s-untyped")
+        out = self.run_funnel()
+        self.assertEqual(out["routing"]["verdict"], gf.FAIL)
+        self.assertIn("judged shell-capable", " ".join(out["inputs"]["problems"]))
+
+
+class ShellLookups(FunnelCase):
+    def lookups(self, cmd: str, tool: str = "Bash", cwd: Path | None = None) -> gf.ShellLookups:
+        return gf.shell_lookups(cmd, tool, str(cwd or self.other))
+
+    def test_cd_then_relative_grep_resolves_against_cd_target(self):
+        lk = self.lookups(f'cd "{self.repo.as_posix()}" && grep -rn "def sync" backend/aec')
+        self.assertTrue(lk.searched)
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend" / "aec"))})
+
+    def test_pattern_and_option_values_are_not_paths(self):
+        lk = self.lookups(f'grep -rn -A 3 "a/b.py" {self.repo.as_posix()}/backend')
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
+        lk = self.lookups("sed -n '1,40p' backend/router.py", cwd=self.repo)
+        self.assertTrue(lk.read)
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "backend" / "router.py"))})
+        lk = self.lookups("rg -e x/y.py -g '*.py' backend/", cwd=self.repo)
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
+
+    def test_bare_search_after_cd_searches_the_cd_target(self):
+        lk = self.lookups(f"cd {self.repo.as_posix()}/backend && rg sync_rooms")
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
+        # a search fed by a pipe reads stdin, not the cd target
+        lk = self.lookups(f"cd {self.repo.as_posix()}/backend && git log | grep fix")
+        self.assertEqual(lk.search_paths, set())
+
+    def test_git_show_ref_path_and_git_dash_c(self):
+        lk = self.lookups(f"git -C {self.repo.as_posix()} show HEAD:backend/m0.py")
+        self.assertTrue(lk.read)
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "backend" / "m0.py"))})
+
+    def test_powershell_reads_and_globs(self):
+        lk = self.lookups(f"Get-Content -Path '{self.repo}\\backend\\m1.py' -TotalCount 20", "PowerShell")
+        self.assertTrue(lk.read)
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "backend" / "m1.py"))})
+        lk = self.lookups(f"Select-String -Pattern sync -Path {self.repo}\\backend\\*.py", "PowerShell")
+        self.assertEqual(lk.search_paths, {gf.norm_path(str(self.repo / "backend"))})
+
+    def test_commands_inside_a_comment_are_not_lookups(self):
+        # SA26-16: a search named in a trailing comment never ran.
+        lk = self.lookups("cat a.py  # later; grep -rn foo backend/b.py", cwd=self.repo)
+        self.assertFalse(lk.searched)
+        self.assertEqual(lk.search_paths, set())
+        self.assertEqual(lk.read_paths, {gf.norm_path(str(self.repo / "a.py"))})
+
+    def test_a_commented_out_search_is_not_counted_in_the_unit(self):
+        # SA26-16: the unit's search count must ignore the comment too, not just shell_lookups.
+        path = Transcript(self.repo) \
+            .tool("Bash", {"command": "cat a.py  # later; grep -rn foo backend/b.py"}) \
+            .tool("Bash", {"command": "ls  # rg later"}) \
+            .write(self.projects, "p", "s-comment")
+        unit = gf.load_session(path).units["main"]
+        self.assertEqual((unit.searches, unit.reads), (0, 1))
+
+    def unit_of(self, tool: str, cmd: str) -> gf.Unit:
+        path = Transcript(self.repo).tool(tool, {"command": cmd}).write(self.projects, "p", "s-one")
+        return gf.load_session(path).units["main"]
+
+    def test_a_search_in_a_script_fed_to_a_shell_is_counted(self):
+        # SA26-16: blanking heredocs and multi-line quotes must not hide a script a shell runs.
+        for tool, cmd in (("Bash", 'bash -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", "bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "sh <<'EOF'\nrg foo src\nEOF"),
+                          ("PowerShell", 'pwsh -NoProfile -Command "\n Select-String -Pattern foo -Path src\\a.py\n"'),
+                          ("Bash", "cat <<'EOF' | bash\ngrep -rn foo src\nEOF"),
+                          ("Bash", "sudo bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "ssh host bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", "FOO=1 bash <<'EOF'\ngrep -rn foo src\nEOF"),
+                          ("Bash", 'bash --norc -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash -o pipefail -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash --rcfile x -c "set -e\ngrep -rn foo src\n"'),
+                          ("Bash", 'bash -euo pipefail -c "set -e\ngrep -rn foo src\n"')):
+            with self.subTest(cmd=cmd):
+                unit = self.unit_of(tool, cmd)
+                self.assertEqual((unit.searches, unit.reads), (1, 0))
+
+    def test_a_heredoc_that_is_data_is_not_a_search(self):
+        for cmd in ("git commit -m \"$(cat <<'EOF'\nfix: stop the grep fallback\nEOF\n)\"",
+                    "git commit -F - <<'EOF'\nfix: drop the grep fallback\nEOF",
+                    "cat > notes.md <<'EOF'\nuse rg here\nEOF",
+                    "tee notes.md <<'EOF'\nuse grep here\nEOF",
+                    "python - <<'EOF'\nprint('run grep later')\nEOF",
+                    "node <<'EOF'\nconsole.log('use grep here')\nEOF",
+                    "bash <<'EOF'\necho done  # grep later\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.unit_of("Bash", cmd).searches, 0)
+
+    def searches_of(self, cmd: str, tool: str = "Bash") -> tuple[int, int]:
+        unit = self.unit_of(tool, cmd)
+        return unit.searches, unit.reads
+
+    def test_a_search_word_counts_only_at_a_command_position(self):
+        # SA26 G-1: a tool name inside an argument, an echo or a string is not a search.
+        for tool, cmd in (("Bash", 'echo "use grep here"'),
+                          ("Bash", "echo use rg later"),
+                          ("Bash", "printf '%s\n' grep rg findstr"),
+                          ("Bash", "taskset -c 0 echo use grep here"),
+                          ("Bash", "flock /tmp/l echo use rg here"),
+                          ("Bash", "taskset -p 1234"),
+                          ("Bash", "man grep"),
+                          ("Bash", "which rg"),
+                          ("Bash", "type grep"),
+                          ("Bash", "command -v rg"),
+                          ("Bash", 'git commit -m "drop the grep fallback"'),
+                          ("PowerShell", "Write-Host 'use Select-String'"),
+                          ("Bash", 'bash -c "echo use grep later\nls"'),
+                          ("Bash", "bash <<'EOF'\necho use grep later\nEOF"),
+                          ("PowerShell", 'pwsh -Command "\nWrite-Host \'use Select-String\'\n"')):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.searches_of(cmd, tool)[0], 0)
+
+    def test_every_form_that_runs_a_search_tool_is_still_counted(self):
+        # SA26 G-1: command positions are the start of a segment, after a pipe, a subshell, a block or a
+        # keyword, and after a wrapper (xargs, timeout, sudo, env, VAR=x, ...) or a remote runner.
+        for tool, cmd in (("Bash", "grep -rn foo src"),
+                          ("Bash", "cd src && rg foo"),
+                          ("Bash", "git log | grep fix"),
+                          ("Bash", "ls | xargs grep foo"),
+                          ("Bash", "ls | xargs -n 1 grep foo"),
+                          ("Bash", "find . -name '*.py' -exec grep -l foo {} +"),
+                          ("Bash", "sudo grep -rn foo /etc"),
+                          ("Bash", "sudo -u bob grep -rn foo src"),
+                          ("Bash", "timeout 10 rg foo src"),
+                          ("Bash", "env FOO=1 rg foo src"),
+                          ("Bash", "FOO=1 grep -rn foo src"),
+                          ("Bash", "nohup rg foo src"),
+                          ("Bash", "for f in a b; do grep -n foo $f; done"),
+                          ("Bash", "if grep -q foo a.txt; then echo y; fi"),
+                          ("Bash", "echo $(grep -c foo a.txt)"),
+                          ("Bash", "{ grep -rn foo src; }"),
+                          ("Bash", "git -C src grep foo"),
+                          ("Bash", "git --no-pager grep -n foo"),
+                          ("Bash", "ssh host grep -rn foo src"),
+                          ("Bash", "docker exec c grep -rn foo /src"),
+                          ("Bash", "rg.exe foo src"),
+                          ("Bash", "time -p grep -rn foo src"),
+                          ("Bash", "watch -n 5 grep -rn foo src"),
+                          ("Bash", "taskset -c 0 grep -rn foo src"),
+                          ("Bash", "taskset 0x3 grep -rn foo src"),
+                          ("Bash", "taskset --cpu-list 0,1 rg foo src"),
+                          ("Bash", "numactl --cpunodebind=0 grep -rn foo src"),
+                          ("Bash", "numactl -N 0 -m 0 rg foo src"),
+                          ("Bash", "flock /tmp/l grep -rn foo src"),
+                          ("Bash", "flock -n -w 5 /tmp/l grep -rn foo src"),
+                          ("Bash", "chronic grep -rn foo src"),
+                          ("Bash", "caffeinate -i grep -rn foo src"),
+                          ("Bash", "caffeinate -t 60 grep -rn foo src"),
+                          ("Bash", "ltrace grep -rn foo src"),
+                          ("Bash", "ltrace -o out.txt grep -rn foo src"),
+                          ("Bash", "valgrind grep -rn foo src"),
+                          ("Bash", "valgrind --tool=memcheck grep -rn foo src"),
+                          ("Bash", "nsenter -t 1 -m grep -rn foo src"),
+                          ("Bash", "nsenter --target 1 --mount grep -rn foo src"),
+                          ("Bash", "gdb --args grep -rn foo src"),
+                          ("Bash", "gdb -batch -ex run --args rg foo src"),
+                          ("Bash", "eval grep -rn foo src"),
+                          ("Bash", 'FOO="a b" grep -rn foo src'),
+                          ("Bash", 'FOO="a b" grep -rn foo src \\\n  extra'),
+                          ("Bash", "cd src && \\\n grep -rn foo ."),
+                          ("Bash", "find . -exec grep -l foo {} \\;"),
+                          ("Bash", "cat <<'EOF' | grep -c bash\nuse rg later\nEOF"),
+                          ("PowerShell", "$r = Select-String -Pattern foo -Path a.py"),
+                          ("PowerShell", "Select-String -Pattern foo -Path a.py"),
+                          ("PowerShell", "Get-ChildItem -Recurse | Select-String foo"),
+                          ("PowerShell", "Get-ChildItem | ForEach-Object { Select-String foo $_ }")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.searches_of(cmd, tool)[0], 1)
+
+    def test_a_one_line_shell_c_script_is_scanned_like_a_multi_line_one(self):
+        # SA26 G-2: `bash -c "grep ..."`, `sh -c '...'`, `pwsh -Command "..."` and `cmd /c "..."` on one line.
+        for tool, cmd in (("Bash", 'bash -c "grep -rn foo src"'),
+                          ("Bash", "sh -c 'rg foo src'"),
+                          ("Bash", 'bash -lc "cd /r && grep -rn foo src"'),
+                          ("Bash", 'bash -o pipefail -c "grep -rn foo src"'),
+                          ("Bash", 'sudo bash -c "grep -rn foo src"'),
+                          ("Bash", 'cmd /c "findstr /s foo *.py"'),
+                          ("PowerShell", 'pwsh -NoProfile -Command "Select-String -Pattern foo -Path a.py"'),
+                          ("PowerShell", "powershell -Command 'Get-ChildItem | Select-String foo'")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.searches_of(cmd, tool), (1, 0))
+        for tool, cmd in (("Bash", 'bash -c "echo use grep here"'),
+                          ("Bash", "sh -c 'echo rg'"),
+                          ("Bash", 'bash -c "ls -la"'),
+                          ("PowerShell", "pwsh -Command \"Write-Host 'use Select-String'\"")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.searches_of(cmd, tool), (0, 0))
+
+    def test_the_c_option_word_pattern_does_not_cross_a_separator(self):
+        # SA26 G-3: `bash build.sh; python -c "..."` is not bash's script.
+        for shell in ("bash build.sh", "pwsh build.ps1", "powershell build.ps1"):
+            for sep in (";", "&&", "|", "&"):
+                for body in ('"x\ngrep -rn foo src\n"', '"grep -rn foo src"'):
+                    cmd = f"{shell} {sep} python -c {body}"
+                    with self.subTest(cmd=cmd):
+                        self.assertEqual(self.searches_of(cmd)[0], 0)
+        # the same flag, with its words on one side of the separator, still hides nothing
+        self.assertEqual(self.searches_of('bash -o pipefail -c "set -e\ngrep -rn foo src\n"')[0], 1)
+
+    def test_unknown_commands_and_urls_contribute_nothing(self):
+        lk = self.lookups("python build.py && curl https://x/a.py && echo backend/a.py")
+        self.assertEqual((lk.searched, lk.read, lk.search_paths, lk.read_paths),
+                         (False, False, set(), set()))
+
+    def test_shell_exploration_is_covered(self):
+        repo = self.repo.as_posix()
+        sub = Transcript(self.other) \
+            .tool("Bash", {"command": f"cd {repo} && grep -rn sync backend/"}) \
+            .tool("Bash", {"command": f"cat {repo}/backend/m0.py"}) \
+            .tool("Bash", {"command": f"sed -n 1,50p {repo}/backend/m1.py"})
+        Transcript(self.repo).subagent("b1", "general-purpose", sub).write(self.projects, "p", "s-sh")
+        # the subagent's own cwd is outside the graph: not a routing unit
+        self.assertEqual(self.run_funnel()["routing"]["exploration_units"], 0)
+        sub2 = Transcript(self.repo) \
+            .tool("Bash", {"command": "grep -rn sync backend/"}) \
+            .tool("Bash", {"command": "cat backend/m0.py"}) \
+            .tool("Bash", {"command": "sed -n 1,50p backend/m1.py"})
+        Transcript(self.repo).subagent("b2", "general-purpose", sub2).write(self.projects, "p", "s-sh2")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["exploration_units"], 1)
+        self.assertIn("in_graph=3", out["bypassed"][0])
+        self.assertEqual(out["lookup_units_without_path_evidence"], 0)
+
+
+class PerUnitCwd(FunnelCase):
+    def test_subagent_outside_graph_in_graph_backed_session_is_not_a_unit(self):
+        sub = Transcript(self.other).greps(3, self.repo / "backend").reads(self.backend_files(3))
+        Transcript(self.repo).hint().subagent("o1", "Explore", sub).write(self.projects, "p", "s-moved")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["graph_backed_units"], 1)   # the main thread only
+        self.assertEqual(out["exploration_units"], 0)
+
+    def test_subagent_in_graph_from_graphless_session_is_a_unit(self):
+        sub = Transcript(self.repo).greps(3).reads(self.backend_files(3))
+        Transcript(self.other).hint().subagent("i1", "Explore", sub).write(self.projects, "p", "s-into")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["graph_backed_units"], 1)
+        self.assertEqual(out["exploration_units"], 1)
+        self.assertIn("cwd=" + str(self.repo), out["bypassed"][0])
+
+
+class GraphUnusable(FunnelCase):
+    def agent(self, folder: Path, name: str, tools: str) -> None:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{name}.md").write_text(f"---\nname: {name}\ntools: {tools}\n---\nbody\n",
+                                           encoding="utf-8")
+
+    def session_with(self, agent_type: str, sid: str) -> None:
+        sub = Transcript(self.repo).greps(3).reads(self.backend_files(3))
+        Transcript(self.repo).subagent("r1", agent_type, sub).write(self.projects, "p", sid)
+
+    def test_project_agent_without_shell_is_unusable_not_bypass(self):
+        self.agent(self.repo / ".claude" / "agents", "reviewer", "Read, Grep, Glob")
+        self.session_with("reviewer", "s-noshell")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["verdict"], gf.INSUFFICIENT)
+        self.assertEqual((out["exploration_units"], out["graph_unusable_units"]), (0, 1))
+        self.assertEqual(out["bypassed"], [])
+        self.assertIn("reviewer:r1", out["graph_unusable"][0])
+        self.assertEqual(out["eligibility_unknown_sessions"], 0)
+
+    def test_user_agent_with_shell_pattern_is_still_a_bypass(self):
+        self.agent(self.root / "user-agents", "runner", '[Read, "Bash(git:*)"]')
+        self.session_with("runner", "s-shell")
+        out = self.run_funnel()["routing"]
+        self.assertEqual((out["verdict"], out["graph_unusable_units"]), (gf.FAIL, 0))
+
+    def test_builtin_no_shell_agent_is_unusable(self):
+        self.session_with("claude-code-guide", "s-guide")
+        self.assertEqual(self.run_funnel()["routing"]["graph_unusable_units"], 1)
+
+    def test_frontmatter_parser(self):
+        fm = gf.parse_frontmatter("---\nname: a\ntools:\n  - Read\n  - Bash\n---\n")
+        self.assertEqual(fm, {"name": "a", "tools": ["Read", "Bash"]})
+        self.assertIsNone(gf.parse_frontmatter("---\nname: a\n"))
+        self.assertIsNone(gf.parse_frontmatter("no frontmatter"))
 
 
 class Execution(FunnelCase):
@@ -386,6 +681,16 @@ class Execution(FunnelCase):
         self.assertEqual(ex["calls"], 5)
         self.assertEqual(ex["bare_cli_calls"], 3)
 
+    def test_a_mention_inside_a_comment_is_not_a_call(self):
+        # SA26-16: text after `#` is a comment; a separator in it is no command position.
+        Transcript(self.repo) \
+            .tool("Bash", {"command": 'cat a.py  # later; graphify query "foo"'}) \
+            .tool("PowerShell", {"command": 'Get-Content a.py # then; python /x/query_reranked.py "q"'}) \
+            .write(self.projects, "p", "s-comment")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual(ex["calls"], 0)
+        self.assertEqual(ex["bare_cli_calls"], 0)
+
     def test_commands_inside_a_quoted_shell_argument_are_not_counted(self):
         # Accepted limit of the quoted-separator rule: the inner command is an argument string.
         Transcript(self.repo) \
@@ -470,12 +775,121 @@ class OrganicSeparation(FunnelCase):
         self.assertEqual(out["execution"]["calls"], 1)
         self.assertEqual(out["execution"]["copied_calls_excluded"], 1)
 
+    def test_forked_exploration_counts_once_in_routing(self):
+        # SA26-6: the fork repeats the original's lookups (same tool_use ids); one real unit.
+        t = Transcript(self.repo).greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "p", "s-orig")
+        t.write(self.projects, "p", "s-fork")
+        r = self.run_funnel()["routing"]
+        self.assertEqual((r["graph_backed_units"], r["exploration_units"], len(r["bypassed"])), (2, 1, 1))
+
+    def test_continuation_call_covers_its_copied_exploration(self):
+        # SA26-6: a continued transcript holds the earlier lookups and then queries graphify
+        # itself; the conversation is one used unit, not a bypass plus a used unit.
+        t = Transcript(self.repo).greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "p", "s-orig")
+        t.query("later q")
+        for rec in t.lines[-2:]:
+            rec["sessionId"] = "s-cont"
+        t.write(self.projects, "p", "s-cont")
+        self.log_record("later q", t.t)
+        r = self.run_funnel()["routing"]
+        self.assertEqual((r["verdict"], r["exploration_units"], r["bypassed"]), (gf.PASS, 1, []))
+        self.assertEqual(r["used_graphify"], ["s-cont/main"])
+        self.assertEqual(r["non_exploration_callers"], 0)
+
     def test_repeated_tool_ids_are_counted_once(self):
         t = Transcript(self.repo)
         for _ in range(3):
             t.tool("Grep", {"pattern": "x"}, tool_id="toolu_same")
         path = t.write(self.projects, "p", "s-rep")
         self.assertEqual(gf.load_session(path).units["main"].searches, 1)
+
+
+class CallWindow(FunnelCase):
+    """SA26-4/5: the log is windowed per record, so calls are too; a session is kept whole."""
+
+    def test_call_before_the_window_in_a_spanning_session_is_not_judged(self):
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)).query("q-early")
+        self.log_record("q-early", t.t)          # logged, but before the window
+        t.t = SINCE + timedelta(hours=1)
+        t.greps(1).write(self.projects, "p", "s-span")
+        out = self.run_funnel()
+        self.assertEqual(out["sessions"]["total"], 1)
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"]),
+                         (0, gf.INSUFFICIENT, []))
+        self.assertEqual(ex["calls_outside_window_excluded"], 1)
+
+    def test_fork_of_a_pre_window_session_drops_the_copied_call(self):
+        orig = Transcript(self.repo, SINCE - timedelta(days=2)).query("q-old")
+        for rec in orig.lines:
+            rec["sessionId"] = "s-orig"
+        self.log_record("q-old", orig.t)
+        path = orig.write(self.projects, "p", "s-orig")
+        old = (SINCE - timedelta(days=1)).timestamp()
+        os.utime(path, (old, old))               # below the mtime floor: never loaded
+        fork = Transcript(self.repo, SINCE + timedelta(hours=1)).greps(1)
+        for rec in fork.lines:
+            rec["sessionId"] = "s-fork"
+        fork.lines = [dict(r) for r in orig.lines] + fork.lines
+        fork.write(self.projects, "p", "s-fork")
+        out = self.run_funnel()
+        self.assertEqual(out["sessions"]["total"], 1)
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"]),
+                         (0, gf.INSUFFICIENT, []))
+
+    def test_call_inside_the_window_is_still_judged(self):
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)).greps(1)
+        t.t = SINCE + timedelta(hours=1)
+        t.query("q-late").write(self.projects, "p", "s-span2")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["calls_outside_window_excluded"]),
+                         (1, gf.FAIL, 0))
+
+    def edge_call(self, session_id: str, start: datetime, end: datetime) -> None:
+        """A wrapper call that starts at `start` and returns, and is logged, at `end`."""
+        t = Transcript(self.repo, start - timedelta(seconds=1))
+        tid = f"toolu_{session_id}"
+        t.lines.append({"timestamp": iso(start), "cwd": t.cwd, "type": "assistant",
+                        "message": {"content": [{"type": "tool_use", "id": tid, "name": "Bash", "input": {
+                            "command": 'python "/x/query_reranked.py" "q-edge" --graph "/x/graph.json"'}}]}})
+        t.lines.append({"timestamp": iso(end), "cwd": t.cwd, "type": "user",
+                        "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                                 "is_error": False, "content": "NODE x [src=a.py]"}]}})
+        t.write(self.projects, "p", session_id)
+        self.log_record("q-edge", end)
+
+    def test_call_ending_after_the_window_is_not_judged(self):
+        # The wrapper logs at the call's end, past the log window: no false FAIL.
+        self.edge_call("s-upper", UNTIL - timedelta(seconds=2), UNTIL + timedelta(seconds=8))
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["unlogged_ok_wrapper_calls"],
+                          ex["calls_outside_window_excluded"]), (0, gf.INSUFFICIENT, [], 1))
+
+    def test_call_starting_before_the_window_but_ending_in_it_is_judged(self):
+        # Its record is in the log window, so the call is measured, not silently dropped.
+        self.edge_call("s-lower", SINCE - timedelta(seconds=10), SINCE + timedelta(seconds=1))
+        out = self.run_funnel()
+        ex = out["execution"]
+        self.assertEqual((ex["calls"], ex["verdict"], ex["calls_outside_window_excluded"]),
+                         (1, gf.PASS, 0))
+        self.assertEqual(out["measurement"]["reranked"]["n"], 1)
+
+    def test_test_run_before_the_window_is_not_an_excluded_call(self):
+        # A redirected-log test run is never a call, inside the window or outside it.
+        t = Transcript(self.repo, SINCE - timedelta(hours=1)) \
+            .query("redirected", extra="GRAPHIFY_QUERY_LOG=/tmp/x.log ")
+        t.t = SINCE + timedelta(hours=1)
+        t.greps(1).write(self.projects, "p", "s-test-early")
+        ex = self.run_funnel()["execution"]
+        self.assertEqual((ex["calls"], ex["calls_outside_window_excluded"], ex["test_alt_log_calls"]),
+                         (0, 0, 0))
 
 
 class Availability(FunnelCase):
@@ -786,6 +1200,32 @@ class InputVisibility(FunnelCase):
         self.assertEqual(out["inputs"]["query_log"]["corrupt_lines"], 2)
         self.assertEqual(out["inputs"]["query_log"]["records_in_window"], 1)
         self.assert_problem(out, "query log has 2 corrupt line(s)")
+
+    def test_query_records_without_a_usable_ts_are_counted(self):
+        # SA26-17: a query record that cannot be placed in time is reported, not dropped.
+        with self.log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"kind": "query", "question": "a", "duration_ms": 5}) + "\n")
+            fh.write(json.dumps({"ts": "not-a-date", "kind": "query", "question": "b"}) + "\n")
+            fh.write(json.dumps({"kind": "refresh"}) + "\n")      # not a query: not counted
+        out = self.run_funnel()
+        q = out["inputs"]["query_log"]
+        self.assertEqual((q["records_in_window"], q["undated_records"]), (0, 2))
+        self.assert_problem(out, "query log has 2 query record(s) without a usable ts")
+
+    def test_undecodable_lines_are_counted_as_corrupt(self):
+        # SA26-18: invalid UTF-8 is a corrupt line in the log and in a transcript.
+        at = T0.isoformat().encode()
+        with self.log.open("ab") as fh:
+            fh.write(b'{"ts": "' + at + b'", "kind": "query", "question": "\xff\xfe"}\n')
+        path = Transcript(self.repo).greps(1).write(self.projects, "p", "s-bytes")
+        with path.open("ab") as fh:
+            fh.write(b'{"timestamp": "' + at + b'", "cwd": "\xff\xfe"}\n')
+        out = self.run_funnel()
+        q = out["inputs"]["query_log"]
+        self.assertEqual((q["records_in_window"], q["corrupt_lines"]), (0, 1))
+        self.assertEqual(out["inputs"]["transcript_corrupt_lines"], 1)
+        self.assert_problem(out, "query log has 1 corrupt line(s)")
+        self.assert_problem(out, "1 corrupt transcript line(s)")
 
     def test_missing_projects_folder(self):
         out = self.run_funnel()

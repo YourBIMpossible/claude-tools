@@ -412,6 +412,197 @@ def test_block_and_subshell_cwd_scope() -> None:
     check(counts(fp("git -C / add a.py")) == (1, 0, []), "git -C / stays unresolved, never inside or outside")
 
 
+def test_git_bash_drive_paths() -> None:
+    """SA26-2: on a Windows repository a Git Bash drive path (the drive letter as the first segment, or after
+    mnt or cygdrive) is the same place as the drive-letter form, so an in-repo touch is neither lost nor counted
+    as outside. Everything that is not a drive stays what it was: /tmp, a multi-letter first segment, another
+    directory on the drive, a UNC share. A repository whose root is not a drive path (Linux, macOS) is never
+    reinterpreted. The fixtures are assembled from parts so that no literal machine path sits in this file."""
+    drv = "F:"  # the repository's drive; the other drive below is a different letter
+    win = drv + "\\Repo"
+    wt_tail = WT[len(REPO):]  # the worktree part of the shared fixture
+    win_wt = win + wt_tail.replace("/", "\\")
+    msys = "/f/Repo"
+
+    def fp(cmd: str, cwd: str | None = None, root: str = win) -> fpm.Footprint:
+        c = call(1, "Bash", {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c], root=root))
+
+    def read(path: str, root: str = win) -> fpm.Footprint:
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [call(1, "Read", {"file_path": path})], root=root))
+
+    def counts(f: fpm.Footprint) -> tuple[list[str], int, int]:
+        return [t[1] for t in f.touches], f.outside, f.unresolved
+
+    inside = (["src/a.py"], 0, 0)
+    other = ([], 1, 0)
+    # the four probes of the audit
+    check(counts(fp(f"cat {drv}/Repo/src/a.py")) == inside, "control: the drive-letter form of the path resolves inside")
+    check(counts(fp(f"cat {msys}/src/a.py")) == inside, "cat <msys repo>/src/a.py: inside, not outside")
+    # `cd <repository root>` itself is counted outside by norm (an argument equal to the root returns None), in the
+    # drive-letter spelling as well; that is a separate finding. What SA26-2 owns is that the msys spelling behaves
+    # exactly like it.
+    msys_cd, win_cd = fp(f"cd {msys} && cat src/a.py"), fp(f"cd {drv}/Repo && cat src/a.py")
+    check([t[1] for t in msys_cd.touches] == ["src/a.py"], "cd <msys repo> then a relative path: the file is touched inside")
+    check(counts(msys_cd) == counts(win_cd), "cd <msys repo>: the same counts as the drive-letter spelling")
+    check(counts(fp(f"cd {msys}/src && cat a.py")) == inside, "cd <msys repo>/src then a bare name: inside")
+    check(counts(fp(f"git -C {msys}/src show HEAD:a.py")) == inside, "git -C <msys repo>/src: the msys base is inside")
+    check(counts(fp("cat a.py", cwd=msys + "/src")) == inside, "a recorded cwd in msys form resolves inside")
+    # spellings of the same drive
+    for form in ("/F/Repo/src/a.py", "/mnt/f/Repo/src/a.py", "/cygdrive/f/Repo/src/a.py",
+                 "/f/Repo\\src\\a.py", "/f/Repo//src/./a.py", "/f/Repo/src/../src/a.py"):
+        check(counts(fp(f"cat {form}")) == inside, f"shell: {form!r} is the repository file")
+        check(counts(read(form)) == inside, f"native Read: {form!r} is the repository file")
+    check(counts(fp(f"cat {msys}{wt_tail}/src/a.py")) == inside, "a worktree under the repository is stripped as before")
+    check(counts(fp(f"cat {msys}/src/a.py", root=win_wt)) == inside,
+          "a repository root that is itself a worktree: the main root still matches")
+    # still outside, or unchanged
+    check(counts(fp("cat /c/Someone/notes.md")) == other, "another drive is outside")
+    check(counts(fp("cat /f/Other/a.py")) == other, "another directory on the same drive is outside")
+    check(counts(fp("cat /f/Repo-old/a.py")) == other, "a sibling that merely starts with the repo name is outside")
+    check(counts(fp("cat /tmp/scratch.py")) == other, "/tmp is a POSIX location, not a drive")
+    check(counts(fp("cat /fx/Repo/src/a.py")) == other, "a multi-letter first segment is not a drive")
+    check(counts(fp("cat /fRepo/src/a.py")) == other,
+          "a first segment that is the drive letter glued to the repository name is not the repository")
+    check(counts(fp("cat /mnt/data/x.py")) == other, "/mnt/<name> is not a drive")
+    check(counts(fp("cat //server/share/a.py")) == other, "a UNC path stays outside a drive repository")
+    check(counts(fp("cat /f/")) == other and counts(fp("cat /f")) == other, "the drive root itself is outside the repository")
+    check(counts(fp("cat /f/Repo/../Other/a.py")) == other, "'..' leaving the repository on the drive is outside")
+    check(counts(fp("cat $HOME/f/Repo/src/a.py")) == ([], 0, 1), "an environment-dependent path is still unresolved")
+    # a UNC repository: its own share is inside, another share is outside, nothing is treated as a drive
+    unc = "//server/share/repo"
+    check(counts(fp("cat //server/share/repo/src/a.py", root=unc)) == inside, "UNC repository: its own share is inside")
+    check(counts(fp("cat //server/share/other/a.py", root=unc)) == other, "UNC repository: another directory is outside")
+    check(counts(fp(f"cat {msys}/src/a.py", root=unc)) == other, "UNC repository: a drive path is outside")
+    # a repository that is not on a drive is never reinterpreted
+    check(counts(fp(f"cat {REPO}/src/a.py", root=REPO)) == inside, "POSIX repository: its own path is inside")
+    check(counts(fp(f"cat {msys}/src/a.py", root=REPO)) == other, "POSIX repository: /f/... is just another absolute path")
+    check(counts(fp("cat /f/proj/src/a.py", root="/f/proj")) == inside, "POSIX repository that lives under /f/: matched as written")
+    check(counts(fp("cat /mnt/c/x.py", root=REPO)) == other, "POSIX repository: /mnt/c is not remapped")
+    # the other spellings of a drive path are unchanged
+    check(counts(fp(f"cat {drv}\\Repo\\src\\a.py")) == inside, "backslash Windows form is unchanged")
+    check(counts(fp(f"cat {drv.lower()}/repo/src/a.py")) == inside, "lowercase drive form is unchanged")
+
+
+def test_nav_destination() -> None:
+    """SA26-7: ``cd ..`` and ``cd .`` move the cwd like any other relative cd, and a '..' that climbs above the
+    filesystem root stays unresolved. SA26-19: the nav destination is the cd's own argument, never a redirect
+    target that the parser lists first."""
+    def fp(cmd: str, cwd: str | None = WT, tool: str = "Bash") -> fpm.Footprint:
+        c = call(1, tool, {"command": cmd})
+        if cwd is not None:
+            c["cwd"] = cwd
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def later(f: fpm.Footprint) -> tuple[list[str], int]:
+        return [t[1] for t in f.touches], f.unresolved
+
+    check(later(fp("cd src && cd .. && cat a.py")) == (["a.py"], 0), "cd src && cd ..: back in the starting directory")
+    f = fp("cd . && cat a.py")
+    check((later(f), f.outside) == ((["a.py"], 0), 0), "cd .: the directory is unchanged, nothing outside")
+    check(later(fp("cd .. && cat a.py", WT + "/src")) == (["a.py"], 0), "cd .. from a subdirectory cwd")
+    check(later(fp("cd src; Set-Location ..; Get-Content a.py", tool="PowerShell")) == (["a.py"], 0),
+          "Set-Location .. is the parent, as cd .. is")
+    check(fp("cd src && cd .. && cat a.py").outside == 0, "cd .. back to the root: nothing outside")
+    check(fp("cd src; (cd ..; cat a.py); cat b.py").outside == 0, "cd .. inside a subshell: nothing outside")
+    segs = sp.parse_command("cd .. > out.log")[0]
+    check([(u.path, u.role) for u in segs[0].paths] == [("out.log", "write")] and segs[0].nav_dest == "..",
+          "cd ..: the destination is kept apart from the segment's paths")
+    check(sp.parse_command("cd src > out.log")[0][0].nav_dest == "src", "cd src > out.log: the destination is src")
+    f = fp("cd .. && cat a.py", None)
+    check((f.touches, f.outside) == ([], 0), "cd .. with no recorded cwd: nothing touched, nothing outside")
+    f = fp("cd ../../../../../../../.. && cat a.py")
+    check((f.touches, f.outside) == ([], 0) and f.unresolved == 2,
+          "cd .. past the filesystem root: the argument and later relative paths are unresolved, not outside")
+    check(later(fp("cd src > out.log && cat a.py")) == (["out.log", "src/a.py"], 0),
+          "cd src > out.log: the redirect is a write, the destination is src")
+    check(later(fp("cd src 2> err.log && cat a.py")) == (["err.log", "src/a.py"], 0),
+          "cd src 2> err.log: a stderr redirect is not the destination")
+    check(later(fp("cd > out.log src && cat a.py")) == (["out.log", "src/a.py"], 0),
+          "a redirect before the argument is not the destination")
+
+    # F-107: a trailing slash (or backslash) on . or .. names the same directory as without it
+    f = fp("cd ./ && cat a.py")
+    check((later(f), f.outside) == ((["a.py"], 0), 0), "cd ./ is cd .: the directory is unchanged, nothing outside")
+    f = fp("cd src && cd ../ && cat a.py")
+    check((later(f), f.outside) == ((["a.py"], 0), 0), "cd src && cd ../ is cd src && cd ..: back in the root, nothing outside")
+    f = fp("cd src; Set-Location ../; Get-Content a.py", tool="PowerShell")
+    check((later(f), f.outside) == ((["a.py"], 0), 0), "Set-Location ../ is Set-Location ..")
+    for tail, want in (("../", ".."), ("..//", ".."), ("..\\", ".."), ("./", "."), (".//", "."), (".\\", ".")):
+        seg = sp.parse_command(f"cd {tail} > out.log")[0][0]
+        check(seg.nav_dest == want and [(u.path, u.role) for u in seg.paths] == [("out.log", "write")],
+              f"cd {tail}: the destination is {want}, kept apart from the segment's paths")
+    for slashed, plain in (("cd ../ && cat a.py", "cd .. && cat a.py"), ("cd ../ && cd ./ && cat a.py", "cd .. && cd . && cat a.py"),
+                           ("cd ..// && cat a.py", "cd .. && cat a.py")):
+        a, b = fp(slashed, REPO), fp(plain, REPO)
+        check((a.touches, a.outside, a.unresolved) == (b.touches, b.outside, b.unresolved),
+              f"{slashed!r} leaves the repository exactly as {plain!r} does")
+    # controls: a real destination is still a destination, and still outside when it leaves the repository
+    leave = fp("cd .. && cat a.py", REPO).outside
+    for cmd in ("cd ../other && cat a.py", "cd ../other/ && cat a.py", "cd ../../x && cat a.py"):
+        check(fp(cmd, REPO).outside > leave, f"{cmd!r} is still flagged outside")
+    check(later(fp("cd src/ && cat a.py")) == (["src/a.py"], 0), "cd src/ is still src")
+    check(fp("cd / && cat a.py").unresolved == 1, "cd / is unchanged: the root is not a . or ..")
+    check(sp.parse_command("cd // > out.log")[0][0].nav_dest == "//", "cd // is not read as . or ..")
+
+
+def test_powershell_scope_and_conditional_nav() -> None:
+    """SA26-20: a PowerShell ``$( ... )`` or ``( ... )`` runs in the current scope, so its Set-Location carries on;
+    a Bash one is still a subshell. SA26-21: the pipeline after ``||`` runs only when the one before it failed, so
+    it starts in the directory that one started in, and its own cd leaves the success path alone; a Bash pipeline
+    stage is a subshell, and a PowerShell nav inside a pipeline leaves the rest of that pipeline unresolved and takes
+    effect when it ends."""
+    def fp(cmd: str, tool: str = "Bash") -> fpm.Footprint:
+        c = call(1, tool, {"command": cmd})
+        c["cwd"] = WT
+        return fpm.Footprint(row("p", "2026-01-01T00:00:00+00:00", [], [c]))
+
+    def later(cmd: str, tool: str = "Bash") -> tuple[list[str], int]:
+        f = fp(cmd, tool)
+        return [t[1] for t in f.touches], f.unresolved
+
+    ps = "PowerShell"
+    check(later("$(Set-Location src); Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell $(Set-Location): the location change carries on")
+    check(later("(Set-Location src); Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell (Set-Location): the location change carries on")
+    check(later("echo $(cd src); cat a.py") == (["a.py"], 0), "Bash $(cd): still a subshell")
+    check(later("(cd src); cat a.py") == (["a.py"], 0), "Bash (cd): still a subshell")
+    check(sp.parse_command("(cd src)")[0][0].scope != () and sp.parse_command("(cd src)", shell="bash")[0][0].scope != ()
+          and sp.parse_command("(Set-Location src)", shell="powershell")[0][0].scope == (),
+          "parse_command defaults to Bash scoping; shell='powershell' keeps a group in the current scope")
+    check(later("cd src || cat a.py") == (["a.py"], 0), "cd X || cmd: cmd runs only if the cd failed")
+    check(later("Set-Location src || Get-Content a.py", ps) == (["a.py"], 0), "PowerShell ||: the same")
+    check(later("cd src || exit 1; cat a.py") == (["src/a.py"], 0), "cd X || exit; later segments are in X")
+    check(later("cd a || cd b || cat y.py") == (["y.py"], 0), "a chain of || starts where the first cd started")
+    check(later("cat x.py || cd src; cat a.py") == (["x.py", "a.py"], 0),
+          "a cd that runs only on failure does not move the success path")
+    check(later("cd src && cat a.py || cat b.py") == (["src/a.py", "src/b.py"], 0),
+          "after cd && cmd, the || branch starts where cmd started")
+    check(later("cd src || cat $(echo a.py) b.py") == (["b.py"], 0),
+          "a substitution inside the || branch belongs to the branch")
+    check(later("cd src | cat a.py") == (["a.py"], 0), "Bash cd X | cmd: the cd ends with its pipeline stage")
+    check(later("cd src | cat; cat a.py") == (["a.py"], 0), "Bash: a piped cd does not move later segments")
+    check(later("Set-Location src | Get-Content a.py", ps) == ([], 1),
+          "PowerShell: a piped Set-Location leaves later relative paths unresolved")
+    check(later("Set-Location src | Out-Null; Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell: once the pipeline ends, its Set-Location has taken effect")
+    check(later("Push-Location src | Out-Null; Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell: the same for Push-Location")
+    check(later("Set-Location src | Out-Null && Get-Content a.py", ps) == (["src/a.py"], 0),
+          "PowerShell: && also starts after the pipeline ends")
+    check(later("Set-Location src | Out-Null | Get-Content a.py; Get-Content b.py", ps) == (["src/b.py"], 1),
+          "PowerShell: unresolved for the rest of the pipeline, then the new location")
+    check(later("Set-Location src | Out-Null || Get-Content x.py; Get-Content a.py", ps) == (["x.py", "src/a.py"], 0),
+          "PowerShell: the || branch starts where the pipeline started; after it the location has changed")
+    check(later("x | y || Set-Location src | Out-Null; Get-Content a.py", ps) == (["a.py"], 0),
+          "PowerShell: a piped Set-Location in a || branch does not move the success path")
+    check(later("Set-Location src | Write-Output $(Get-Content a.py)", ps) == ([], 1),
+          "PowerShell: a substitution in a later stage is still inside the pipeline")
+
+
 def main() -> int:
     test_shell_paths()
     test_powershell_assignment_and_foreach()
@@ -419,7 +610,10 @@ def main() -> int:
     test_repo_aware_relative_paths()
     test_unresolved_paths_are_not_outside()
     test_env_home_and_parent_segments()
+    test_git_bash_drive_paths()
     test_block_and_subshell_cwd_scope()
+    test_nav_destination()
+    test_powershell_scope_and_conditional_nav()
     with tempfile.TemporaryDirectory() as d:
         test_footprints(Path(d))
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
