@@ -409,14 +409,14 @@ def test_privacy_scope_still_reads_index_text(root: Path) -> None:
     m, i = episode(st, repo)
     snap = st.snapshots / m["episode_id"]
     clean = (snap / "index.bin").read_bytes()
-    outside = b"D:/elsewhere/repo" if os.name == "nt" else b"/opt/elsewhere/repo"
-    ident = b"Location " + outside + b", system test\0"
+    outside = "D:/elsewhere/data.csv" if os.name == "nt" else "/opt/elsewhere/data.csv"
+    ident = b"Location " + outside.encode() + b", system test\0"
     body = clean[:-20] + b"UNTR" + struct.pack(">I", 1 + len(ident)) + bytes([len(ident)]) + ident
     (snap / "index.bin").write_bytes(body + hashlib.sha1(body).digest())
-    assert outside in review.index_scan_bytes((snap / "index.bin").read_bytes())
+    assert outside.encode() in review.index_scan_bytes((snap / "index.bin").read_bytes())
     priv = review.privacy_check(m, snap, i)
     assert priv["by_check"]["path_outside_repo"] == 1 and priv["findings"][0]["source"] == "snapshot/index.bin", priv
-    for junk in (b"DIRX " + outside, clean[:30] + b" " + outside):  # not an index; cut inside an entry
+    for junk in (b"DIRX " + outside.encode(), clean[:30] + b" " + outside.encode()):  # not an index; cut entry
         assert review.index_scan_bytes(junk) == junk, "bytes that do not parse are scanned as stored"
         (snap / "index.bin").write_bytes(junk)
         assert not review.privacy_check(m, snap, i)["passed"]
