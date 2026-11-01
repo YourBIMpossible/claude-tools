@@ -26,6 +26,7 @@ import causal  # noqa: E402
 import causal_admit  # noqa: E402
 import causal_hooks  # noqa: E402
 import dryrun  # noqa: E402
+import pipeline  # noqa: E402
 import review  # noqa: E402
 from common import iso, now_utc  # noqa: E402
 from test_hooks import PROMPT, Fixture  # noqa: E402
@@ -152,6 +153,54 @@ def test_unattributed_change_and_other_worktree(root: Path) -> None:
     assert a["unattributed"] == 1 and a["other_worktrees_moved"] == 1 and not a["isolated"], a
     w = fx.episode(sid)["causal"]["worktrees"]
     assert (w["unrelated"], w["contaminating"], w["unknown"], w["shared_state_changed"]) == (1, 0, 0, False), w
+
+
+def test_sibling_branch_config_is_not_shared_state(root: Path) -> None:
+    """D4 Q2 through the hooks: during the turn a sibling lane edits its own tree and records
+    its upstream (what ``push -u`` writes to the common config). Unrelated, not contaminating."""
+    fx = Fixture(root)
+    wt = fx.root / "wt2"
+    git(fx.repo, "worktree", "add", "-q", str(wt), "-b", "other")
+    sid = str(uuid.uuid4())
+    tp = turn(fx, sid)
+    (wt / "x.txt").write_text("other lane\n", encoding="utf-8")
+    git(wt, "config", "branch.other.remote", "origin")
+    git(wt, "config", "branch.other.merge", "refs/heads/other")
+    fx.end(sid, tp)
+    c = fx.episode(sid)["causal"]
+    assert c["errors"] == [], c["errors"]
+    assert c["attribution"]["unattributed"] == 0 and c["attribution"]["other_worktrees_moved"] == 1, c["attribution"]
+    w = c["worktrees"]
+    assert (w["unrelated"], w["contaminating"], w["unknown"], w["shared_state_changed"]) == (1, 0, 0, False), w
+
+
+def test_start_budget_rule_snapshot_first(root: Path) -> None:
+    """D4 Q1, design (no patch): one 2 s start budget, spent in order. The snapshot, which replay
+    cannot do without, takes what it needs first; the causal start gets only what is left and
+    is skipped, never squeezed, below ``START_MIN_REMAINING_S``. Pinned so it cannot drift."""
+    assert (pipeline.START_BUDGET_MS, causal_hooks.START_MIN_REMAINING_S) == (2000, 0.4)
+    fx = Fixture(root)
+    seen: list[float] = []
+    real_snapshot, real_start = pipeline.take_snapshot, causal_hooks.start
+
+    def slow_snapshot(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        out = real_snapshot(*a, **k)
+        time.sleep(1.7)
+        return out
+
+    def spy(*a, remaining_s: float, **k):  # noqa: ANN002, ANN003, ANN202
+        seen.append(remaining_s)
+        return real_start(*a, remaining_s=remaining_s, **k)
+
+    pipeline.take_snapshot, causal_hooks.start = slow_snapshot, spy
+    try:
+        res = pipeline.run_start({"session_id": str(uuid.uuid4()), "prompt": PROMPT, "cwd": str(fx.repo)}, fx.env)
+    finally:
+        pipeline.take_snapshot, causal_hooks.start = real_snapshot, real_start
+    m = pipeline.read_manifest(fx.stores, res["episode_id"])
+    assert m["start_snapshot"]["state"] == "complete", m["start_snapshot"]
+    assert len(seen) == 1 and seen[0] < 0.3, seen  # the snapshot's time came out of the causal start's share
+    assert m["causal"]["errors"] == ["causal:start:skipped_budget"] and m["causal"]["start"] is None, m["causal"]
 
 
 def test_unsupported_reason_explicit(root: Path) -> None:
@@ -458,6 +507,7 @@ def test_other_worktree_classification(root: Path) -> None:
 
 
 TESTS = [test_freeze_register_admit, test_start_end_preserved_and_attributed, test_unattributed_change_and_other_worktree,
+         test_sibling_branch_config_is_not_shared_state, test_start_budget_rule_snapshot_first,
          test_unsupported_reason_explicit, test_failures_are_explicit_and_fail_open,
          test_end_never_recorded_by_maintenance_or_twice, test_overlay_materializes_from_frozen_history,
          test_causal_states_follow_snapshot_retention, test_fidelity_is_byte_exact_not_git_equivalent,

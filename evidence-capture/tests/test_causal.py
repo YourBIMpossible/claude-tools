@@ -503,6 +503,161 @@ def test_nested_worktree_without_marker_is_unknown(tmp: Path) -> None:
     assert not causal.attribute(st, st, [], worktrees_start=fps, worktrees_end=fps)["isolated"]
 
 
+def test_worktree_toplevel_probes_run_beside_the_statuses(tmp: Path) -> None:
+    """D4 Q1: every sibling's toplevel probe starts with the statuses, so N siblings cost the
+    start budget one round trip, not N in a row. Records are unchanged; a stuck probe still
+    leaves its worktree unobservable."""
+    repo = make_repo(tmp)
+    for i in range(3):
+        git(repo, "worktree", "add", "-q", "-b", f"s{i}", str(tmp / f"s{i}"))
+    (tmp / "s1" / "a.txt").write_bytes(b"moved")
+    expected = causal.worktree_records(repo)
+    real = causal._toplevel_probe
+    events: list[str] = []
+
+    class Probe:
+        def __init__(self, path: str) -> None:
+            self.p = real(path)
+            events.append("start")
+
+        def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+            events.append("wait")
+            return self.p.communicate(timeout=timeout)
+
+        def __getattr__(self, name: str):  # noqa: ANN204
+            return getattr(self.p, name)
+
+    class Stuck(Probe):
+        def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("git", timeout)
+            return self.p.communicate()
+
+    try:
+        causal._toplevel_probe = Probe
+        assert causal.worktree_records(repo) == expected
+        assert events[:3] == ["start"] * 3, events  # all started before the first wait
+        causal._toplevel_probe = Stuck
+        stuck = causal.worktree_records(repo)
+    finally:
+        causal._toplevel_probe = real
+    assert all(r["fp"] is None and r["status_error"]["stderr"] == "toplevel unresolved: timeout"
+               for r in stuck.values()), stuck
+
+
+# ------------------------------------------------------------------ shared git state (D4 Q2)
+
+
+def _repo_with_sibling(tmp: Path) -> tuple[Path, Path]:
+    repo = make_repo(tmp)
+    git(repo, "remote", "add", "origin", str(tmp / "no_remote"))
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    side = tmp / "side_wt"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(side))
+    return repo, side
+
+
+def test_own_branch_config_drops_only_other_branch_sections(tmp: Path) -> None:
+    cfg = (b'[core]\n\tbare = false\n[branch "main"]\n\tremote = origin\n'
+           b'[branch "lane/a"]\n\tremote = origin\n\tmerge = refs/heads/main\n'
+           b'[BRANCH "q\\"x"]\n\tremote = origin\n[remote "origin"]\n\turl = ../o\n')
+    assert causal.own_branch_config(cfg, b"main") == (b'[core]\n\tbare = false\n[branch "main"]\n\tremote = origin\n'
+                                                      b'[remote "origin"]\n\turl = ../o\n')
+    assert causal.own_branch_config(cfg, b'q"x').count(b"[BRANCH") == 1, "escaped subsection name"
+    assert b"[branch" not in causal.own_branch_config(cfg, None), "detached: no branch section applies"
+    for odd in (b'[branch "lane/a"] remote = origin\n', b'[branch.lane]\n\tremote = o\n'):
+        assert causal.own_branch_config(odd, b"main") == odd, "a header git does not write is kept"
+
+
+def test_shared_git_state_ignores_routine_sibling_writes(tmp: Path) -> None:
+    """D4 Q2: what sibling worktrees routinely write cannot alter this checkout, so it no
+    longer moves the shared state (before the fix each of these flipped it)."""
+    repo, side = _repo_with_sibling(tmp)
+    s0 = causal.shared_git_state(repo)
+    git(side, "branch", "-u", "origin/main")  # what push -u records
+    git(repo, "worktree", "add", "-q", "-b", "lane", str(tmp / "lane_wt"), "origin/main")  # house-rule lane
+    assert b'[branch "lane"]' in (repo / ".git" / "config").read_bytes()
+    git(side, "commit", "-q", "--allow-empty", "-m", "side work")
+    git(side, "gc", "-q")  # repack runs update-server-info
+    assert (repo / ".git" / "info" / "refs").is_file()
+    git(side, "config", "--remove-section", "branch.side")  # what branch -d drops
+    assert causal.shared_git_state(repo) == s0
+
+
+def test_shared_git_state_still_sees_what_applies_here(tmp: Path) -> None:
+    """The narrowing keeps every change that can alter this checkout: such a pair stays inadmissible."""
+    repo, side = _repo_with_sibling(tmp)
+    gd = repo / ".git"
+    for d in (gd / "info", gd / "hooks"):
+        d.mkdir(exist_ok=True)
+
+    def append(p: Path, data: bytes) -> None:
+        with open(p, "ab") as fh:
+            fh.write(data)
+    changes = {
+        "generic key written from a sibling": lambda: git(side, "config", "core.autocrlf", "true"),
+        "this branch's own section": lambda: git(side, "config", "branch.main.rebase", "true"),
+        "info/exclude": lambda: append(gd / "info" / "exclude", b"*.log\n"),
+        "hooks": lambda: (gd / "hooks" / "pre-commit").write_bytes(b"#!/bin/sh\nexit 0\n"),
+        "a branch header git does not write": lambda: append(gd / "config", b'[branch "side"] remote = x\n'),
+        "this worktree's HEAD": lambda: git(repo, "checkout", "-q", "--detach"),
+    }
+    for why, change in changes.items():
+        before = causal.shared_git_state(repo)
+        change()
+        assert causal.shared_git_state(repo) != before, why
+    before = causal.shared_git_state(repo)
+    git(side, "config", "branch.main.rebase", "false")
+    assert causal.shared_git_state(repo) == before, "detached: branch main's section no longer applies here"
+
+
+def test_sibling_elsewhere_is_unrelated_and_the_predicate_decides(tmp: Path) -> None:
+    """D4 Q2 regression, end to end on real worktrees: during the turn a sibling edits its own
+    tree and records its upstream, in paths the episode never touched. Before the fix the
+    config write set ``shared_state_changed`` and so made the sibling contaminating; now it is
+    unrelated, and admission turns on the preregistered discriminating predicate (fails on
+    the start state, passes on the end state). A shared change that applies here still
+    excludes the pair."""
+    repo, side = _repo_with_sibling(tmp)
+    ep = tmp / "episode"
+    ws, ss = causal.worktree_records(repo), causal.shared_git_state(repo)
+    s = causal.capture_state(repo, ep / "start", label="start")
+    causal.freeze_history(repo, ep / "history")
+    (repo / "a.txt").write_bytes(b"done\n")  # the agent's write
+    (side / "side.txt").write_bytes(b"other lane\n")  # the sibling, elsewhere
+    git(side, "branch", "-u", "origin/main")
+    e = causal.capture_state(repo, ep / "end", label="end")
+    we, se = causal.worktree_records(repo), causal.shared_git_state(repo)
+    calls = [{"input": {"file_path": str(repo / "a.txt"), "content": "done\n"}}]
+    key = next(iter(we))
+    cls = causal.classify_worktrees(ws, we, shared_start=ss, shared_end=se, calls=calls, subagents_unresolved=0,
+                                    top=str(repo))
+    assert cls == {"contaminating": [], "unrelated": [key], "unknown": [], "shared_state_changed": False}, cls
+    att = causal.attribute(s, e, ["a.txt"], top=str(repo), worktrees_start={k: v["fp"] for k, v in ws.items()},
+                           worktrees_end={k: v["fp"] for k, v in we.items()})
+    assert att["unattributed"] == [] and att["other_worktrees_moved"] == [key] and not att["isolated"], att
+    causal.materialize(ep / "start", tmp / "m0")
+    causal.materialize(ep / "end", tmp / "m1")
+    record = {"identity_accepted": True, "start_problems": causal.verify_state(ep / "start"),
+              "end_problems": causal.verify_state(ep / "end"), "history_problems": causal.verify_history(ep / "history"),
+              "unsupported": causal.unsupported_state(repo), "start_fidelity": [], "end_fidelity": [],
+              "attribution": att, "worktrees": cls, "dependency_drift": [], "registration_problems": []}
+
+    def verdict(checks: list[dict]) -> dict:
+        return causal.admit({**record, "checks": checks, "check_results": causal.run_checks(checks, tmp / "m1"),
+                             "check_results_start": causal.run_checks(checks, tmp / "m0")})
+    assert verdict([{"kind": "file_contains", "path": "a.txt", "text": "done"}]) == {"eligible": True, "reasons": []}
+    assert verdict([{"kind": "file_contains", "path": "a.txt", "text": "o"}])["reasons"] == [
+        "predicate_not_discriminating"], "already true at the start: not admissible"
+    git(side, "config", "core.autocrlf", "true")  # shared state that does apply to this checkout
+    cls2 = causal.classify_worktrees(ws, causal.worktree_records(repo), shared_start=ss,
+                                     shared_end=causal.shared_git_state(repo), calls=calls, subagents_unresolved=0,
+                                     top=str(repo))
+    assert cls2["contaminating"] == [key] and cls2["shared_state_changed"] is True, cls2
+    assert causal.admit({**record, "worktrees": cls2})["reasons"][:2] == [
+        "shared_git_state_changed", "other_worktree_contaminating"]
+
+
 # ------------------------------------------------------------------------ runner
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
