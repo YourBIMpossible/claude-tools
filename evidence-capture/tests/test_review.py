@@ -10,8 +10,10 @@ Synthetic example — contains no private repository data or production findings
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -368,6 +370,93 @@ def test_privacy_scope_rejects(root: Path) -> None:
     assert review.load_capture_config(root / "nowhere")["present"] is False
 
 
+INDEX_FIELDS = {"mtime": 8, "mtime_ns": 12, "dev": 16, "ino": 20}  # offsets in a v2 entry
+
+
+def with_index_fields(idx: bytes, **fields: int) -> bytes:
+    """A v2 SHA-1 ``idx`` with the named 32-bit stat fields set in every entry."""
+    b = bytearray(idx)
+    off = 12
+    for _ in range(struct.unpack(">I", b[8:12])[0]):
+        for name, value in fields.items():
+            struct.pack_into(">I", b, off + INDEX_FIELDS[name], value)
+        off += (62 + (struct.unpack(">H", b[off + 60:off + 62])[0] & 0xFFF) + 8) & ~7
+    return bytes(b)
+
+
+def test_privacy_scope_ignores_index_binary_fields(root: Path) -> None:
+    """The index copy's stat data are numbers, not text. On ubuntu-26.04 the fixture's
+    files got inodes 0x007e5cxx, whose bytes ``~\\`` read as a home path, and the episode
+    was excluded; an mtime of 0x6ae7743a with nanoseconds 0x2f... reads ``t:/``."""
+    st = make_stores(root)
+    repo = tc.make_repo(root)
+    m, i = episode(st, repo)
+    snap = st.snapshots / m["episode_id"]
+    clean = (snap / "index.bin").read_bytes()
+    assert review.privacy_check(m, snap, i)["passed"]
+    for fields in ({"ino": 0x007E5C0E}, {"ino": 0x007E2F0E}, {"mtime": 0x6AE7743A, "mtime_ns": 0x2F77E3C1},
+                   {"dev": 0x002F612F, "ino": 0x62000000}):
+        (snap / "index.bin").write_bytes(with_index_fields(clean, **fields))
+        priv = review.privacy_check(m, snap, i)
+        assert priv["passed"], (fields, priv)
+
+
+def test_privacy_scope_still_reads_index_text(root: Path) -> None:
+    """Names and extension text in the index copy are still scanned, and bytes that do not
+    parse as an index are scanned whole."""
+    st = make_stores(root)
+    repo = tc.make_repo(root)
+    m, i = episode(st, repo)
+    snap = st.snapshots / m["episode_id"]
+    clean = (snap / "index.bin").read_bytes()
+    outside = b"D:/elsewhere/repo" if os.name == "nt" else b"/opt/elsewhere/repo"
+    ident = b"Location " + outside + b", system test\0"
+    body = clean[:-20] + b"UNTR" + struct.pack(">I", 1 + len(ident)) + bytes([len(ident)]) + ident
+    (snap / "index.bin").write_bytes(body + hashlib.sha1(body).digest())
+    assert outside in review.index_scan_bytes((snap / "index.bin").read_bytes())
+    priv = review.privacy_check(m, snap, i)
+    assert priv["by_check"]["path_outside_repo"] == 1 and priv["findings"][0]["source"] == "snapshot/index.bin", priv
+    for junk in (b"DIRX " + outside, clean[:30] + b" " + outside):  # not an index; cut inside an entry
+        assert review.index_scan_bytes(junk) == junk, "bytes that do not parse are scanned as stored"
+        (snap / "index.bin").write_bytes(junk)
+        assert not review.privacy_check(m, snap, i)["passed"]
+
+
+def test_index_scan_bytes_blanks_only_binary_fields(root: Path) -> None:
+    """Indexes as git writes them: v2, v3 (extended flags), v4 (prefix-compressed names),
+    and a SHA-256 repository."""
+    def variant(name: str, *setup: tuple[str, ...], fmt: str = "sha1") -> tuple[bytes, int, Path]:
+        repo = root / name
+        repo.mkdir()
+        tc.git(repo, "init", "-q", "-b", "main", f"--object-format={fmt}")
+        tc.git(repo, "config", "core.autocrlf", "false")
+        (repo / "README.md").write_text("# fixture\n", encoding="utf-8")
+        (repo / "src").mkdir()
+        (repo / "src" / "alpha.py").write_text("x = 1\n", encoding="utf-8")
+        tc.git(repo, "add", "-A")
+        tc.git(repo, "commit", "-q", "-m", "start")
+        for args in setup:
+            tc.git(repo, *args)
+        return (repo / ".git" / "index").read_bytes(), 32 if fmt == "sha256" else 20, repo
+
+    cases = {"v2": variant("v2"), "v3": variant("v3", ("update-index", "--skip-worktree", "src/alpha.py")),
+             "v4": variant("v4", ("update-index", "--index-version", "4")), "sha256": variant("s256", fmt="sha256")}
+    with_tree = []
+    for label, (raw, hashsz, repo) in cases.items():
+        out = review.index_scan_bytes(raw)
+        version = struct.unpack(">I", raw[4:8])[0]
+        assert version == {"v3": 3, "v4": 4}.get(label, 2), (label, version)
+        assert len(out) == len(raw) and out[:12] == raw[:12], label
+        assert out[12:12 + review.INDEX_STAT_BYTES + hashsz] == bytes(review.INDEX_STAT_BYTES + hashsz), label
+        assert out[-hashsz:] == bytes(hashsz) != raw[-hashsz:], label
+        assert b"README.md\0" in out and b"src/alpha.py\0" in out and b"TREE" in out, label
+        tree = bytes.fromhex(tc.git(repo, "rev-parse", "HEAD^{tree}").strip())
+        if tree in raw:  # update-index may invalidate the cache tree, which then stores no id
+            with_tree.append(label)
+            assert tree not in out, (label, "cache-tree ids are blanked")
+    assert {"v2", "sha256"} <= set(with_tree), with_tree
+
+
 def test_deny_glob_double_star_matches_root(root: Path) -> None:
     """``**/x`` means x at any depth, the repository root included: a root-level private
     file must not pass the screen because fnmatch has no ``**``."""
@@ -564,53 +653,6 @@ def test_seal_extends(root: Path) -> None:
     (seals / "seals" / "s1.json").write_text(json.dumps(raw) + "\n", encoding="utf-8")
     res = review.expire(st, now=now)
     assert res["expired_deleted"] == 1 and not (st.payloads / ep).exists(), "an uncommitted seal edit voids it"
-
-
-def test_zz_ci_privacy_sampler(root: Path) -> None:
-    """TEMPORARY CI diagnostic, removed with the fix: samples the owner-review fixture on the
-    runner and reports which snapshot text trips the privacy scan. Never fails."""
-    if os.environ.get("GITHUB_ACTIONS") != "true":
-        return
-    import struct
-
-    def shift(idx: bytes, epoch: int) -> bytes:  # ctime/mtime seconds of every v2 entry
-        b = bytearray(idx)
-        off = 12
-        for _ in range(struct.unpack(">I", b[8:12])[0]):
-            struct.pack_into(">I", b, off, epoch)
-            struct.pack_into(">I", b, off + 8, epoch)
-            off += (62 + (struct.unpack(">H", b[off + 60:off + 62])[0] & 0xFFF) + 8) & ~7
-        return bytes(b)
-
-    def ctx(text: str) -> list[str]:
-        norm = review._normalize(text)
-        return [ascii(norm[max(0, x.start() - 12):x.start() + 16]) for x in review.ABS_RE.finditer(norm)]
-
-    mounts = Path("/proc/mounts").read_text().splitlines() if Path("/proc/mounts").is_file() else []
-    print("DIAG env", os.getuid(), os.getgid(), tempfile.gettempdir(), os.stat(root).st_dev,
-          [ln for ln in mounts if " /tmp " in ln])
-    windows = {"17:15-17:25Z": range(1793553300, 1793553900), "23:05-23:20Z": range(1793574300, 1793575200)}
-    t0, n, live, swept = time.time(), 0, 0, {k: 0 for k in windows}
-    while n < 80 and time.time() - t0 < 90:
-        case = root / f"s{n}"
-        case.mkdir()
-        st = make_stores(case)
-        m, i = episode(st, tc.make_repo(case), origin=None)
-        snap = st.snapshots / m["episode_id"]
-        idx = (snap / "index.bin").read_bytes()
-        if n == 0:
-            print("DIAG index.bin", idx.hex())
-        priv = review.privacy_check(m, snap, i)
-        if not priv["passed"]:
-            live += 1
-            print("DIAG live hit", n, priv["by_check"], [f["source"] for f in priv["findings"]], ctx(idx.decode("utf-8", "replace")))
-        for name, rng in windows.items():
-            hits = [e for e in rng if review.outside_paths(shift(idx, e).decode("utf-8", "replace"), i.repo_root)]
-            swept[name] += bool(hits)
-            if hits and swept[name] <= 3:
-                print("DIAG swept hit", name, n, len(hits), hits[:3], ctx(shift(idx, hits[0]).decode("utf-8", "replace")))
-        n += 1
-    print(f"DIAG samples={n} live_hits={live} samples_with_swept_hits={swept} in {time.time() - t0:.0f}s")
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
