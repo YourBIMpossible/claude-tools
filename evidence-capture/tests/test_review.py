@@ -566,6 +566,53 @@ def test_seal_extends(root: Path) -> None:
     assert res["expired_deleted"] == 1 and not (st.payloads / ep).exists(), "an uncommitted seal edit voids it"
 
 
+def test_zz_ci_privacy_sampler(root: Path) -> None:
+    """TEMPORARY CI diagnostic, removed with the fix: samples the owner-review fixture on the
+    runner and reports which snapshot text trips the privacy scan. Never fails."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    import struct
+
+    def shift(idx: bytes, epoch: int) -> bytes:  # ctime/mtime seconds of every v2 entry
+        b = bytearray(idx)
+        off = 12
+        for _ in range(struct.unpack(">I", b[8:12])[0]):
+            struct.pack_into(">I", b, off, epoch)
+            struct.pack_into(">I", b, off + 8, epoch)
+            off += (62 + (struct.unpack(">H", b[off + 60:off + 62])[0] & 0xFFF) + 8) & ~7
+        return bytes(b)
+
+    def ctx(text: str) -> list[str]:
+        norm = review._normalize(text)
+        return [ascii(norm[max(0, x.start() - 12):x.start() + 16]) for x in review.ABS_RE.finditer(norm)]
+
+    mounts = Path("/proc/mounts").read_text().splitlines() if Path("/proc/mounts").is_file() else []
+    print("DIAG env", os.getuid(), os.getgid(), tempfile.gettempdir(), os.stat(root).st_dev,
+          [ln for ln in mounts if " /tmp " in ln])
+    windows = {"17:15-17:25Z": range(1793553300, 1793553900), "23:05-23:20Z": range(1793574300, 1793575200)}
+    t0, n, live, swept = time.time(), 0, 0, {k: 0 for k in windows}
+    while n < 80 and time.time() - t0 < 90:
+        case = root / f"s{n}"
+        case.mkdir()
+        st = make_stores(case)
+        m, i = episode(st, tc.make_repo(case), origin=None)
+        snap = st.snapshots / m["episode_id"]
+        idx = (snap / "index.bin").read_bytes()
+        if n == 0:
+            print("DIAG index.bin", idx.hex())
+        priv = review.privacy_check(m, snap, i)
+        if not priv["passed"]:
+            live += 1
+            print("DIAG live hit", n, priv["by_check"], [f["source"] for f in priv["findings"]], ctx(idx.decode("utf-8", "replace")))
+        for name, rng in windows.items():
+            hits = [e for e in rng if review.outside_paths(shift(idx, e).decode("utf-8", "replace"), i.repo_root)]
+            swept[name] += bool(hits)
+            if hits and swept[name] <= 3:
+                print("DIAG swept hit", name, n, len(hits), hits[:3], ctx(shift(idx, hits[0]).decode("utf-8", "replace")))
+        n += 1
+    print(f"DIAG samples={n} live_hits={live} samples_with_swept_hits={swept} in {time.time() - t0:.0f}s")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
