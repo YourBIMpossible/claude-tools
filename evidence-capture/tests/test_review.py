@@ -83,6 +83,23 @@ def committed(stores: store.Stores, rel: str) -> bool:
     return bool(out.strip())
 
 
+def privacy_detail(m: dict, snap: Path, inputs: review.ReviewInputs) -> dict:
+    """The privacy result for a failure message, taken before review deletes an excluded
+    snapshot, with the text around each absolute-path match in the files it flags.
+    Fixtures are synthetic, so that text is safe to print."""
+    privacy = review.privacy_check(m, snap, inputs)
+    matches = {}
+    for rel in sorted({f["source"][len("snapshot/"):] for f in privacy["findings"]
+                       if f["source"].startswith("snapshot/")}):
+        text = (snap / rel).read_bytes().decode("utf-8", "replace")
+        norm = review._normalize(text)
+        matches[rel] = [norm[max(0, x.start() - 40):x.start() + 60] for x in review.ABS_RE.finditer(norm)]
+        matches[rel] += [x.group(0) for rx in (review.UNC_RE, review.HOME_RE) for x in rx.finditer(text)]
+    paths = review.snapshot_content_paths(snap) if privacy["by_check"]["deny_glob"] else None
+    return {"privacy": privacy, "root_key": review._root_key(inputs.repo_root), "snapshot_matches": matches,
+            "content_paths": paths}
+
+
 # --------------------------------------------------------------------------- tests
 
 def test_content_store_not_git(root: Path) -> None:
@@ -462,8 +479,9 @@ def test_owner_review_resolves_unknown(root: Path) -> None:
     common.write_json_atomic(path, {"episode_id": m["episode_id"], "reviewed_at": "2026-09-27T00:00:00Z",
                                     "rules": {"X1": {"state": "no", "basis": "owner typed the prompt"}},
                                     "case_by_case": {"admit": True, "notes": "synthetic"}})
+    detail = privacy_detail(reread(st, m), st.snapshots / m["episode_id"], i)
     res = review.review_episode(st, reread(st, m), i)
-    assert res["state"] == "materialized", res
+    assert res["state"] == "materialized", (res, detail)
     got = reread(st, m)
     assert got["review"]["owner_review"] is True
     assert [e for e in got["exclusions"] if e["rule"] == "X1"][0].get("owner_resolved") is True
