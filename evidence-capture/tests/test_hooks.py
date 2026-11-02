@@ -39,6 +39,28 @@ REPORT: dict[str, object] = {}
 PROMPT = dryrun.PROMPT
 BUDGET_ERRORS = frozenset({"start_over_budget", "end_over_budget"})
 
+# The hook wall-clock budgets (start 2 s, ends 20 s / 8 s) are product behaviour, asserted
+# in-process by construction (test_identity's tripped clock, causal skipped_budget). A
+# subprocess hook on a slow runner (GitHub's Windows images take about 2 s for a start)
+# overruns them and records partial / unknown:X7 shapes the join, link and review tests
+# never meant to exercise, so the Fixture runs its hooks with budgets far above any load.
+UNBUDGETED_S = 120
+_UNBUDGETED_SHIM = (
+    "import runpy, sys; sys.path.insert(0, sys.argv[1]); import causal_hooks, pipeline; "
+    "s = float(sys.argv[3]); pipeline.START_BUDGET_MS = s * 1000; pipeline.END_BUDGET_S = s; "
+    "causal_hooks.END_BUDGET_S = s; sys.argv = sys.argv[2:3]; "
+    "runpy.run_path(sys.argv[0], run_name='__main__')"
+)
+
+
+def run_hook_unbudgeted(script: str, payload: dict | bytes, env: dict[str, str]) -> tuple[int, bytes, float]:
+    """``dryrun.run_hook`` with the hook budgets raised to ``UNBUDGETED_S``."""
+    data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+    t0 = time.perf_counter()
+    proc = subprocess.run([sys.executable, "-c", _UNBUDGETED_SHIM, str(PKG), str(PKG / script), str(UNBUDGETED_S)],
+                          input=data, capture_output=True, env=env, timeout=UNBUDGETED_S * 2)
+    return proc.returncode, proc.stdout, (time.perf_counter() - t0) * 1000
+
 
 def require_yaml(suite: str) -> None:
     """The hook suites' fixtures carry ``.evidence-compiler/config.yaml``; without PyYAML
@@ -106,7 +128,7 @@ class Fixture:
               cwd: Path | None = None) -> tuple[str | None, str]:
         ts = iso(now_utc())
         pid = dryrun.write_packet(self.repo, sid, prompt, ts) if packet else None
-        rc, out, _ = dryrun.run_hook("capture_start.py", {"session_id": sid, "prompt": prompt,
+        rc, out, _ = run_hook_unbudgeted("capture_start.py", {"session_id": sid, "prompt": prompt,
                                                           "cwd": str(cwd or self.repo)}, env or self.env)
         assert rc == 0 and out == b"", (rc, out)
         return pid, ts
@@ -120,7 +142,7 @@ class Fixture:
         payload = {"session_id": sid, "cwd": str(self.repo)}
         if transcript is not None:
             payload["transcript_path"] = str(transcript)
-        rc, out, _ = dryrun.run_hook("capture_end.py", payload, env or self.env)
+        rc, out, _ = run_hook_unbudgeted("capture_end.py", payload, env or self.env)
         assert rc == 0 and out == b"", (rc, out)
 
     def episode(self, sid: str) -> dict:
