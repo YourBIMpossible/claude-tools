@@ -1255,13 +1255,14 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     # A target path (repo, else scan) may sit inside a repo or a worktree lane: compare it by
     # the same identity as a session's repo; a path outside any git repo is kept verbatim.
     targets = {norm(repo_identity(t, resolver) or t) for t in cfg.targets}
-    # Headless/throwaway runs start in the temp dir; on unless the config turns it off.
-    tmp = norm(tempfile.gettempdir()) if cfg.exclude_temp_cwd else None
+    # Headless/throwaway runs start in the temp dir; on unless the config turns it off. Both sides
+    # are real paths: Windows may spell the temp dir as an 8.3 short name and the session cwd long.
+    tmp = norm(os.path.realpath(tempfile.gettempdir())) if cfg.exclude_temp_cwd else None
 
     for s in sessions:
         if s.session_id in excludes:
             s.excluded = str(excludes[s.session_id])
-        elif tmp and s.cwd and norm(s.cwd).startswith(tmp):
+        elif tmp and s.cwd and norm(os.path.realpath(s.cwd)).startswith(tmp):
             s.excluded = "cwd in system temp dir"
         if s.cwd:
             r = resolver.resolve(s.cwd)

@@ -349,7 +349,8 @@ def test_link_failure_leaves_no_part() -> None:
                 check(f.action == "error" and not r.safe_to_remove and "copy failed" in f.detail,
                       f"{label}: a failed link is a blocking error")
                 check(not (archive / "packets" / f"{PA}.json").exists(), f"{label}: nothing is published")
-                left = list((archive / "staging").glob("*.part"))
+                # evacuate() reports resolved paths; resolving here matches them when the temp dir is an 8.3 short name
+                left = list((archive.resolve() / "staging").glob("*.part"))
                 if cleanup_fails:
                     check(len(left) == 1 and f.staging_left == left[0].as_posix()
                           and "staged copy left in staging/: PermissionError" in f.detail
@@ -399,7 +400,7 @@ def test_cleanup_failure_after_publish_is_verified_copy() -> None:
               "a published, verified copy is a success despite the cleanup failure")
         check((archive / "packets" / f"{PA}.json").read_bytes() == packet(PA),
               "the published packet is preserved byte-exact")
-        left = list((archive / "staging").glob("ep_*.part"))
+        left = list((archive.resolve() / "staging").glob("ep_*.part"))  # resolved, as evacuate() reports it
         check(len(left) == 1 and f.staging_left == left[0].as_posix()
               and "staged copy left in staging/: PermissionError" in f.detail,
               "the leftover staged copy is named on the file result")
