@@ -7,7 +7,7 @@ name: machine-paths
 # Run the same check locally:  python .github/scripts/check_machine_paths.py
 #
 # Cost posture (2026-11-02): ubuntu-latest, PR + manual only, non-draft, and
-# cancel-in-progress, as the house secret-scan.yml.
+# cancel-in-progress, as secret-scan.yml beside it.
 on:
   pull_request:
     # No `synchronize`: pushing more commits to an open PR does not re-fire this. The pre-push

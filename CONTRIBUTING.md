@@ -65,7 +65,10 @@ the commit `tools/gate.py` pins. The gate prints a line for each suite it cannot
 here. CI's `ci.yml` runs the same gate on manual dispatch only
 (`gh workflow run ci.yml --ref <branch>`). The automatic PR check, `secret-scan.yml`
 (when a PR opens or leaves draft, never on later pushes), runs the boundary check and
-gitleaks; `machine-paths.yml` fires the same way.
+gitleaks; `machine-paths.yml` fires the same way. After a later push, the new head has no
+check until one is run on it, and a merge from a Claude session needs one: dispatch
+`ci.yml` on the final head (flipping the PR draft->ready re-runs only the two scans,
+not the tests).
 
 ## Licensing of contributions
 

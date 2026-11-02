@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,60 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         FAILED += 1
         FAILURES.append(name)
         print(f"FAIL  {name}\n{detail}")
+
+
+def workflow_code(text: str) -> str:
+    """A workflow with its comments stripped, so a commented-out trigger neither passes nor fails a check."""
+    return "\n".join(re.sub(r"(^|\s)#.*", "", line).rstrip() for line in text.splitlines())
+
+
+def workflow_events(code: str) -> set:
+    """The events under a workflow's top-level `on:`, inline (`on: [push, pull_request]`) or as a block. Anything it
+    cannot read comes back empty, which no posture check accepts."""
+    match = re.search(r"^on:[ \t]*(.*)\n((?:(?:[ \t]+.*)?\n)*)", code + "\n", re.M)
+    if not match:
+        return set()
+    inline, block = match.groups()
+    return set(re.findall(r"\w+", inline)) | set(re.findall(r"^  (\w+)\s*:", block, re.M))
+
+
+def workflow_jobs(code: str) -> dict:
+    """Each job under `jobs:`, by id, as its own block of code."""
+    match = re.search(r"^jobs:[ \t]*\n((?:(?:[ \t]+.*)?\n)*)", code + "\n", re.M)
+    parts = re.split(r"^  ([\w-]+):[ \t]*\n", match.group(1), flags=re.M) if match else []
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def pull_request_block(code: str) -> str:
+    """The body of the `pull_request:` event under `on:`, empty when there is none."""
+    match = re.search(r"^on:[ \t]*\n(?:(?:[ \t]+.*)?\n)*?  pull_request:[ \t]*\n((?:(?:    .*)?\n)*)", code + "\n", re.M)
+    return match.group(1) if match else ""
+
+
+def posture_problems(code: str) -> list:
+    """Why an automatic workflow breaks the cost posture: it must fire once per PR and skip drafts in every job, on
+    Linux only."""
+    problems = []
+    if "    types: [opened, reopened, ready_for_review]" not in pull_request_block(code):
+        problems.append("pull_request is not limited to opened, reopened, ready_for_review")
+    if "synchronize" in code:
+        problems.append("names synchronize")
+    jobs = workflow_jobs(code)
+    if not jobs:
+        problems.append("no jobs read")
+    for job, body in jobs.items():
+        if not re.search(r"^    if:.*github\.event\.pull_request\.draft == false", body, re.M):
+            problems.append(f"job {job} runs on drafts")
+        if re.findall(r"^    runs-on:\s*(\S.*)", body, re.M) != ["ubuntu-latest"]:
+            problems.append(f"job {job} is not ubuntu-latest only")
+    return problems
+
+
+# An automatic workflow whose second job forgot the draft skip and runs on Windows: the posture check must name both.
+SECOND_JOB = (
+    "on:\n  pull_request:\n    types: [opened, reopened, ready_for_review]\njobs:\n"
+    "  first:\n    if: ${{ github.event.pull_request.draft == false }}\n    runs-on: ubuntu-latest\n"
+    "  second:\n    runs-on: windows-latest\n")
 
 
 def load():
@@ -129,18 +184,32 @@ def main() -> int:
 
     print("CI cost posture")
     workflows = REPO / ".github" / "workflows"
+    check("the posture parser reads inline and block triggers and ignores comments",
+          workflow_events(workflow_code("on: [push, pull_request]\njobs:\n")) == {"push", "pull_request"}
+          and workflow_events(workflow_code("on:\n  # push:\n  pull_request:\n    types: [opened]\njobs:\n"))
+          == {"pull_request"} and workflow_events(workflow_code('"on":\n  push:\n')) == set())
+    check("the posture check refuses a second job without the draft skip, and a Windows job",
+          posture_problems(SECOND_JOB) == ["job second runs on drafts", "job second is not ubuntu-latest only"],
+          str(posture_problems(SECOND_JOB)))
     check("the full gate (ci.yml) is workflow_dispatch only",
-          workflow.split("\non:\n", 1)[1].startswith("  workflow_dispatch:\n\n"))
+          workflow_events(workflow_code(workflow)) == {"workflow_dispatch"}, str(workflow_events(workflow_code(workflow))))
     scan = (workflows / "secret-scan.yml").read_text(encoding="utf-8")
     check("the automatic check runs the boundary check and gitleaks with the gate's config",
           "python tools/pre_publish_check.py" in scan and "--no-git" in scan and "--config .gitleaks.toml" in scan
           and f'GITLEAKS_VERSION: "{gate.GITLEAKS_PIN}"' in scan)
-    for path in sorted(workflows.glob("*.yml")):
-        text = path.read_text(encoding="utf-8")
-        if "pull_request:" in text:
-            check(f"{path.name}: fires once per PR (no synchronize), skips drafts, Linux only",
-                  "types: [opened, reopened, ready_for_review]" in text
-                  and "github.event.pull_request.draft == false" in text and "windows-latest" not in text)
+    automatic = {}
+    for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
+        code = workflow_code(path.read_text(encoding="utf-8"))
+        events = workflow_events(code)
+        check(f"{path.name}: fires only on pull_request or workflow_dispatch",
+              bool(events) and events <= {"pull_request", "workflow_dispatch"}, str(events))
+        if events != {"workflow_dispatch"}:
+            automatic[path.name] = code
+    check("the automatic workflows are exactly machine-paths.yml and secret-scan.yml",
+          set(automatic) == {"machine-paths.yml", "secret-scan.yml"}, str(sorted(automatic)))
+    for name, code in sorted(automatic.items()):
+        check(f"{name}: fires once per PR (no synchronize), skips drafts in every job, Linux only",
+              not posture_problems(code), str(posture_problems(code)))
 
     print("verdicts")
     code, text = run_main(gate, [gate.Step("one", py("print('one ran')")), gate.Step("two", py("print('two ran')"))])

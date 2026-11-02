@@ -1,10 +1,15 @@
 name: CI
 
 # Cost posture (2026-11-02): this lane no longer fires on pull requests or pushes. The
-# pre-push hook runs the same gate on every push; the only automatic remote check is
-# .github/workflows/secret-scan.yml (gitleaks + the public-boundary check). This
-# workflow stays as a deliberate audit: `gh workflow run ci.yml --ref <branch>` when a
-# clean-runner confirmation is wanted. No secrets are used; permissions are read-only.
+# pre-push hook runs the same gate on every push; the automatic remote checks are
+# .github/workflows/secret-scan.yml (gitleaks + the public-boundary check) and
+# machine-paths.yml, both only when a PR opens or leaves draft. This workflow stays as a
+# deliberate audit: `gh workflow run ci.yml --ref <branch>` when a clean-runner
+# confirmation is wanted. A push to an open PR fires no check on the new head, and
+# ship_guard lets a Claude session merge only when the head has green checks: dispatch
+# this on the final head after the last push. Flipping the PR draft->ready re-runs only
+# the secret and path scans, not the tests. No secrets are used; permissions are
+# read-only.
 #
 # Both jobs run the one gate, tools/gate.py: the public-boundary check, the
 # machine-paths guard, the slop_prepass self-test, every test suite in its

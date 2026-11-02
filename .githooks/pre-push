@@ -2,9 +2,10 @@
 # .githooks/pre-push - run the gate (tools/gate.py) on the commits being pushed, 2026-11-02.
 # ship-guard: gate   (the profile's hooks/ship_guard.py refuses a Claude session's push here while core.hooksPath is not .githooks)
 #
-# The gate is what CI's workflows run (ci.yml on Linux and Windows PowerShell 5.1, machine-paths.yml): the
-# public-boundary check, the machine-paths guard, every test suite and the gitleaks secret scan. So a failing test, a
-# literal machine path, a private marker or a secret fails here instead of on the PR.
+# The gate is what CI's manual audit runs (ci.yml, dispatch only, on Linux and Windows PowerShell 5.1): the
+# public-boundary check, the machine-paths guard, every test suite and the gitleaks secret scan. The automatic PR
+# checks (secret-scan.yml, machine-paths.yml) fire only when a PR opens or leaves draft, so a failing test, a literal
+# machine path, a private marker or a secret is caught here, on each push.
 # The profile's bootstrap turns it on (tools/git_gate.py: gitleaks, then core.hooksPath = .githooks in this clone);
 # by hand, once per clone:
 #     git config core.hooksPath .githooks
@@ -95,7 +96,7 @@ $targets
 EOF
 
 if [ "$failed" -ne 0 ]; then
-    echo "pre-push: BLOCKED - CI runs this same gate on the PR and would fail the same way." >&2
+    echo "pre-push: BLOCKED - CI's manual audit (ci.yml) runs this same gate and would fail the same way." >&2
     echo "pre-push: fix the failures above, commit, push again. A vetted exception goes in the scanner's" >&2
     echo "pre-push: allowlist (.machine-paths-allow.json, tools/public-boundary-exceptions.json, .gitleaks.toml), not a bypass." >&2
     exit 1
