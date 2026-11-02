@@ -374,13 +374,15 @@ INDEX_FIELDS = {"mtime": 8, "mtime_ns": 12, "dev": 16, "ino": 20}  # offsets in 
 
 
 def with_index_fields(idx: bytes, **fields: int) -> bytes:
-    """A v2 SHA-1 ``idx`` with the named 32-bit stat fields set in every entry."""
+    """A v2 SHA-1 ``idx`` with the named 32-bit stat fields set in every entry and its
+    checksum recomputed, as git writes such an index."""
     b = bytearray(idx)
     off = 12
     for _ in range(struct.unpack(">I", b[8:12])[0]):
         for name, value in fields.items():
             struct.pack_into(">I", b, off + INDEX_FIELDS[name], value)
         off += (62 + (struct.unpack(">H", b[off + 60:off + 62])[0] & 0xFFF) + 8) & ~7
+    b[-20:] = hashlib.sha1(bytes(b[:-20])).digest()
     return bytes(b)
 
 
@@ -399,6 +401,39 @@ def test_privacy_scope_ignores_index_binary_fields(root: Path) -> None:
         (snap / "index.bin").write_bytes(with_index_fields(clean, **fields))
         priv = review.privacy_check(m, snap, i)
         assert priv["passed"], (fields, priv)
+    (snap / "index.bin").write_bytes(with_index_fields(clean, ino=0x007E5C0E))
+    real = review.index_scan_bytes
+    try:
+        review.index_scan_bytes = lambda data: data  # the scan before the fix
+        before = review.privacy_check(m, snap, i)
+    finally:
+        review.index_scan_bytes = real
+    assert before["by_check"]["path_outside_repo"] == 3 and {f["source"] for f in before["findings"]} == {
+        "snapshot/index.bin"}, ("CI's finding: three hits, all in the index copy", before)
+
+
+def test_index_scan_bytes_scans_corrupt_or_cut_copies_whole(root: Path) -> None:
+    """Review MUST-1: a corrupt or cut copy can still parse, and its text would be blanked.
+    The checksum git wrote proves the layout (or, under index.skipHash, the name lengths
+    git stored), so such a copy is scanned whole."""
+    repo = tc.make_repo(root)
+    tc.git(repo, "update-index", "--skip-worktree", "src/alpha.py")  # v3, where extended flags are legal
+    raw = (repo / ".git" / "index").read_bytes()
+    assert struct.unpack(">I", raw[4:8])[0] == 3 and review.index_scan_bytes(raw) != raw
+    flags = 12 + review.INDEX_STAT_BYTES + 20  # the first entry's flags (.gitignore)
+    corrupt = raw[:flags] + bytes([raw[flags] | 0x40]) + raw[flags + 1:]  # 0x4000 shifts the name by two bytes
+    skiphash = raw[:-20] + bytes(20)
+    assert review.index_scan_bytes(skiphash) != skiphash, "a sound skipHash copy still parses"
+    tree_line = skiphash.index(b" ", skiphash.index(b"\0", skiphash.index(b"TREE") + 8))  # root's "<n> <subtrees>\n"
+    copies = {
+        "corrupt": corrupt,
+        "corrupt, checksum recomputed": corrupt[:-20] + hashlib.sha1(corrupt[:-20]).digest(),
+        "corrupt, skipHash trailer": corrupt[:-20] + bytes(20),
+        "skipHash, cache-tree line broken": skiphash[:tree_line] + b"\n" + skiphash[tree_line + 1:],
+        "cut, last 20 bytes left look like a checksum": raw[:raw.index(b"TREE") + 20],
+    }
+    for why, data in copies.items():
+        assert review.index_scan_bytes(data) == data, why
 
 
 def test_privacy_scope_still_reads_index_text(root: Path) -> None:
@@ -424,7 +459,7 @@ def test_privacy_scope_still_reads_index_text(root: Path) -> None:
 
 def test_index_scan_bytes_blanks_only_binary_fields(root: Path) -> None:
     """Indexes as git writes them: v2, v3 (extended flags), v4 (prefix-compressed names),
-    and a SHA-256 repository."""
+    a SHA-256 repository, and index.skipHash (an all-zero trailer, no checksum)."""
     def variant(name: str, *setup: tuple[str, ...], fmt: str = "sha1") -> tuple[bytes, int, Path]:
         repo = root / name
         repo.mkdir()
@@ -440,7 +475,8 @@ def test_index_scan_bytes_blanks_only_binary_fields(root: Path) -> None:
         return (repo / ".git" / "index").read_bytes(), 32 if fmt == "sha256" else 20, repo
 
     cases = {"v2": variant("v2"), "v3": variant("v3", ("update-index", "--skip-worktree", "src/alpha.py")),
-             "v4": variant("v4", ("update-index", "--index-version", "4")), "sha256": variant("s256", fmt="sha256")}
+             "v4": variant("v4", ("update-index", "--index-version", "4")), "sha256": variant("s256", fmt="sha256"),
+             "skiphash": variant("skiphash", ("-c", "index.skipHash=true", "update-index", "--force-write-index"))}
     with_tree = []
     for label, (raw, hashsz, repo) in cases.items():
         out = review.index_scan_bytes(raw)
@@ -448,7 +484,7 @@ def test_index_scan_bytes_blanks_only_binary_fields(root: Path) -> None:
         assert version == {"v3": 3, "v4": 4}.get(label, 2), (label, version)
         assert len(out) == len(raw) and out[:12] == raw[:12], label
         assert out[12:12 + review.INDEX_STAT_BYTES + hashsz] == bytes(review.INDEX_STAT_BYTES + hashsz), label
-        assert out[-hashsz:] == bytes(hashsz) != raw[-hashsz:], label
+        assert out[-hashsz:] == bytes(hashsz) and (raw[-hashsz:] == bytes(hashsz)) == (label == "skiphash"), label
         assert b"README.md\0" in out and b"src/alpha.py\0" in out and b"TREE" in out, label
         tree = bytes.fromhex(tc.git(repo, "rev-parse", "HEAD^{tree}").strip())
         if tree in raw:  # update-index may invalidate the cache tree, which then stores no id

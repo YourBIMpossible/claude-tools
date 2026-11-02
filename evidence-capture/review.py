@@ -43,6 +43,7 @@ never a path, prompt or brief.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import posixpath
@@ -199,11 +200,15 @@ def escaping_citations(brief: str) -> list[str]:
 INDEX_STAT_BYTES = 40  # ctime and mtime (seconds, nanoseconds), dev, ino, mode, uid, gid, size
 
 
-def _index_varint_end(data: bytes, p: int) -> int:
-    """End of git's offset varint at ``p`` (the v4 name-prefix length)."""
-    while data[p] & 0x80:
+def _index_varint(data: bytes, p: int) -> tuple[int, int]:
+    """git's offset varint at ``p`` (the v4 name-prefix strip length): ``(value, end)``."""
+    c = data[p]
+    value = c & 0x7F
+    while c & 0x80:
         p += 1
-    return p + 1
+        c = data[p]
+        value = ((value + 1) << 7) | (c & 0x7F)
+    return value, p + 1
 
 
 def _blank_cache_tree(data: bytes, out: bytearray, p: int, stop: int, hashsz: int) -> None:
@@ -211,7 +216,7 @@ def _blank_cache_tree(data: bytes, out: bytearray, p: int, stop: int, hashsz: in
     while p < stop:
         nul = data.index(b"\0", p, stop)
         lf = data.index(b"\n", nul, stop)
-        entries = int(data[nul + 1:lf].split(b" ", 1)[0])
+        entries, _subtrees = (int(v) for v in data[nul + 1:lf].split(b" "))  # exactly "<entries> <subtrees>"
         p = lf + 1
         if entries >= 0:  # -1 marks an invalidated subtree, which has no id
             if p + hashsz > stop:
@@ -221,14 +226,21 @@ def _blank_cache_tree(data: bytes, out: bytearray, p: int, stop: int, hashsz: in
 
 
 def _index_blanked(data: bytes, hashsz: int) -> bytes:
-    if data[:4] != b"DIRC":
+    if data[:4] != b"DIRC" or len(data) < 12 + hashsz:
         raise ValueError("not an index")
     version, count = struct.unpack(">II", data[4:12])
     if version not in (2, 3, 4):
         raise ValueError(f"index version {version}")
     end = len(data) - hashsz
+    # A corrupt or cut copy can still parse and so blank text: only the checksum git wrote
+    # proves these are its bytes. An all-zero trailer (index.skipHash) proves nothing; there
+    # the name lengths checked below have to hold.
+    trailer = data[end:]
+    if trailer != bytes(hashsz) and (hashlib.sha1 if hashsz == 20 else hashlib.sha256)(data[:end]).digest() != trailer:
+        raise ValueError("index checksum mismatch")
     out = bytearray(data)
     off = 12
+    prev_len = 0
     for _ in range(count):
         fixed = INDEX_STAT_BYTES + hashsz + 2
         (flags,) = struct.unpack(">H", data[off + fixed - 2:off + fixed])
@@ -237,9 +249,15 @@ def _index_blanked(data: bytes, hashsz: int) -> bytes:
                 raise ValueError("extended flags in a v2 index")
             fixed += 2
         name = off + fixed
-        if version == 4:
-            name = _index_varint_end(data, name)
+        strip = 0
+        if version == 4:  # the name drops `strip` bytes from the end of the previous one
+            strip, name = _index_varint(data, name)
+            if strip > prev_len:
+                raise ValueError("name prefix longer than the previous name")
         nul = data.index(b"\0", name, end)
+        prev_len = prev_len - strip + (nul - name) if version == 4 else nul - name
+        if flags & 0xFFF != min(prev_len, 0xFFF):  # the length git stored, capped at 0xfff
+            raise ValueError("name length differs from the flags")
         out[off:name] = bytes(name - off)
         if version == 4:
             off = nul + 1
@@ -265,7 +283,8 @@ def index_scan_bytes(data: bytes) -> bytes:
     """``data`` with the binary fields of a git index (v2-v4, SHA-1 or SHA-256 ids) set to
     NUL: entry stat data, ids, flags and v4 prefix lengths, extension sizes, cache-tree ids
     and the trailing checksum. Names and all other extension bytes are kept. Bytes that do
-    not parse as an index come back unchanged and are scanned whole."""
+    not parse as an index, or whose checksum does not match, come back unchanged and are
+    scanned whole."""
     for hashsz in (20, 32):
         try:
             return _index_blanked(data, hashsz)
