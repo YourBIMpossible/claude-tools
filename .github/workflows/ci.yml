@@ -1,8 +1,10 @@
 name: CI
 
-# Runs on pull requests and manual dispatch only — never on push. Keeps the
-# boundary/secret/test gates in front of every merge without reacting to every
-# commit. No secrets are used; permissions are read-only and least-privilege.
+# Cost posture (2026-11-02): this lane no longer fires on pull requests or pushes. The
+# pre-push hook runs the same gate on every push; the only automatic remote check is
+# .github/workflows/secret-scan.yml (gitleaks + the public-boundary check). This
+# workflow stays as a deliberate audit: `gh workflow run ci.yml --ref <branch>` when a
+# clean-runner confirmation is wanted. No secrets are used; permissions are read-only.
 #
 # Both jobs run the one gate, tools/gate.py: the public-boundary check, the
 # machine-paths guard, the slop_prepass self-test, every test suite in its
@@ -14,7 +16,6 @@ name: CI
 # suites under pwsh 7 and under Windows PowerShell 5.1 (the shell the scheduled
 # tasks use, whose JSON and path APIs differ from pwsh 7).
 on:
-  pull_request:
   workflow_dispatch:
 
 permissions:

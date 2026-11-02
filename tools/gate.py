@@ -8,8 +8,9 @@ It runs, from the repository root, everything the CI workflows check:
   2. every test suite in TEST_SUITES, each a plain script that exits non-zero on a failure;
   3. the gitleaks secret scan of the tracked tree, with the repo's .gitleaks.toml (CI's last step).
 
-CI's two jobs (.github/workflows/ci.yml: Linux, and Windows PowerShell 5.1) run this gate, so TEST_SUITES is the one
-list of what CI checks; a suite added to it is checked on the pushing machine and in CI with no second list to update.
+CI's two jobs (.github/workflows/ci.yml, manual dispatch only: Linux, and Windows PowerShell 5.1) run this gate, so
+TEST_SUITES is the one list of what CI checks; the automatic PR check (secret-scan.yml) runs only its boundary check and
+secret scan; a suite added to it is checked on the pushing machine and in CI with no second list to update.
 Every tracked test_*.py must be in it (tools/test_gate.py fails otherwise), so no suite goes unrun.
 A suite this machine cannot run is left out with a line saying why, never silently: the Windows-only suites off
 Windows, the PowerShell suites where that shell is missing, a suite whose package is not installed (CI installs it). On Windows the PowerShell suites run twice, under pwsh 7

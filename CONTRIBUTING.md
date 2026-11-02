@@ -5,7 +5,7 @@ but the top priority is that nothing private ever enters the repository.
 
 ## The one hard rule: keep the public boundary intact
 
-Before every push, run the gate. It is exactly what CI runs on Linux and Windows:
+Before every push, run the gate. It is exactly what CI's manual audit (`ci.yml`) runs on Linux and Windows:
 
 ```bash
 python tools/gate.py     # boundary + machine paths + every test suite + gitleaks; ends GATE PASS or GATE FAIL
@@ -62,7 +62,10 @@ list). A suite is a plain script that exits non-zero on a failure; run one alone
 `python <suite>`. The graphify suites need pwsh (PowerShell 7); the scheduling suite
 runs only on Windows; the evidence-episodes suite needs evidence-compiler installed at
 the commit `tools/gate.py` pins. The gate prints a line for each suite it cannot run
-here. CI (PR + manual dispatch only) runs the same gate.
+here. CI's `ci.yml` runs the same gate on manual dispatch only
+(`gh workflow run ci.yml --ref <branch>`). The automatic PR check, `secret-scan.yml`
+(when a PR opens or leaves draft, never on later pushes), runs the boundary check and
+gitleaks; `machine-paths.yml` fires the same way.
 
 ## Licensing of contributions
 

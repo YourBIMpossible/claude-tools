@@ -127,6 +127,21 @@ def main() -> int:
     check("both CI jobs install evidence-compiler at the gate's pin, so its suite runs in CI",
           workflow.count(f'python -m pip install "{gate.EVIDENCE_COMPILER_SOURCE}"') == 2)
 
+    print("CI cost posture")
+    workflows = REPO / ".github" / "workflows"
+    check("the full gate (ci.yml) is workflow_dispatch only",
+          workflow.split("\non:\n", 1)[1].startswith("  workflow_dispatch:\n\n"))
+    scan = (workflows / "secret-scan.yml").read_text(encoding="utf-8")
+    check("the automatic check runs the boundary check and gitleaks with the gate's config",
+          "python tools/pre_publish_check.py" in scan and "--no-git" in scan and "--config .gitleaks.toml" in scan
+          and f'GITLEAKS_VERSION: "{gate.GITLEAKS_PIN}"' in scan)
+    for path in sorted(workflows.glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        if "pull_request:" in text:
+            check(f"{path.name}: fires once per PR (no synchronize), skips drafts, Linux only",
+                  "types: [opened, reopened, ready_for_review]" in text
+                  and "github.event.pull_request.draft == false" in text and "windows-latest" not in text)
+
     print("verdicts")
     code, text = run_main(gate, [gate.Step("one", py("print('one ran')")), gate.Step("two", py("print('two ran')"))])
     lines = lines_of(text)
