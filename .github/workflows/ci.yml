@@ -38,6 +38,10 @@ jobs:
       - name: Public-boundary checker tests
         run: python tools/test_pre_publish_check.py
 
+      - name: pre-push hook tests
+        # Real git pushes to a local bare remote; git runs .githooks/pre-push itself.
+        run: python tools/test_pre_push_hook.py
+
       - name: Safe-by-default (census-only) guard
         run: python local-audit/test_local_audit.py
 
@@ -138,6 +142,10 @@ jobs:
 
       - name: graphify health-check boundary tests (5.1)
         run: python graphify/test_health_check.py
+
+      - name: pre-push hook tests (Windows)
+        # Git for Windows runs the hook under its own sh; the same path the owner's machines take.
+        run: python tools/test_pre_push_hook.py
 
       - name: scheduling hidden-launcher tests (Windows)
         # Drives the real wscript.exe launcher; the no-window check reports SKIP if the runner cannot show a window.

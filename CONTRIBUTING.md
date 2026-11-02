@@ -19,6 +19,17 @@ python tools/pre_publish_check.py                # forbidden-file + private-mark
 python .github/scripts/check_machine_paths.py   # no machine-specific absolute paths (also a CI workflow)
 ```
 
+Turn on the repo's git hooks once per clone, so the last two run on every push and a
+staged secret is caught at commit time:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-push` runs CI's exact path-scanner commands on each pushed commit
+(checked out apart from your working copy) and blocks the push on a finding, with the
+scanner's own report. `.githooks/pre-commit` runs gitleaks on the staged diff.
+
 Never attach to a commit, issue, or PR: secrets, tokens, keys, `.env` files;
 customer/client/financial data; private source trees or architecture metadata
 (routes, service topology, internal class/command names, secret env-var names);

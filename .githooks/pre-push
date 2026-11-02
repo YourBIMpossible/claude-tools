@@ -1,0 +1,110 @@
+#!/bin/sh
+# .githooks/pre-push - run the CI path scanners on the commits being pushed, 2026-11-02.
+#
+# Runs the same commands as the machine-paths workflow and the CI public-boundary step, so a
+# literal machine path or private marker fails here instead of on the PR. Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# Behavior:
+#   - Each pushed commit is checked out into a throwaway clone and scanned there, so the result is
+#     the pushed tree's, never the working copy's: uncommitted edits neither fail nor pass a push.
+#     The scanners run from the pushed commit itself, the same copies CI will run.
+#   - A finding BLOCKS the push (exit 1). The scanner's report is shown unchanged - the text the
+#     CI job prints.
+#   - A scan that cannot run (no Python 3.9+, the throwaway clone fails) also BLOCKS, naming why.
+#   - Branch deletions are not scanned. A pushed commit that lacks a scanner skips that one check
+#     with a note (branches older than the scanner).
+#   - Emergency bypass, explicit and audited:  BIMP_PATHS_BYPASS="<reason>" git push ...
+#     appends a line to <git-common-dir>/paths-bypass.log. `--no-verify` skips the hook and
+#     leaves no trail; prefer the variable.
+# Python lookup: python3, python, then py -3; each is probed, so a store stub that fails is skipped.
+# POSIX sh, LF endings.
+
+# One check per line: a repo-relative script, then its arguments (CI's exact commands).
+CHECKS='.github/scripts/check_machine_paths.py --self-test
+.github/scripts/check_machine_paths.py
+tools/pre_publish_check.py'
+
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-push: not inside a git work tree" >&2; exit 1; }
+common=$(cd "$repo" && cd "$(git rev-parse --git-common-dir)" && pwd) || { echo "pre-push: cannot locate the git directory" >&2; exit 1; }
+
+if [ -n "${BIMP_PATHS_BYPASS:-}" ]; then
+    log="$common/paths-bypass.log"
+    printf '%s pre-push bypass: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BIMP_PATHS_BYPASS" >> "$log"
+    echo "pre-push: path scan BYPASSED ($BIMP_PATHS_BYPASS) - logged to $log" >&2
+    exit 0
+fi
+
+cannot_scan() {
+    echo "pre-push: BLOCKED - the path scan cannot run: $1" >&2
+    echo "pre-push: emergency bypass (logged): BIMP_PATHS_BYPASS=\"<reason>\" git push ..." >&2
+    exit 1
+}
+
+# stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per pushed ref.
+targets=
+while read -r lref lsha rref rsha; do
+    case "$lsha" in *[!0]*) ;; *) continue ;; esac   # all zeros: a deletion, nothing to scan
+    case "$targets" in *"$lsha"*) continue ;; esac
+    targets="$targets$lsha $lref
+"
+done
+[ -n "$targets" ] || exit 0
+
+py= pyarg=
+for c in python3 python py; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    a=
+    [ "$c" = py ] && a=-3
+    if "$c" $a -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+        py=$c pyarg=$a
+        break
+    fi
+done
+[ -n "$py" ] || cannot_scan "no Python 3.9+ found (tried python3, python, py -3)"
+
+# The throwaway clones are separate repositories; hook-time git variables would point them back here.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/pre-push.XXXXXX") || cannot_scan "could not create a temporary directory"
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+
+failed=0
+while read -r sha ref; do
+    [ -n "$sha" ] || continue
+    short=$(printf '%s' "$sha" | cut -c1-12)
+    tree="$tmp/$short"
+    { git clone -q --shared --no-checkout "$common" "$tree" &&
+      git -C "$tree" -c advice.detachedHead=false checkout -q --detach "$sha"; } </dev/null >/dev/null 2>&1 ||
+        cannot_scan "could not check out $short ($ref) into a throwaway clone"
+    echo "pre-push: scanning $short ($ref)" >&2
+    while IFS= read -r cmd; do
+        set -- $cmd
+        if [ ! -f "$tree/$1" ]; then
+            echo "pre-push: $1 is not in $short - that check skipped" >&2
+            continue
+        fi
+        (cd "$tree" && "$py" $pyarg "$@") </dev/null
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            failed=1
+            echo "pre-push: FAILED (exit $rc): python $cmd  [$short, $ref]" >&2
+        fi
+    done <<EOF
+$CHECKS
+EOF
+    rm -rf "$tree"
+done <<EOF
+$targets
+EOF
+
+if [ "$failed" -ne 0 ]; then
+    echo "pre-push: BLOCKED - CI runs these same checks on the PR and would fail the same way." >&2
+    echo "pre-push: fix the findings above, commit, push again. A vetted exception goes in the scanner's" >&2
+    echo "pre-push: allowlist (.machine-paths-allow.json, tools/public-boundary-exceptions.json), not a bypass." >&2
+    echo "pre-push: emergency bypass (logged): BIMP_PATHS_BYPASS=\"<reason>\" git push ..." >&2
+    exit 1
+fi
+echo "pre-push: path scans passed" >&2
+exit 0
