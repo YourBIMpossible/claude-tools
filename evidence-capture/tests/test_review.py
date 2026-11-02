@@ -98,7 +98,7 @@ def privacy_detail(m: dict, snap: Path, inputs: review.ReviewInputs) -> dict:
         matches[rel] = [norm[max(0, x.start() - 40):x.start() + 60] for x in review.ABS_RE.finditer(norm)]
         matches[rel] += [x.group(0) for rx in (review.UNC_RE, review.HOME_RE) for x in rx.finditer(text)]
     paths = review.snapshot_content_paths(snap) if privacy["by_check"]["deny_glob"] else None
-    return {"privacy": privacy, "root_key": review._root_key(inputs.repo_root), "snapshot_matches": matches,
+    return {"privacy": privacy, "root_keys": review._root_keys(inputs.repo_root), "snapshot_matches": matches,
             "content_paths": paths}
 
 
@@ -544,6 +544,31 @@ def test_privacy_scope_non_ascii_root(root: Path) -> None:
     m2, _ = episode(st, repo, prompt="second")
     privacy2 = review.privacy_check(m2, st.snapshots / m2["episode_id"], inputs2)
     assert privacy2["by_check"]["path_outside_repo"] == 1 and privacy2["findings"][0]["source"] == "settings", privacy2
+
+
+def test_privacy_scope_short_and_long_root_spellings(root: Path) -> None:
+    """A Windows 8.3 short root (``RUNNER~1``, as GitHub runners set TEMP) and its long form name the
+    same directory: a path inside the root clears in either spelling, whichever one the root is given
+    in, and a sibling path is still flagged. Elsewhere both spellings are the same string."""
+    st = make_stores(root)
+    (root / "a long directory name").mkdir()
+    long_repo = tc.make_repo((root / "a long directory name").resolve())
+    short_repo = long_repo
+    if os.name == "nt":
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(long_repo), buf, len(buf)):
+            short_repo = Path(buf.value)
+    for n, (given, spelled) in enumerate((g, s) for g in (long_repo, short_repo) for s in (long_repo, short_repo)):
+        inside = spelled.as_posix() + "/src/alpha.py"
+        m, inputs = episode(st, long_repo, prompt=f"fix {inside} ({n})")
+        inputs = dataclasses.replace(inputs, repo_root=given, settings={**inputs.settings, "cwd": inside})
+        privacy = review.privacy_check(m, st.snapshots / m["episode_id"], inputs)
+        assert privacy["passed"], (str(given), inside, privacy["findings"])
+    outside = (root / "a long directory name" / "other" / "x.py").as_posix()
+    m, inputs = episode(st, long_repo, prompt=f"fix {outside}")
+    privacy = review.privacy_check(m, st.snapshots / m["episode_id"], dataclasses.replace(inputs, repo_root=short_repo))
+    assert privacy["by_check"]["path_outside_repo"] == 1, privacy
 
 
 def test_review_excluded_held(root: Path) -> None:
