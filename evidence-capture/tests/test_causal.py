@@ -545,6 +545,58 @@ def test_worktree_toplevel_probes_run_beside_the_statuses(tmp: Path) -> None:
                for r in stuck.values()), stuck
 
 
+def test_worktree_records_reaps_every_child(tmp: Path) -> None:
+    """Review NIT-3 and NIT-1: no git child outlives worktree_records, neither after a status
+    times out (on main 3-5 of 8-10 children were left running) nor when a probe fails to
+    start after its status has."""
+    repo = make_repo(tmp)
+    for i in range(4):
+        git(repo, "worktree", "add", "-q", "-b", f"s{i}", str(tmp / f"s{i}"))
+    real_popen, real_probe = subprocess.Popen, None
+    made: list[subprocess.Popen[bytes]] = []
+    stuck = True
+
+    class Rec(real_popen):  # type: ignore[misc,valid-type]  # records every child; a status never ends in time
+        def __init__(self, args, *a, **k) -> None:  # noqa: ANN001,ANN002,ANN003
+            super().__init__(args, *a, **k)
+            self.is_status = "status" in args
+            made.append(self)
+
+        def communicate(self, input=None, timeout=None):  # noqa: A002,ANN001,ANN201
+            if stuck and self.is_status and timeout is not None:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return super().communicate(input, timeout)
+
+    calls = []
+
+    def failing_probe(path: str) -> subprocess.Popen[bytes]:
+        calls.append(path)
+        if len(calls) == 3:
+            raise OSError("synthetic: the probe could not start")
+        return real_probe(path)
+
+    try:
+        subprocess.Popen = Rec
+        raises(lambda: causal.worktree_records(repo), "worktree_status_timeout")
+        assert len(made) >= 5 and all(p.returncode is not None for p in made), [p.args[3:5] for p in made
+                                                                                 if p.returncode is None]
+        made.clear()
+        stuck = False
+        real_probe = causal._toplevel_probe
+        causal._toplevel_probe = failing_probe
+        try:
+            causal.worktree_records(repo)
+            raise AssertionError("the probe failure was swallowed")
+        except OSError as exc:
+            assert "synthetic" in str(exc), exc
+        assert sum(p.is_status for p in made) == 3 and all(p.returncode is not None for p in made), (
+            [p.args[3:5] for p in made if p.returncode is None])
+    finally:
+        subprocess.Popen = real_popen
+        if real_probe is not None:
+            causal._toplevel_probe = real_probe
+
+
 # ------------------------------------------------------------------ shared git state (D4 Q2)
 
 
@@ -567,6 +619,36 @@ def test_own_branch_config_drops_only_other_branch_sections(tmp: Path) -> None:
     assert b"[branch" not in causal.own_branch_config(cfg, None), "detached: no branch section applies"
     for odd in (b'[branch "lane/a"] remote = origin\n', b'[branch.lane]\n\tremote = o\n'):
         assert causal.own_branch_config(odd, b"main") == odd, "a header git does not write is kept"
+
+
+def test_own_branch_config_keeps_files_with_continued_values(tmp: Path) -> None:
+    """Review SHOULD-1: git joins a value line ending in a backslash with the next line and
+    ends lines at \\n only. A `[branch "x"]` line after such a line, or after a lone \\r, is
+    then value text, and the keys under it apply to the section above. Such a file is kept
+    whole, so a hooks redirect hidden that way still moves the shared state."""
+    bs = b"\\"
+    hidden = {
+        "continued": b'[core]\n\tfoo = a ' + bs + b'\n[branch "x"]\n\thooksPath = evil\n',
+        "continued, CRLF": b'[core]\r\n\tfoo = a ' + bs + b'\r\n[branch "x"]\r\n\thooksPath = evil\r\n',
+        "lone CR": b'[core]\n\tfoo = a\r[branch "x"]\n\thooksPath = evil\n',
+    }
+    for why, cfg in hidden.items():
+        f = tmp / "cfg"
+        f.write_bytes(cfg)
+        assert git(tmp, "config", "--file", str(f), "--get", "core.hooksPath").strip() == "evil", why  # git's reading
+        kept = causal.own_branch_config(cfg, b"main")
+        assert b"hooksPath = evil" in kept and kept != causal.own_branch_config(cfg.replace(b"evil", b"x"), b"main"), why
+    escaped = b'[core]\n\tfoo = a' + bs + bs + b'\n[branch "x"]\n\thooksPath = evil\n'  # an escaped backslash ends it
+    assert causal.own_branch_config(escaped, b"main") == b'[core]\n\tfoo = a' + bs + bs + b'\n'
+    comment = b'[core]\n\t# note ' + bs + b'\n[branch "x"]\n\tremote = o\n'  # git does not continue a comment,
+    assert causal.own_branch_config(comment, b"main") == comment  # but keeping it whole only errs safe
+
+    repo, side = _repo_with_sibling(tmp)
+    with (repo / ".git" / "config").open("ab") as fh:
+        fh.write(hidden["continued"])
+    before = causal.shared_git_state(repo)
+    (repo / ".git" / "config").write_bytes((repo / ".git" / "config").read_bytes().replace(b"evil", b"x"))
+    assert causal.shared_git_state(repo) != before, "a hidden hooks redirect moves the shared state"
 
 
 def test_shared_git_state_ignores_routine_sibling_writes(tmp: Path) -> None:

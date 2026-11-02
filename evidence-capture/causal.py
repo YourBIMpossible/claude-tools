@@ -721,20 +721,38 @@ _BRANCH_HEADER = re.compile(rb'\[[ \t]*branch[ \t]+"((?:[^"\\\r\n]|\\.)*)"[ \t]*
 
 def _checked_out_branch(gitdir: Path) -> bytes | None:
     """This worktree's branch name from its ``HEAD``; ``None`` when HEAD is detached."""
+    # No HEAD raises FileNotFoundError by intent: the side records that error and no state (git cannot use it either).
     head = (gitdir / "HEAD").read_bytes().strip()
     return head[len(b"ref: refs/heads/"):] if head.startswith(b"ref: refs/heads/") else None
+
+
+def _continues(line: bytes) -> bool:
+    """True when ``line`` ends in an unescaped backslash, which git reads as a value going on
+    over the next line (``\\r\\n`` counts as the newline). Also true in a comment, where git
+    does not continue: over-reporting only keeps more of the file."""
+    body = line[:-1] if line.endswith(b"\n") else line
+    if line.endswith(b"\r\n"):
+        body = body[:-1]
+    return (len(body) - len(body.rstrip(b"\\"))) % 2 == 1
 
 
 def own_branch_config(config: bytes, branch: bytes | None) -> bytes:
     """``config`` without the ``[branch "<name>"]`` sections of every branch other than
     ``branch`` (the checked-out one; ``None``: detached, so no branch section applies).
 
-    Only a header as git writes it (``[branch "<name>"]`` alone on its line) starts a
-    dropped section, and the next line opening with ``[`` ends it. Anything unusual is
-    kept, so an odd file can make the shared state look changed, never unchanged."""
+    Lines end at ``\\n`` only, as in git: a lone ``\\r`` is part of the line. A file with a
+    line that may continue a value (``_continues``) is returned whole, because a ``[`` line
+    after it can be value text rather than a header. Git never writes such a line. Only a
+    header as git writes it (``[branch "<name>"]`` alone on its line) starts a dropped
+    section, and the next line opening with ``[`` ends it. Anything unusual is kept, so an
+    odd file can make the shared state look changed, never unchanged."""
+    lines = [ln + b"\n" for ln in config.split(b"\n")]
+    lines[-1] = lines[-1][:-1]  # the text after the last newline, usually empty
+    if any(_continues(ln) for ln in lines):
+        return config
     out: list[bytes] = []
     dropping = False
-    for line in config.splitlines(keepends=True):
+    for line in lines:
         if line.lstrip().startswith(b"["):
             m = _BRANCH_HEADER.fullmatch(line.lstrip())
             dropping = m is not None and re.sub(rb"\\(.)", rb"\1", m.group(1)) != branch
@@ -793,9 +811,15 @@ def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, A
                 out[path] = {"fp": "missing", "head": None, "paths": None}
                 continue
             # the toplevel probe starts beside the status: N worktrees cost one round trip, not N
-            procs[path] = (fields.get(b"HEAD", b""), subprocess.Popen(
-                ["git", "-C", path, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env()), _toplevel_probe(path))
+            proc = subprocess.Popen(["git", "-C", path, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env())
+            try:
+                probe = _toplevel_probe(path)
+            except BaseException:  # this status is not in procs yet, so the reaping below would miss it
+                proc.kill()
+                proc.communicate()
+                raise
+            procs[path] = (fields.get(b"HEAD", b""), proc, probe)
         for path, (head, proc, probe) in procs.items():
             try:
                 status, err = proc.communicate(timeout=timeout)
