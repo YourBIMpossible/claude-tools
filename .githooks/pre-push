@@ -63,8 +63,10 @@ for c in python3 python py; do
 done
 [ -n "$py" ] || cannot_scan "no Python 3.9+ found (tried python3, python, py -3)"
 
-# The throwaway clones are separate repositories; hook-time git variables would point them back here.
+# The throwaway clones are separate repositories; hook-time git variables would point them back here, and a
+# `git -c ...` on the push (exported as GIT_CONFIG_*) would reach every git the gate's suites run.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/pre-push.XXXXXX") || cannot_scan "could not create a temporary directory"
 trap 'rm -rf "$tmp"' EXIT

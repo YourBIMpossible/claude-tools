@@ -31,6 +31,8 @@ PRIVATE_EMAIL = "dev" + "@" + "corp-internal.net"  # synthetic, caught by the pu
 FAKE_TOKEN = "ghp_" + "a1B2" * 9                   # GitHub classic PAT shape, synthetic
 STUB_OK = "print('stub suite ok')\n"
 STUB_FAIL = "import sys\nprint('stub suite failed on purpose')\nsys.exit(1)\n"
+# Fails when a `git -c` given to the push leaks through the hook into the gate's processes.
+STUB_NO_PUSH_CONFIG = "import os, sys\nsys.exit('GIT_CONFIG_PARAMETERS' in os.environ)\n"
 # The hook's environment: this process's, minus any bypass a caller has set.
 ENV = {k: v for k, v in os.environ.items() if not k.startswith("BIMP_")}
 
@@ -151,6 +153,13 @@ def main() -> int:
         check("every suite and scanner ran", all(f"<== {label}: ok" in out for label in
               ("public-boundary check", "machine-paths guard self-test", "machine-paths guard scan",
                "gitleaks secret scan", "ctxcheck/test_ctxcheck.py")), out)
+
+        print("git -c on the push")
+        branch(src, "gitc")
+        commit(src, "ctxcheck/test_ctxcheck.py", STUB_NO_PUSH_CONFIG, "probe for push-time config")
+        rc, out = run(src, "git", "-c", "gate.probe=1", "push", "-q", "origin", "gitc")
+        check("a `git -c` on the push does not reach the gate's suites", rc == 0 and remote_has(src, "gitc")
+              and verdict(out).startswith("GATE PASS"), out)
 
         print("drive path in a commit")
         branch(src, "drive")
