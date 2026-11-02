@@ -8,11 +8,12 @@
 # Behavior:
 #   - A finding BLOCKS the commit (exit 1). Output is redacted; the value is never printed.
 #   - gitleaks missing or failing to run: loud warning on stderr, commit proceeds (the pre-push /
-#     PR scan is the backstop). It is never a silent skip.
+#     PR scan is the backstop; the pre-push gate's gitleaks step BLOCKS without it). It is never a silent skip.
 #   - Emergency bypass, explicit and audited:  BIMP_SECRETS_BYPASS="<reason>" git commit ...
 #     appends a line to <git-common-dir>/secrets-bypass.log. `--no-verify` skips all hooks and
 #     leaves no trail; prefer the variable.
-# Resolution order for the binary: $GITLEAKS_BIN, then PATH.
+# Resolution order for the binary: $GITLEAKS_BIN, PATH, <home>/.claude/bin (the profile's tools/git_gate.py
+# installs it there), then bin/.
 # Uses the repo's .gitleaks.toml when present (gitleaks also finds it by default).
 # POSIX sh, LF endings.
 
@@ -28,7 +29,14 @@ fi
 gl="${GITLEAKS_BIN:-}"
 [ -n "$gl" ] || gl=$(command -v gitleaks 2>/dev/null || command -v gitleaks.exe 2>/dev/null || true)
 if [ -z "$gl" ]; then
-    echo "pre-commit: WARNING gitleaks not found (GITLEAKS_BIN or PATH) - staged-secret scan SKIPPED" >&2
+    # Where the profile's tools/git_gate.py installs the pinned gitleaks, then this repo's bin/ (bin/README.md).
+    for c in "${HOME:-/nonexistent}/.claude/bin/gitleaks" "${HOME:-/nonexistent}/.claude/bin/gitleaks.exe" \
+             "$repo/bin/gitleaks" "$repo/bin/gitleaks.exe"; do
+        if [ -f "$c" ]; then gl=$c; break; fi
+    done
+fi
+if [ -z "$gl" ]; then
+    echo "pre-commit: WARNING gitleaks not found (GITLEAKS_BIN, PATH, <home>/.claude/bin, bin/) - staged-secret scan SKIPPED" >&2
     exit 0
 fi
 

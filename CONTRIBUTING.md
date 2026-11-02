@@ -5,30 +5,27 @@ but the top priority is that nothing private ever enters the repository.
 
 ## The one hard rule: keep the public boundary intact
 
-Before every push, scan the **committed tree** (never trust `.gitignore` alone):
+Before every push, run the gate. It is exactly what CI runs on Linux and Windows:
 
 ```bash
-pwsh tools/release-check.ps1          # gitleaks + boundary + tests, all in one
+python tools/gate.py     # boundary + machine paths + every test suite + gitleaks; ends GATE PASS or GATE FAIL
 ```
 
-or the individual gates:
+It needs gitleaks 8.18.4 (`$GITLEAKS_BIN`, PATH, the profile's `tools/git_gate.py`
+install, or `bin/`: see [bin/README.md](bin/README.md)); without it the gate fails.
 
-```bash
-bin/gitleaks.exe detect --source . --no-banner   # requires the gitleaks download
-python tools/pre_publish_check.py                # forbidden-file + private-marker scan
-python .github/scripts/check_machine_paths.py   # no machine-specific absolute paths (also a CI workflow)
-```
-
-Turn on the repo's git hooks once per clone, so the last two run on every push and a
-staged secret is caught at commit time:
+Turn on the repo's git hooks once per clone (the profile's bootstrap does it), so the
+gate runs on every push and a staged secret is caught at commit time:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-`.githooks/pre-push` runs CI's exact path-scanner commands on each pushed commit
-(checked out apart from your working copy) and blocks the push on a finding, with the
-scanner's own report. `.githooks/pre-commit` runs gitleaks on the staged diff.
+`.githooks/pre-push` runs the gate on each pushed commit (checked out apart from your
+working copy) and blocks the push unless it passes, printing each failing step's own
+report. `.githooks/pre-commit` runs gitleaks on the staged diff. A vetted false
+positive goes in the scanner's allowlist (`.machine-paths-allow.json`,
+`tools/public-boundary-exceptions.json`, `.gitleaks.toml`), never a bypass.
 
 Never attach to a commit, issue, or PR: secrets, tokens, keys, `.env` files;
 customer/client/financial data; private source trees or architecture metadata
@@ -59,16 +56,13 @@ does not remove it from Git history or third-party caches.
 
 ## Tests
 
-```bash
-python ctxcheck/test_ctxcheck.py
-python ctxdex/test_ctxdex_gate.py
-python tools/test_pre_publish_check.py
-python evidence-relevance/test_measure_relevance.py
-python evidence-archive/test_evacuate_worktree.py
-python graphify/test_refresh_graphs.py   # needs pwsh (PowerShell 7)
-```
-
-CI (PR + manual dispatch only) runs these plus the boundary and secret scans.
+Every suite is listed in `TEST_SUITES` in [tools/gate.py](tools/gate.py), and the gate
+runs them all (`tools/test_gate.py` fails if a tracked `test_*.py` is missing from the
+list). A suite is a plain script that exits non-zero on a failure; run one alone with
+`python <suite>`. The graphify suites need pwsh (PowerShell 7); the scheduling suite
+runs only on Windows; the evidence-episodes suite needs evidence-compiler installed at
+the commit `tools/gate.py` pins. The gate prints a line for each suite it cannot run
+here. CI (PR + manual dispatch only) runs the same gate.
 
 ## Licensing of contributions
 

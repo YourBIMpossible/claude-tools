@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -464,10 +465,22 @@ TESTS = [test_freeze_register_admit, test_start_end_preserved_and_attributed, te
          test_other_worktree_classification, test_clean_bytes_history_cannot_write]
 
 
+def ensure_python_on_path(tmp: Path) -> None:
+    """A command check runs a bare ``python`` (an absolute argv is refused), which a Linux machine with only
+    ``python3`` lacks; there, this interpreter is put first on PATH under that name."""
+    if shutil.which("python"):
+        return
+    shim = tmp / "python-on-path"
+    shim.mkdir()
+    (shim / "python").symlink_to(sys.executable)
+    os.environ["PATH"] = str(shim) + os.pathsep + os.environ.get("PATH", "")
+
+
 def main() -> int:
     only = sys.argv[1:]
     dryrun.run_hook = run_hook_unbudgeted  # Fixture (test_hooks) calls the hooks through it
     with tempfile.TemporaryDirectory(prefix="ec-causal-hooks-") as tmp:
+        ensure_python_on_path(Path(tmp))
         for fn in TESTS:
             if only and fn.__name__ not in only:
                 continue

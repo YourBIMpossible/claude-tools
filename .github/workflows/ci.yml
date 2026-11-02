@@ -3,6 +3,16 @@ name: CI
 # Runs on pull requests and manual dispatch only — never on push. Keeps the
 # boundary/secret/test gates in front of every merge without reacting to every
 # commit. No secrets are used; permissions are read-only and least-privilege.
+#
+# Both jobs run the one gate, tools/gate.py: the public-boundary check, the
+# machine-paths guard, the slop_prepass self-test, every test suite in its
+# TEST_SUITES (with the one package a suite needs, evidence-compiler, installed
+# at the commit gate.py pins) and the gitleaks secret scan. The pre-push hook (.githooks/pre-push)
+# runs the same gate on the pushing machine, so a push that would fail here is
+# blocked before it leaves. A new check goes into tools/gate.py, not into a step
+# here. Linux leaves out the Windows-only suite; Windows runs the PowerShell
+# suites under pwsh 7 and under Windows PowerShell 5.1 (the shell the scheduled
+# tasks use, whose JSON and path APIs differ from pwsh 7).
 on:
   pull_request:
   workflow_dispatch:
@@ -14,13 +24,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GITLEAKS_VERSION: "8.18.4"   # tools/gate.py GITLEAKS_PIN and bin/README.md pin the same version
+
 jobs:
-  gates:
-    name: boundary + secret + tests
+  gate-linux:
+    name: gate (Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      GITLEAKS_VERSION: "8.18.4"
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -32,79 +43,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Public-boundary check
-        run: python tools/pre_publish_check.py
-
-      - name: Public-boundary checker tests
-        run: python tools/test_pre_publish_check.py
-
-      - name: pre-push hook tests
-        # Real git pushes to a local bare remote; git runs .githooks/pre-push itself.
-        run: python tools/test_pre_push_hook.py
-
-      - name: Safe-by-default (census-only) guard
-        run: python local-audit/test_local_audit.py
-
-      - name: ctxcheck tests
-        run: python ctxcheck/test_ctxcheck.py
-
-      - name: ctxdex secret-gate tests
-        run: python ctxdex/test_ctxdex_gate.py
-
-      - name: slop_prepass self-test
-        run: python local-audit/slop_prepass.py --self-test
-
-      - name: graphify refresh failure-accounting tests
-        # Drives graphify/Refresh-Graphs.ps1 under pwsh (preinstalled on ubuntu-latest).
-        run: python graphify/test_refresh_graphs.py
-
-      - name: graphify health-check boundary tests
-        # Drives graphify/Check-GraphifyHealth.ps1 under pwsh; scheduled-task and PyPI calls are stubbed.
-        run: python graphify/test_health_check.py
-
-      - name: graphify adoption-funnel tests
-        # Synthetic transcripts, log and stub resolver; no local data.
-        run: python graphify/test_graphify_funnel.py
-
-      - name: evidence-relevance tests
-        run: python evidence-relevance/test_measure_relevance.py
-
-      - name: evidence-archive evacuation tests
-        run: python evidence-archive/test_evacuate_worktree.py
-
-      - name: evidence-capture capture/screen tests
-        run: python evidence-capture/tests/test_capture.py
-
-      - name: evidence-capture lock tests
-        run: python evidence-capture/tests/test_locks.py
-
-      - name: evidence-capture identity tests
-        run: python evidence-capture/tests/test_identity.py
-
-      - name: evidence-capture review tests
-        run: python evidence-capture/tests/test_review.py
-
-      - name: evidence-capture snapshot tests
-        run: python evidence-capture/tests/test_snapshot.py
-
-      - name: evidence-capture causal-state tests
-        run: python evidence-capture/tests/test_causal.py
-
-      - name: evidence-capture host-probe tests
-        run: python evidence-capture/tests/test_host_probe.py
-
-      - name: evidence-footprints tests
-        run: python evidence-footprints/test_footprints.py
-
-      - name: evidence-footprints blind-sheet tests
-        run: python evidence-footprints/test_blind_sheets.py
-
-      - name: evidence-twin tests
-        run: python evidence-twin/test_twin.py
-
       - name: Install gitleaks (pinned, checksum-verified)
+        # Outside the checkout, so the tree the gate scans holds only tracked files.
         run: |
           set -euo pipefail
+          dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$dir"
+          cd "$dir"
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
           tar="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           curl -fsSL -o "$tar" "$base/$tar"
@@ -112,20 +57,20 @@ jobs:
           grep " $tar\$" checksums.txt | sha256sum -c -
           tar -xzf "$tar" gitleaks
           ./gitleaks version
+          echo "GITLEAKS_BIN=$dir/gitleaks" >> "$GITHUB_ENV"
 
-      - name: Gitleaks secret scan (published tree)
-        # --no-git on a fresh checkout scans exactly the tracked tree (git-ignored
-        # dirs are not present in CI), mirroring the local release-check gate.
-        run: ./gitleaks detect --source . --no-git --config .gitleaks.toml --redact --no-banner
+      - name: Install evidence-compiler (pinned)
+        # evidence-episodes/test_build_episodes.py needs it; tools/gate.py EVIDENCE_COMPILER_PIN names the same commit.
+        run: python -m pip install "git+https://github.com/YourBIMpossible/evidence-compiler@1cdc625c4c18ea95994eaf424b039b06e9387d6c"
 
-  graphify-winps51:
-    # The scheduled tasks run Windows PowerShell 5.1, whose JSON and path APIs
-    # differ from pwsh 7; the graphify suites run under it too.
-    name: graphify tests (Windows PowerShell 5.1)
+      - name: Gate
+        # pwsh is preinstalled on ubuntu-latest, so the PowerShell suites run here under pwsh 7.
+        run: python tools/gate.py --verbose
+
+  gate-windows:
+    name: gate (Windows)
     runs-on: windows-latest
-    timeout-minutes: 15
-    env:
-      GRAPHIFY_TEST_SHELL: powershell.exe
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -137,16 +82,33 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: graphify refresh tests (5.1)
-        run: python graphify/test_refresh_graphs.py
+      - name: Install gitleaks (pinned, checksum-verified)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = $env:GITLEAKS_VERSION
+          $dir = Join-Path $env:RUNNER_TEMP 'gitleaks'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $base = "https://github.com/gitleaks/gitleaks/releases/download/v$v"
+          $zip = "gitleaks_${v}_windows_x64.zip"
+          $zipPath = Join-Path $dir $zip
+          $sumPath = Join-Path $dir 'checksums.txt'
+          Invoke-WebRequest -Uri "$base/$zip" -OutFile $zipPath
+          Invoke-WebRequest -Uri "$base/gitleaks_${v}_checksums.txt" -OutFile $sumPath
+          $line = Get-Content $sumPath | Where-Object { $_ -match (' ' + [regex]::Escape($zip) + '$') }
+          if (-not $line) { throw "no checksum listed for $zip" }
+          $want = ($line -split '\s+')[0].ToLowerInvariant()
+          $got = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($got -ne $want) { throw "checksum mismatch for ${zip}: got $got, want $want" }
+          Expand-Archive -Path $zipPath -DestinationPath $dir -Force
+          $exe = Join-Path $dir 'gitleaks.exe'
+          & $exe version
+          "GITLEAKS_BIN=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: graphify health-check boundary tests (5.1)
-        run: python graphify/test_health_check.py
+      - name: Install evidence-compiler (pinned)
+        # evidence-episodes/test_build_episodes.py needs it; tools/gate.py EVIDENCE_COMPILER_PIN names the same commit.
+        run: python -m pip install "git+https://github.com/YourBIMpossible/evidence-compiler@1cdc625c4c18ea95994eaf424b039b06e9387d6c"
 
-      - name: pre-push hook tests (Windows)
-        # Git for Windows runs the hook under its own sh; the same path the owner's machines take.
-        run: python tools/test_pre_push_hook.py
-
-      - name: scheduling hidden-launcher tests (Windows)
-        # Drives the real wscript.exe launcher; the no-window check reports SKIP if the runner cannot show a window.
-        run: python scheduling/test_run_hidden.py
+      - name: Gate
+        # Git for Windows runs the pre-push hook tests' hook under its own sh, the path the owner's machines take.
+        run: python tools/gate.py --verbose
