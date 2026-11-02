@@ -15,9 +15,10 @@ A suite this machine cannot run is left out with a line saying why, never silent
 Windows, the PowerShell suites where that shell is missing, a suite whose package is not installed (CI installs it). On Windows the PowerShell suites run twice, under pwsh 7
 and under Windows PowerShell 5.1 (the shell the scheduled tasks use), as CI's two jobs do between them.
 
-The steps run in parallel, each with its own temporary directory, and their output is buffered: a passing step prints
-one line, a failing step prints all of its output (`--verbose` prints every step's output). Every step runs even when
-another fails, so one run shows every problem. The last line of output is the verdict (`GATE PASS ...` or
+The steps run in parallel, each with its own temporary directory, except the TIMED_SUITES: they assert the evidence
+hooks' wall-clock budgets, so they run one at a time after the parallel steps finish, with nothing else running.
+Output is buffered: a passing step prints one line, a failing step prints all of its output (`--verbose` prints every
+step's output). Every step runs even when another fails, so one run shows every problem. The last line of output is the verdict (`GATE PASS ...` or
 `GATE FAIL ...`), and the exit status is 0 only for a pass.
 
 gitleaks is found through $GITLEAKS_BIN, then PATH, then <home>/.claude/bin (where the profile's tools/git_gate.py installs
@@ -80,6 +81,15 @@ TEST_SUITES = (
     ("evidence-twin/test_twin.py", "any"),
     ("scheduling/test_run_hidden.py", "windows"),
 )
+# Suites that assert the evidence hooks' wall-clock budgets (pipeline.START_BUDGET_MS, END_BUDGET_S): under the
+# parallel steps' load a hook overruns its budget and the suite fails on timing, not behavior, so these run alone.
+TIMED_SUITES = frozenset({
+    "evidence-capture/tests/test_capture.py",
+    "evidence-capture/tests/test_causal_hooks.py",
+    "evidence-capture/tests/test_hooks.py",
+    "evidence-capture/tests/test_host_probe.py",
+    "evidence-capture/tests/test_identity.py",
+})
 GUARD = ".github/scripts/check_machine_paths.py"
 EVIDENCE_COMPILER_PIN = "1cdc625c4c18ea95994eaf424b039b06e9387d6c"  # the commit ci.yml installs
 EVIDENCE_COMPILER_SOURCE = "git+https://github.com/YourBIMpossible/evidence-compiler@" + EVIDENCE_COMPILER_PIN
@@ -99,6 +109,7 @@ class Step:
     label: str
     argv: list[str]
     env: tuple[tuple[str, str], ...] = ()
+    alone: bool = False  # run after the parallel steps, with nothing else running
 
 
 def powershell_hosts(windows: bool, which: Callable[[str], str | None] = shutil.which) -> list[tuple[str, str]]:
@@ -135,7 +146,7 @@ def default_steps(root: Path, python: str = sys.executable, windows: bool = os.n
             skipped.append(f"not run here (evidence_compiler not installed; pip install \"{EVIDENCE_COMPILER_SOURCE}\"):"
                            f" {suite}")
         else:
-            steps.append(Step(suite, [python, suite]))
+            steps.append(Step(suite, [python, suite], alone=suite in TIMED_SUITES))
     steps.append(Step("gitleaks secret scan", [python, "tools/gate.py", "--secret-scan", "--root", str(root)]))
     return steps, skipped
 
@@ -216,22 +227,32 @@ def run_step(step: Step, cwd: Path, scratch: Path) -> Result:
 
 def run_steps(steps: list[Step], cwd: Path, out: TextIO, verbose: bool = False,
               runner: Callable[[Step, Path, Path], Result] = run_step) -> tuple[list[str], int]:
-    """(labels of the failed steps, number of steps run). Every step runs; results print in step order."""
+    """(labels of the failed steps, number of steps run). Every step runs. The parallel steps run first and print in
+    step order; then each `alone` step runs by itself, in step order, once every parallel step has finished."""
     if not steps:
         return [], 0
-    with tempfile.TemporaryDirectory(prefix="gate-") as scratch_root, \
-            ThreadPoolExecutor(max_workers=min(8, len(steps), os.cpu_count() or 1)) as pool:
-        futures = [pool.submit(runner, step, cwd, Path(scratch_root) / str(i)) for i, step in enumerate(steps)]
-        failed = []
-        for future in futures:
-            result = future.result()
-            if verbose or not result.ok:
-                print(f"==> {result.label}", file=out)
-                text = result.output
-                out.write(text if not text or text.endswith("\n") else text + "\n")
-            print(f"<== {result.label}: {result.status} in {result.seconds:.1f}s", file=out, flush=True)
-            if not result.ok:
-                failed.append(result.label)
+    failed = []
+
+    def report(result: Result) -> None:
+        if verbose or not result.ok:
+            print(f"==> {result.label}", file=out)
+            text = result.output
+            out.write(text if not text or text.endswith("\n") else text + "\n")
+        print(f"<== {result.label}: {result.status} in {result.seconds:.1f}s", file=out, flush=True)
+        if not result.ok:
+            failed.append(result.label)
+
+    indexed = list(enumerate(steps))
+    together = [(i, step) for i, step in indexed if not step.alone]
+    alone = [(i, step) for i, step in indexed if step.alone]
+    with tempfile.TemporaryDirectory(prefix="gate-") as scratch_root:
+        if together:
+            with ThreadPoolExecutor(max_workers=min(8, len(together), os.cpu_count() or 1)) as pool:
+                futures = [pool.submit(runner, step, cwd, Path(scratch_root) / str(i)) for i, step in together]
+                for future in futures:
+                    report(future.result())
+        for i, step in alone:  # the pool has shut down: nothing else is running
+            report(runner(step, cwd, Path(scratch_root) / str(i)))
     return failed, len(steps)
 
 
