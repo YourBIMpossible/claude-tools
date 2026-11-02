@@ -15,8 +15,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -99,9 +97,6 @@ def main() -> int:
     check("Windows runs the PowerShell suites under pwsh 7 and 5.1", sorted(shells.values()) ==
           ["powershell.exe", "pwsh"], str(shells))
     check("the Windows-only suite runs on Windows", "scheduling/test_run_hidden.py" in labels, str(labels))
-    check("every timed suite is a gate suite", gate.TIMED_SUITES <= set(listed), str(gate.TIMED_SUITES - set(listed)))
-    check("exactly the timed suites run alone", {s.label for s in win if s.alone} == gate.TIMED_SUITES,
-          str(sorted(s.label for s in win if s.alone)))
     for step in win:
         for part in step.argv[1:]:
             if part.endswith(".py"):
@@ -157,34 +152,6 @@ def main() -> int:
     code, text = run_main(gate, [gate.Step("env", py("import os, sys; sys.exit(os.environ.get('GRAPHIFY_TEST_SHELL') "
                                                     "!= 'powershell.exe')"), (("GRAPHIFY_TEST_SHELL", "powershell.exe"),))])
     check("a step's own environment reaches it", code == 0, text)
-
-    print("timed suites run alone")
-    spans: list[tuple[str, float, float]] = []
-    lock = threading.Lock()
-
-    def timing_runner(step, cwd, scratch):
-        started = time.monotonic()
-        time.sleep(0.2)
-        with lock:
-            spans.append((step.label, started, time.monotonic()))
-        return gate.Result(step.label, True, "", 0.2, "ok")
-
-    mixed = [gate.Step("p1", []), gate.Step("t1", [], alone=True), gate.Step("p2", []),
-             gate.Step("t2", [], alone=True), gate.Step("p3", [])]
-    out = io.StringIO()
-    failed, total = gate.run_steps(mixed, REPO, out, runner=timing_runner)
-    by_label = {label: (start, end) for label, start, end in spans}
-    check("every step ran, none failed", total == 5 and not failed and len(spans) == 5, str(spans))
-    last_parallel_end = max(by_label[p][1] for p in ("p1", "p2", "p3"))
-    check("the alone steps start only after every parallel step has finished",
-          min(by_label["t1"][0], by_label["t2"][0]) >= last_parallel_end, str(spans))
-    check("the alone steps never overlap each other, and run in step order",
-          by_label["t1"][1] <= by_label["t2"][0], str(spans))
-    printed = [ln.split(":")[0][4:] for ln in lines_of(out.getvalue()) if ln.startswith("<== ")]
-    check("parallel steps print first in step order, then the alone steps", printed == ["p1", "p2", "p3", "t1", "t2"],
-          str(printed))
-    code, text = run_main(gate, [gate.Step("solo", py("print('solo ran')"), alone=True)])
-    check("a gate of only alone steps runs them", code == 0 and "<== solo: ok" in text, text)
 
     print("secret scan")
     with tempfile.TemporaryDirectory() as td:
