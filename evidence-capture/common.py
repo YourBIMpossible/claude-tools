@@ -82,7 +82,16 @@ def plus_days(value: str, days: int) -> str:
 
 
 def norm_path(path: str | Path) -> str:
-    return str(path).replace("\\", "/").rstrip("/")
+    """Forward slashes, no trailing slash. On Windows an absolute path holding an 8.3 short component
+    (``RUNNER~1``) is first expanded to its long form, the form ``Path.resolve()`` records roots in, so a
+    cwd or transcript path spelled short still matches the root and hashes the same."""
+    s = str(path)
+    if os.name == "nt" and "~" in s and os.path.isabs(s):
+        try:
+            s = os.path.realpath(s)
+        except (OSError, ValueError):
+            pass
+    return s.replace("\\", "/").rstrip("/")
 
 
 def git_env() -> dict[str, str]:

@@ -136,9 +136,17 @@ def load_capture_config(repo_root: Path) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------- privacy scope
 
-def _root_key(repo_root: Path) -> str:
-    key = norm_path(repo_root)
-    return key.lower() if os.name == "nt" else key
+def _root_keys(repo_root: Path) -> tuple[str, ...]:
+    """The root as written, its long form, and on Windows its 8.3 short form (``RUNNER~1``, as
+    GitHub runners set TEMP). A prompt or setting may spell the root either way; every spelling
+    names the same directory, so any of them clears a path."""
+    keys = {norm_path(repo_root), str(repo_root).replace("\\", "/").rstrip("/")}
+    if os.name == "nt":
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(repo_root), buf, len(buf)):
+            keys.add(buf.value.replace("\\", "/").rstrip("/"))
+    return tuple(sorted((k.lower() if os.name == "nt" else k) for k in keys))
 
 
 def _normalize(text: str) -> str:
@@ -160,7 +168,7 @@ def _escapes(tail: str) -> bool:
 
 def outside_paths(text: str, repo_root: Path) -> list[str]:
     """Absolute paths in ``text`` that are not inside ``repo_root`` (as path hashes)."""
-    root = _root_key(repo_root)
+    roots = _root_keys(repo_root)
     hits: list[str] = []
     for m in UNC_RE.finditer(text):
         hits.append(sha256_bytes(m.group(0).encode("utf-8", "surrogatepass")))
@@ -171,10 +179,11 @@ def outside_paths(text: str, repo_root: Path) -> list[str]:
         rest = norm[m.start():]
         if re.match(r"/[a-z]/", rest, re.I) and not re.match(_POSIX[len(r"(?<![\w.~/:-])"):], rest):
             rest = rest[1] + ":" + rest[2:]  # Git Bash /c/... form
-        inside = rest.startswith(root) and (len(rest) == len(root) or rest[len(root)] == "/"
-                                            or rest[len(root)] in TOKEN_END or rest[len(root)] in ".,;:)]}")
-        if inside and _escapes(rest[len(root):]):
-            inside = False
+        inside = any(
+            rest.startswith(root) and (len(rest) == len(root) or rest[len(root)] == "/"
+                                       or rest[len(root)] in TOKEN_END or rest[len(root)] in ".,;:)]}")
+            and not _escapes(rest[len(root):])
+            for root in roots)
         if not inside:
             token = TOKEN_RE.match(rest)
             hits.append(sha256_bytes((token.group(0) if token else rest[:64]).encode("utf-8", "surrogatepass")))

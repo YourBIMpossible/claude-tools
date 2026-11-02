@@ -1068,6 +1068,23 @@ def test_windows_path_forms(root: Path) -> None:
         assert cls(p) == "external_path", (p, cls(p))
 
 
+def test_short_name_path_normalizes_to_long_form(root: Path) -> None:
+    """A Windows 8.3 short spelling (``RUNNER~1``, as GitHub runners set TEMP) normalizes, and so hashes,
+    the same as the long form ``Path.resolve()`` records roots in. Elsewhere, or on a volume with short
+    names turned off, the short spelling is the long one and the check still holds."""
+    long_dir = (root / "a long directory name").resolve()
+    long_dir.mkdir()
+    short = str(long_dir)
+    if os.name == "nt":
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(long_dir), buf, len(buf)):
+            short = buf.value
+    assert common.norm_path(short) == common.norm_path(long_dir), (short, str(long_dir))
+    assert common.norm_path(short + os.sep + "x.txt") == common.norm_path(long_dir) + "/x.txt"
+    assert pipeline.root_sha256(Path(short)) == pipeline.root_sha256(long_dir)
+
+
 def test_root_resolution_without_marker_and_gone(root: Path) -> None:
     """The captured root resolves by path hash even when the checkout no longer carries
     the config marker; a removed worktree is reported as gone, not unresolved."""

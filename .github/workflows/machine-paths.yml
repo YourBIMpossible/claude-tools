@@ -5,20 +5,29 @@ name: machine-paths
 # it in another repo, copy this file and .github/scripts/check_machine_paths.py, and
 # add a .machine-paths-allow.json at the repo root only if something must be exempt.
 # Run the same check locally:  python .github/scripts/check_machine_paths.py
+#
+# Cost posture (2026-11-02): ubuntu-latest, PR + manual only, non-draft, and
+# cancel-in-progress, as secret-scan.yml beside it.
 on:
   pull_request:
+    # No `synchronize`: pushing more commits to an open PR does not re-fire this. The pre-push
+    # gate runs the same guard on each push; re-run remotely by hand (workflow_dispatch) or by
+    # flipping draft->ready when you want the fresh confirmation.
+    types: [opened, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: machine-paths-${{ github.ref }}
+  group: machine-paths-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   machine-paths:
     name: no machine-specific paths
+    # Skip drafts on PR events; always run on manual dispatch.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

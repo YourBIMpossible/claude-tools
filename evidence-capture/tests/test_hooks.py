@@ -32,6 +32,11 @@ import report  # noqa: E402
 import store  # noqa: E402
 from common import iso, now_utc, parse_iso, read_json, write_json_atomic  # noqa: E402
 
+# Metadata commits run in this process and in children built from os.environ (some with an isolated HOME), so the
+# fixture identity is pinned here, not taken from the machine: a CI runner or WSL with no git identity would fail
+# every one of them. test_backstop and test_causal_hooks import this module and get the same identity.
+os.environ.update({k: v for k, v in dryrun.FIXTURE_ENV.items() if not k.endswith("_DATE")})
+
 PASSED: list[str] = []
 FAILED: list[str] = []
 SKIPPED: list[str] = []

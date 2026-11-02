@@ -1,0 +1,3 @@
+# The git hooks are POSIX sh scripts run by Git for Windows' sh too: a CRLF checkout
+# (core.autocrlf=true) would put a carriage return into every assignment and break them.
+.githooks/* text eol=lf
