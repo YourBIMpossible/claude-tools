@@ -11,7 +11,8 @@ at episode end and again, idempotently, at the next capture start.
    missing inputs → **held**: the snapshot is kept until it expires; no payload.
 4. Otherwise the snapshot must verify against its ``SHA256SUMS`` and the manifest's
    hash (else excluded, ``snapshot_unverified``), and the privacy-scope check runs:
-   no path outside the repository in the prompt, brief, settings or snapshot bytes;
+   no path outside the repository in the prompt, brief, settings or snapshot bytes (of
+   the index copy, its names and extension text, not its binary stat data and ids);
    no snapshot path matching a deny glob (built-in list plus ``capture.deny_globs`` in
    the repository's ``.evidence-compiler/config.yaml``); no brief citation outside the
    repository; no attachment. Any failure → excluded, reason ``privacy_scope``.
@@ -42,10 +43,12 @@ never a path, prompt or brief.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import posixpath
 import re
+import struct
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -189,6 +192,107 @@ def escaping_citations(brief: str) -> list[str]:
     return hits
 
 
+# ``index.bin`` is a byte copy of ``.git/index``. Its stat data, object ids and flags are
+# binary numbers whose bytes can read as a path: inode 0x007e5c0e holds ``~\`` (a home
+# path), and an mtime of 0x6ae7743a before nanoseconds starting 0x2f reads ``t:/`` (a drive
+# root). Those fields are blanked before the path scan; names and extension text are
+# scanned as stored.
+INDEX_STAT_BYTES = 40  # ctime and mtime (seconds, nanoseconds), dev, ino, mode, uid, gid, size
+
+
+def _index_varint(data: bytes, p: int) -> tuple[int, int]:
+    """git's offset varint at ``p`` (the v4 name-prefix strip length): ``(value, end)``."""
+    c = data[p]
+    value = c & 0x7F
+    while c & 0x80:
+        p += 1
+        c = data[p]
+        value = ((value + 1) << 7) | (c & 0x7F)
+    return value, p + 1
+
+
+def _blank_cache_tree(data: bytes, out: bytearray, p: int, stop: int, hashsz: int) -> None:
+    """Blank the object ids in a ``TREE`` extension body; ValueError when it does not parse."""
+    while p < stop:
+        nul = data.index(b"\0", p, stop)
+        lf = data.index(b"\n", nul, stop)
+        entries, _subtrees = (int(v) for v in data[nul + 1:lf].split(b" "))  # exactly "<entries> <subtrees>"
+        p = lf + 1
+        if entries >= 0:  # -1 marks an invalidated subtree, which has no id
+            if p + hashsz > stop:
+                raise ValueError("cache tree id truncated")
+            out[p:p + hashsz] = bytes(hashsz)
+            p += hashsz
+
+
+def _index_blanked(data: bytes, hashsz: int) -> bytes:
+    if data[:4] != b"DIRC" or len(data) < 12 + hashsz:
+        raise ValueError("not an index")
+    version, count = struct.unpack(">II", data[4:12])
+    if version not in (2, 3, 4):
+        raise ValueError(f"index version {version}")
+    end = len(data) - hashsz
+    # A corrupt or cut copy can still parse and so blank text: only the checksum git wrote
+    # proves these are its bytes. An all-zero trailer (index.skipHash) proves nothing; there
+    # the name lengths checked below have to hold.
+    trailer = data[end:]
+    if trailer != bytes(hashsz) and (hashlib.sha1 if hashsz == 20 else hashlib.sha256)(data[:end]).digest() != trailer:
+        raise ValueError("index checksum mismatch")
+    out = bytearray(data)
+    off = 12
+    prev_len = 0
+    for _ in range(count):
+        fixed = INDEX_STAT_BYTES + hashsz + 2
+        (flags,) = struct.unpack(">H", data[off + fixed - 2:off + fixed])
+        if flags & 0x4000:  # 16-bit extended flags follow
+            if version < 3:
+                raise ValueError("extended flags in a v2 index")
+            fixed += 2
+        name = off + fixed
+        strip = 0
+        if version == 4:  # the name drops `strip` bytes from the end of the previous one
+            strip, name = _index_varint(data, name)
+            if strip > prev_len:
+                raise ValueError("name prefix longer than the previous name")
+        nul = data.index(b"\0", name, end)
+        prev_len = prev_len - strip + (nul - name) if version == 4 else nul - name
+        if flags & 0xFFF != min(prev_len, 0xFFF):  # the length git stored, capped at 0xfff
+            raise ValueError("name length differs from the flags")
+        out[off:name] = bytes(name - off)
+        if version == 4:
+            off = nul + 1
+        else:  # 1-8 NULs pad each entry to a multiple of eight bytes
+            nxt = off + ((nul - off + 8) & ~7)
+            if nxt > end or data[nul:nxt].strip(b"\0"):
+                raise ValueError("entry padding")
+            off = nxt
+    while off < end:
+        (size,) = struct.unpack(">I", data[off + 4:off + 8])
+        body = off + 8
+        if body + size > end:
+            raise ValueError("extension overruns the checksum")
+        out[off + 4:body] = bytes(4)
+        if data[off:off + 4] == b"TREE":
+            _blank_cache_tree(data, out, body, body + size, hashsz)
+        off = body + size
+    out[end:] = bytes(hashsz)
+    return bytes(out)
+
+
+def index_scan_bytes(data: bytes) -> bytes:
+    """``data`` with the binary fields of a git index (v2-v4, SHA-1 or SHA-256 ids) set to
+    NUL: entry stat data, ids, flags and v4 prefix lengths, extension sizes, cache-tree ids
+    and the trailing checksum. Names and all other extension bytes are kept. Bytes that do
+    not parse as an index, or whose checksum does not match, come back unchanged and are
+    scanned whole."""
+    for hashsz in (20, 32):
+        try:
+            return _index_blanked(data, hashsz)
+        except (ValueError, IndexError, struct.error):
+            continue
+    return data
+
+
 def _stage_paths_with_blobs(snapshot: Path) -> list[str]:
     listing = snapshot / "ls-files-stage.z"
     blobs = snapshot / "blobs"
@@ -278,7 +382,8 @@ def privacy_check(m: dict[str, Any], snapshot: Path, inputs: ReviewInputs) -> di
         add("external_citation", "brief", h)
     for f in sorted(p for p in snapshot.rglob("*") if p.is_file()):
         rel = f.relative_to(snapshot).as_posix()
-        text = f.read_bytes().decode("utf-8", "replace")
+        data = f.read_bytes()
+        text = (index_scan_bytes(data) if rel == "index.bin" else data).decode("utf-8", "replace")
         for h in outside_paths(text, root):
             add("path_outside_repo", "snapshot/" + rel, h)
 
