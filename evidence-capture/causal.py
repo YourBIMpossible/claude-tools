@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -714,26 +715,83 @@ def _status_paths(status: bytes) -> list[str]:
     return sorted(out)
 
 
+SERVER_INFO_FILES = frozenset({"info/refs"})  # update-server-info's ref listing; repack and gc rewrite it
+_BRANCH_HEADER = re.compile(rb'\[[ \t]*branch[ \t]+"((?:[^"\\\r\n]|\\.)*)"[ \t]*\][ \t]*\r?\n?', re.IGNORECASE)
+
+
+def _checked_out_branch(gitdir: Path) -> bytes | None:
+    """This worktree's branch name from its ``HEAD``; ``None`` when HEAD is detached."""
+    # No HEAD raises FileNotFoundError by intent: the side records that error and no state (git cannot use it either).
+    head = (gitdir / "HEAD").read_bytes().strip()
+    return head[len(b"ref: refs/heads/"):] if head.startswith(b"ref: refs/heads/") else None
+
+
+def _continues(line: bytes) -> bool:
+    """True when ``line`` ends in an unescaped backslash, which git reads as a value going on
+    over the next line (``\\r\\n`` counts as the newline). Also true in a comment, where git
+    does not continue: over-reporting only keeps more of the file."""
+    body = line[:-1] if line.endswith(b"\n") else line
+    if line.endswith(b"\r\n"):
+        body = body[:-1]
+    return (len(body) - len(body.rstrip(b"\\"))) % 2 == 1
+
+
+def own_branch_config(config: bytes, branch: bytes | None) -> bytes:
+    """``config`` without the ``[branch "<name>"]`` sections of every branch other than
+    ``branch`` (the checked-out one; ``None``: detached, so no branch section applies).
+
+    Lines end at ``\\n`` only, as in git: a lone ``\\r`` is part of the line. A file with a
+    line that may continue a value (``_continues``) is returned whole, because a ``[`` line
+    after it can be value text rather than a header. Git never writes such a line. Only a
+    header as git writes it (``[branch "<name>"]`` alone on its line) starts a dropped
+    section, and the next line opening with ``[`` ends it. Anything unusual is kept, so an
+    odd file can make the shared state look changed, never unchanged."""
+    lines = [ln + b"\n" for ln in config.split(b"\n")]
+    lines[-1] = lines[-1][:-1]  # the text after the last newline, usually empty
+    if any(_continues(ln) for ln in lines):
+        return config
+    out: list[bytes] = []
+    dropping = False
+    for line in lines:
+        if line.lstrip().startswith(b"["):
+            m = _BRANCH_HEADER.fullmatch(line.lstrip())
+            dropping = m is not None and re.sub(rb"\\(.)", rb"\1", m.group(1)) != branch
+        if not dropping:
+            out.append(line)
+    return b"".join(out)
+
+
 def shared_git_state(repo: Path) -> str:
     """sha256 over the repository state every worktree shares and that can change how this
     checkout behaves: the common ``config``, ``info/`` (exclude, attributes, sparse
-    settings) and ``hooks/``, plus this worktree's own ``HEAD`` reference text. Other
-    worktrees' branch refs and objects are deliberately outside it (they cannot alter
-    this checkout's files or configuration)."""
+    settings) and ``hooks/``, plus this worktree's own ``HEAD`` reference text and
+    ``config.worktree``.
+
+    Deliberately outside it, because they cannot alter this checkout's files or
+    configuration: other worktrees' branch refs and objects, the ``[branch "<name>"]``
+    config sections of branches this worktree has not checked out
+    (``own_branch_config``), and ``info/refs`` (``SERVER_INFO_FILES``). Sibling worktrees
+    rewrite those routinely (``worktree add -b <b> <remote branch>``, ``push -u``,
+    ``branch -d``, gc), and counting them made every moved sibling contaminating."""
     gitdir, common = _gitdirs(repo)
+    branch = _checked_out_branch(gitdir)
     parts: list[bytes] = []
     for base in (common / "config", common / "info", common / "hooks", gitdir / "HEAD", gitdir / "config.worktree"):
         files = [base] if base.is_file() else sorted(p for p in base.rglob("*") if p.is_file()) if base.is_dir() else []
         for f in files:
-            parts.append(str(f.relative_to(common if f.is_relative_to(common) else gitdir)).replace("\\", "/").encode()
-                         + b"\0" + f.read_bytes())
+            rel = str(f.relative_to(common if f.is_relative_to(common) else gitdir)).replace("\\", "/")
+            if rel in SERVER_INFO_FILES:
+                continue
+            data = f.read_bytes()
+            parts.append(rel.encode() + b"\0" + (own_branch_config(data, branch) if f == common / "config" else data))
     return sha256_bytes(b"\0\0".join(parts))
 
 
 def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, Any]]:
     """Every OTHER worktree sharing this repository: ``{path: {"fp", "head", "paths"}}``,
     where ``fp`` is sha256(HEAD + status) and ``paths`` the paths its status names
-    (statuses run concurrently; one that cannot finish raises ``worktree_status_timeout``).
+    (statuses and their toplevel probes all run concurrently; a status that cannot finish
+    raises ``worktree_status_timeout``).
 
     A worktree whose status command fails (non-zero exit: broken gitdir pointer, locked
     index, unreadable checkout), or whose status resolved to some other repository (its
@@ -742,54 +800,74 @@ def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, A
     observed, so it is never equal to anything, not even to itself."""
     me = os.path.normcase(os.path.realpath(_git(repo, "rev-parse", "--show-toplevel").decode().strip()))
     out: dict[str, dict[str, Any]] = {}
-    procs: dict[str, tuple[bytes, subprocess.Popen[bytes]]] = {}
-    for block in _git(repo, "worktree", "list", "--porcelain", "-z").split(b"\0\0"):
-        fields = dict(f.split(b" ", 1) if b" " in f else (f, b"") for f in block.split(b"\0") if f)
-        path = fields.get(b"worktree", b"").decode("utf-8", "surrogateescape")
-        if not path or b"bare" in fields or os.path.normcase(os.path.realpath(path)) == me:
-            continue
-        if not os.path.isdir(path):
-            out[path] = {"fp": "missing", "head": None, "paths": None}
-            continue
-        procs[path] = (fields.get(b"HEAD", b""), subprocess.Popen(
-            ["git", "-C", path, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env()))
-    for path, (head, proc) in procs.items():
-        try:
-            status, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            raise CausalError("worktree_status_timeout") from None
-        if proc.returncode != 0:
-            out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
-                         "status_error": {"rc": proc.returncode,
-                                          "stderr": err.decode("utf-8", "replace").strip()[:2000]}}
-            continue
-        mismatch = _toplevel_mismatch(path, timeout)
-        if mismatch is not None:
-            out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
-                         "status_error": {"rc": 0, "stderr": mismatch}}
-            continue
-        out[path] = {"fp": sha256_bytes(head + b"\0" + status), "head": head.decode() or None,
-                     "paths": _status_paths(status)}
+    procs: dict[str, tuple[bytes, subprocess.Popen[bytes], subprocess.Popen[bytes]]] = {}
+    try:
+        for block in _git(repo, "worktree", "list", "--porcelain", "-z").split(b"\0\0"):
+            fields = dict(f.split(b" ", 1) if b" " in f else (f, b"") for f in block.split(b"\0") if f)
+            path = fields.get(b"worktree", b"").decode("utf-8", "surrogateescape")
+            if not path or b"bare" in fields or os.path.normcase(os.path.realpath(path)) == me:
+                continue
+            if not os.path.isdir(path):
+                out[path] = {"fp": "missing", "head": None, "paths": None}
+                continue
+            # the toplevel probe starts beside the status: N worktrees cost one round trip, not N
+            proc = subprocess.Popen(["git", "-C", path, "status", "--porcelain=v2", "-z", "--untracked-files=all"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env())
+            try:
+                probe = _toplevel_probe(path)
+            except BaseException:  # this status is not in procs yet, so the reaping below would miss it
+                proc.kill()
+                proc.communicate()
+                raise
+            procs[path] = (fields.get(b"HEAD", b""), proc, probe)
+        for path, (head, proc, probe) in procs.items():
+            try:
+                status, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                raise CausalError("worktree_status_timeout") from None
+            if proc.returncode != 0:
+                out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
+                             "status_error": {"rc": proc.returncode,
+                                              "stderr": err.decode("utf-8", "replace").strip()[:2000]}}
+                continue
+            mismatch = _toplevel_mismatch(path, timeout, probe)
+            if mismatch is not None:
+                out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
+                             "status_error": {"rc": 0, "stderr": mismatch}}
+                continue
+            out[path] = {"fp": sha256_bytes(head + b"\0" + status), "head": head.decode() or None,
+                         "paths": _status_paths(status)}
+    finally:
+        for _, *started in procs.values():
+            for p in started:  # never waited on (a status past its timeout, a probe not needed): reap it
+                if p.returncode is None:
+                    p.kill()
+                    p.communicate()
     return out
 
 
-def _toplevel_mismatch(path: str, timeout: float) -> str | None:
+def _toplevel_probe(path: str) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env())
+
+
+def _toplevel_mismatch(path: str, timeout: float, probe: subprocess.Popen[bytes] | None = None) -> str | None:
     """Prove the status just taken was of ``path`` itself. A worktree whose ``.git`` marker
     is gone makes git walk up to an enclosing repository (the house layout nests lanes
     in an ignored directory inside the repository): status then exits 0 with
     no output whatever changed inside. Returns the reason when the toplevel git resolves
-    for ``path`` is not ``path``, or when it cannot be resolved; ``None`` when it matches."""
+    for ``path`` is not ``path``, or when it cannot be resolved; ``None`` when it matches.
+    ``probe``: a ``_toplevel_probe(path)`` already running (else one is started here)."""
+    proc = probe if probe is not None else _toplevel_probe(path)
     try:
-        res = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True,
-                             env=git_env(), timeout=timeout)
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
         return "toplevel unresolved: timeout"
-    if res.returncode != 0:
-        return f"toplevel unresolved: rc {res.returncode}: {res.stderr.decode('utf-8', 'replace').strip()[:500]}"
-    got = res.stdout.decode("utf-8", "surrogateescape").strip()
+    if proc.returncode != 0:
+        return f"toplevel unresolved: rc {proc.returncode}: {stderr.decode('utf-8', 'replace').strip()[:500]}"
+    got = stdout.decode("utf-8", "surrogateescape").strip()
     if os.path.normcase(os.path.realpath(got)) != os.path.normcase(os.path.realpath(path)):
         return f"toplevel mismatch: {got}"
     return None
