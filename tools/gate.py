@@ -19,7 +19,9 @@ and under Windows PowerShell 5.1 (the shell the scheduled tasks use), as CI's tw
 The steps run in parallel, each with its own temporary directory, and their output is buffered: a passing step prints
 one line, a failing step prints all of its output (`--verbose` prints every step's output). Every step runs even when
 another fails, so one run shows every problem. The last line of output is the verdict (`GATE PASS ...` or
-`GATE FAIL ...`), and the exit status is 0 only for a pass.
+`GATE FAIL ...`), and the exit status is 0 only for a pass. The pass line is read alone, so it says what it does not
+cover: `GATE PASS: 29 of 29 steps passed; 4 suites not run here (listed above)` when this machine left suites out, and
+`... (publication scans only, no test suite)` for `--scans-only`.
 
 gitleaks is found through $GITLEAKS_BIN, then PATH, then <home>/.claude/bin (where the profile's tools/git_gate.py installs
 it), then this repo's bin/ (bin/README.md). Missing gitleaks fails the gate: the secret scan is not optional.
@@ -30,6 +32,8 @@ Usage:
   python tools/gate.py              # the whole gate, from anywhere inside the repository
   python tools/gate.py --verbose    # the same, printing every step's output (what CI runs)
   python tools/gate.py --root DIR   # another checkout of this repository
+  python tools/gate.py --scans-only --root DIR   # boundary, machine paths and secrets only, of DIR, with THIS
+                                                 # checkout's scanners and allowlists (see scan_steps)
 """
 from __future__ import annotations
 
@@ -82,6 +86,8 @@ TEST_SUITES = (
     ("scheduling/test_run_hidden.py", "windows"),
 )
 GUARD = ".github/scripts/check_machine_paths.py"
+MACHINE_PATHS_ALLOW = ".machine-paths-allow.json"
+GITLEAKS_CONFIG = ".gitleaks.toml"
 EVIDENCE_COMPILER_PIN = "1cdc625c4c18ea95994eaf424b039b06e9387d6c"  # the commit ci.yml installs
 EVIDENCE_COMPILER_SOURCE = "git+https://github.com/YourBIMpossible/evidence-compiler@" + EVIDENCE_COMPILER_PIN
 
@@ -141,6 +147,38 @@ def default_steps(root: Path, python: str = sys.executable, windows: bool = os.n
     return steps, skipped
 
 
+def scan_steps(root: Path, python: str = sys.executable, own: Path = DEFAULT_ROOT) -> list[Step]:
+    """The checks that decide whether a commit's content may be published: the public-boundary check, the
+    machine-paths scan and the secret scan. No test suite: a red test in an earlier commit is not a leak.
+
+    The pre-push hook runs these (`--scans-only`) on every pushed commit before the tip, because every pushed commit
+    stays in the public history. It runs the TIP's copy of this file on the earlier commit's checkout (`root`).
+
+    Everything that decides the verdict then comes from `own`, the checkout this file belongs to (the tip), and
+    nothing from `root`: both scanners, their allowlists (tools/public-boundary-exceptions.json,
+    tools/private-identifiers.sha256, .machine-paths-allow.json) and .gitleaks.toml. A commit scanned with its own
+    copies could relax the scan for itself (add an exception, allowlist a path, replace a scanner) and a later commit
+    could put things back, so the leak would be published with the gate passing. An exception has to be in the tip,
+    where the whole gate and the review see it. `root`'s own copies of those files are still scanned as content.
+
+    An allowlist entry of the tip's that matches nothing in an earlier commit is not a failure there (the entry may
+    have been added later in the range); the tip's own run fails a stale entry."""
+    gate = str(Path(__file__).resolve())
+    if root.resolve() == own.resolve():  # this checkout scanning itself: its scanners and config are the tip's
+        return [
+            Step("public-boundary check", [python, "tools/pre_publish_check.py"]),
+            Step("machine-paths guard scan", [python, GUARD]),
+            Step("gitleaks secret scan", [python, gate, "--secret-scan", "--root", str(root)]),
+        ]
+    own = own.resolve()
+    return [
+        Step("public-boundary check", [python, str(own / "tools" / "pre_publish_check.py"), "--config-root", str(own)]),
+        Step("machine-paths guard scan", [python, str(own / GUARD), "--root", str(root),
+                                          "--allow", str(own / MACHINE_PATHS_ALLOW), "--ignore-stale"]),
+        Step("gitleaks secret scan", [python, gate, "--secret-scan", "--root", str(root), "--config-root", str(own)]),
+    ]
+
+
 def find_gitleaks(root: Path, environ: dict | None = None,
                   which: Callable[[str], str | None] = shutil.which) -> str | None:
     environ = os.environ if environ is None else environ
@@ -169,9 +207,15 @@ def tracked_files(root: Path) -> list[str] | None:
     return [p for p in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
-def secret_scan(root: Path, out: TextIO) -> int:
-    """gitleaks over the tracked tree, as CI scans its fresh checkout: ignored and untracked files are not published."""
-    gitleaks = find_gitleaks(root)
+def secret_scan(root: Path, out: TextIO, config_root: Path | None = None) -> int:
+    """gitleaks over the tracked tree, as CI scans its fresh checkout: ignored and untracked files are not published.
+
+    The gitleaks config is `config_root`'s .gitleaks.toml (default: root's own). The pre-push hook passes the tip's
+    checkout when it scans an earlier commit, so that commit's own .gitleaks.toml cannot allowlist its own secret.
+    The gitleaks binary is looked up from `config_root` too: the last place looked is a checkout's bin/, and an
+    earlier commit that ships its own bin/gitleaks must not be scanned by it (it could find nothing on purpose)."""
+    config = (config_root or root) / GITLEAKS_CONFIG
+    gitleaks = find_gitleaks(config_root or root)
     if not gitleaks:
         print(f"gitleaks not found ($GITLEAKS_BIN, PATH, <home>/.claude/bin, bin/). Install {GITLEAKS_PIN}: run the "
               "profile's `python tools/git_gate.py`, or follow bin/README.md. The secret scan is required.", file=out)
@@ -187,8 +231,8 @@ def secret_scan(root: Path, out: TextIO) -> int:
                     (source / rel).parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(src, source / rel)
         argv = [gitleaks, "detect", "--source", str(source), "--no-git", "--redact", "--no-banner"]
-        if (root / ".gitleaks.toml").is_file():
-            argv += ["--config", str(root / ".gitleaks.toml")]
+        if config.is_file():
+            argv += ["--config", str(config)]
         try:
             proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                   text=True, encoding="utf-8", errors="replace")
@@ -236,11 +280,18 @@ def run_steps(steps: list[Step], cwd: Path, out: TextIO, verbose: bool = False,
     return failed, len(steps)
 
 
-def main(argv: list[str] | None = None, steps: list[Step] | None = None, out: TextIO | None = None) -> int:
+def main(argv: list[str] | None = None, steps: list[Step] | None = None, out: TextIO | None = None,
+         skipped: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="repository root (default: this clone)")
     ap.add_argument("--verbose", action="store_true", help="print every step's output, not only a failing step's")
     ap.add_argument("--secret-scan", action="store_true", help="run only the gitleaks step (the gate runs it so)")
+    ap.add_argument("--scans-only", action="store_true",
+                    help="run only the publication scans (boundary, machine paths, secrets) and no test suite; "
+                         "the pre-push hook runs this on each pushed commit before the tip")
+    ap.add_argument("--config-root", type=Path,
+                    help="with --secret-scan: take .gitleaks.toml from this checkout, not from --root "
+                         "(the scans of an earlier pushed commit use the tip's)")
     args = ap.parse_args(argv)
     out = out or sys.stdout
     for stream in (sys.stdout, sys.stderr):  # step output is relayed as text; never die on a console codec
@@ -248,11 +299,16 @@ def main(argv: list[str] | None = None, steps: list[Step] | None = None, out: Te
             stream.reconfigure(encoding="utf-8", errors="replace")
     root = args.root.resolve()
     if args.secret_scan:
-        return secret_scan(root, out)
-    if steps is None:
+        return secret_scan(root, out, args.config_root.resolve() if args.config_root else None)
+    scope = ""
+    if steps is None and args.scans_only:
+        steps, skipped = scan_steps(root), []
+        scope = " (publication scans only, no test suite)"
+    elif steps is None:
         steps, skipped = default_steps(root)
-        for line in skipped:
-            print(line, file=out)
+    skipped = skipped or []
+    for line in skipped:
+        print(line, file=out)
     failed, total = run_steps(steps, root, out, verbose=args.verbose)
     if total == 0:
         print("GATE FAIL: no steps ran, so nothing was checked", file=out, flush=True)
@@ -260,7 +316,10 @@ def main(argv: list[str] | None = None, steps: list[Step] | None = None, out: Te
     if failed:
         print(f"GATE FAIL: {len(failed)} of {total} steps failed: {', '.join(failed)}", file=out, flush=True)
         return 1
-    print(f"GATE PASS: {total} of {total} steps passed", file=out, flush=True)
+    # The verdict line is read alone, so it carries what it does not cover: the suites this machine left out.
+    if skipped:
+        scope += f"; {len(skipped)} suite{'' if len(skipped) == 1 else 's'} not run here (listed above)"
+    print(f"GATE PASS: {total} of {total} steps passed{scope}", file=out, flush=True)
     return 0
 
 

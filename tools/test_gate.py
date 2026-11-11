@@ -237,6 +237,66 @@ def main() -> int:
                                                     "!= 'powershell.exe')"), (("GRAPHIFY_TEST_SHELL", "powershell.exe"),))])
     check("a step's own environment reaches it", code == 0, text)
 
+    print("the verdict counts what was left out (SA09-2)")
+    one = [gate.Step("one", py("print('one ran')"))]
+    left_out = ["not run here (Windows only): a/test_a.py", "not run here (no pwsh on PATH): b/test_b.py"]
+    out = io.StringIO()
+    code = gate.main(["--root", str(REPO)], steps=one, out=out, skipped=left_out)
+    text = out.getvalue()
+    check("a pass with suites left out says how many, in the verdict line", code == 0
+          and lines_of(text)[-1] == "GATE PASS: 1 of 1 steps passed; 2 suites not run here (listed above)", text)
+    check("each left-out suite is still listed before the verdict", all(ln in lines_of(text)[:-1] for ln in left_out),
+          text)
+    out = io.StringIO()
+    code = gate.main(["--root", str(REPO)], steps=one, out=out, skipped=left_out[:1])
+    check("one left-out suite reads as one", code == 0
+          and lines_of(out.getvalue())[-1] == "GATE PASS: 1 of 1 steps passed; 1 suite not run here (listed above)",
+          out.getvalue())
+    code, text = run_main(gate, one)
+    check("a pass with nothing left out keeps the plain verdict",
+          code == 0 and lines_of(text)[-1] == "GATE PASS: 1 of 1 steps passed", text)
+
+    print("publication scans only (SA09-1)")
+    scans = gate.scan_steps(REPO, "python")
+    check("the publication scans are the boundary check, the machine-paths scan and the secret scan",
+          [s.label for s in scans] == ["public-boundary check", "machine-paths guard scan", "gitleaks secret scan"],
+          str([s.label for s in scans]))
+    check("the secret scan step runs this gate, not the scanned commit's copy",
+          Path(scans[-1].argv[1]).resolve() == (REPO / "tools" / "gate.py").resolve()
+          and scans[-1].argv[2:] == ["--secret-scan", "--root", str(REPO)], str(scans[-1].argv))
+    # PR 50 review F1: another checkout (an earlier pushed commit) is scanned with THIS checkout's scanners and
+    # allowlists, so that commit cannot relax the scan for itself.
+    with tempfile.TemporaryDirectory() as td:
+        other = Path(td).resolve()
+        foreign = gate.scan_steps(other, "python")
+        own = REPO.resolve()
+        check("another checkout keeps the same three scans",
+              [s.label for s in foreign] == [s.label for s in scans], str([s.label for s in foreign]))
+        check("its boundary check is this checkout's scanner with this checkout's exceptions",
+              foreign[0].argv == ["python", str(own / "tools" / "pre_publish_check.py"), "--config-root", str(own)],
+              str(foreign[0].argv))
+        check("its machine-paths scan is this checkout's guard with this checkout's allowlist",
+              foreign[1].argv == ["python", str(own / gate.GUARD), "--root", str(other), "--allow",
+                                  str(own / ".machine-paths-allow.json"), "--ignore-stale"], str(foreign[1].argv))
+        check("its secret scan takes .gitleaks.toml from this checkout",
+              Path(foreign[2].argv[1]).resolve() == (REPO / "tools" / "gate.py").resolve()
+              and foreign[2].argv[2:] == ["--secret-scan", "--root", str(other), "--config-root", str(own)],
+              str(foreign[2].argv))
+        check("no scan step of another checkout runs a file of that checkout",
+              all(not Path(a).resolve().is_relative_to(other) for s in foreign for a in s.argv[1:2]),
+              str([s.argv for s in foreign]))
+    saved_scan_steps = gate.scan_steps
+    gate.scan_steps = lambda root:[gate.Step("stub scan", py("print('stub scan ran')"))]
+    try:
+        out = io.StringIO()
+        code = gate.main(["--root", str(REPO), "--scans-only"], out=out)
+    finally:
+        gate.scan_steps = saved_scan_steps
+    text = out.getvalue()
+    check("--scans-only runs the scans and no suite, and its verdict says so", code == 0
+          and lines_of(text) == ["<== stub scan: ok in " + lines_of(text)[0].rsplit(" in ", 1)[-1],
+                                 "GATE PASS: 1 of 1 steps passed (publication scans only, no test suite)"], text)
+
     print("secret scan")
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -257,6 +317,17 @@ def main() -> int:
             gate.find_gitleaks = saved
         check("missing gitleaks fails the scan and names the fix", rc == 1 and "git_gate.py" in out.getvalue()
               and "required" in out.getvalue(), out.getvalue())
+        # Review N1: the binary is looked up where the config is, never in the scanned tree.
+        looked: list[Path] = []
+        gate.find_gitleaks = lambda r, environ=None, which=None: looked.append(Path(r)) or None
+        try:
+            with tempfile.TemporaryDirectory() as other:
+                gate.secret_scan(root, io.StringIO(), config_root=Path(other))
+                gate.secret_scan(root, io.StringIO())
+                check("the scanner is looked up from the config's checkout, and from the scanned one only when "
+                      "they are the same", looked == [Path(other), root], str(looked))
+        finally:
+            gate.find_gitleaks = saved
 
     gitleaks = gate.find_gitleaks(REPO)
     check("gitleaks is installed here (the gate needs it)", gitleaks is not None,

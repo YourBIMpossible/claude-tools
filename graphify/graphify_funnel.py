@@ -513,6 +513,12 @@ def norm(p: str | Path) -> str:
     return os.path.normcase(os.path.normpath(str(p)))
 
 
+def under_dir(path: str, parent: str) -> bool:
+    """True when ``path`` is ``parent`` or lies inside it; both are ``norm()`` results. The match stops at a path
+    separator, so a sibling that only shares the leading characters (Temp2, Templates beside Temp) is outside."""
+    return path == parent or path.startswith(parent if parent.endswith(os.sep) else parent + os.sep)
+
+
 # --------------------------------------------------------------------------- config
 
 FUNNEL_KEYS = {"hint_live_since", "exclude_temp_cwd", "exclude_sessions"}
@@ -1262,7 +1268,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     for s in sessions:
         if s.session_id in excludes:
             s.excluded = str(excludes[s.session_id])
-        elif tmp and s.cwd and norm(os.path.realpath(s.cwd)).startswith(tmp):
+        elif tmp and s.cwd and under_dir(norm(os.path.realpath(s.cwd)), tmp):
             s.excluded = "cwd in system temp dir"
         if s.cwd:
             r = resolver.resolve(s.cwd)

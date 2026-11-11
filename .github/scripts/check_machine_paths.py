@@ -146,7 +146,9 @@ def tracked_files(root: Path) -> list[str]:
     return sorted(p for p in out.decode("utf-8", errors="surrogateescape").split("\0") if p)
 
 
-def check(root: Path, allow_path: Path) -> int:
+def check(root: Path, allow_path: Path, ignore_stale: bool = False) -> int:
+    """ignore_stale: an entry that covers nothing is not a failure. For scanning a tree with ANOTHER tree's
+    allowlist (an earlier pushed commit with the tip's), where an entry may cover a file that tree lacks."""
     allow = load_allowlist(allow_path)
     findings, binary, scanned = [], 0, 0
     for rel in tracked_files(root):
@@ -181,7 +183,7 @@ def check(root: Path, allow_path: Path) -> int:
                 if len(excerpt) > 160:
                     excerpt = excerpt[:157] + "..."
                 findings.append(f"{rel}:{lineno}: {rid} ({text_hit!r}): {excerpt}")
-    stale = [e for e in allow if e["used"] == 0]
+    stale = [] if ignore_stale else [e for e in allow if e["used"] == 0]
     for line in findings:
         print(line)
     for e in stale:
@@ -287,6 +289,13 @@ def _repo_cases() -> list[tuple[str, bool]]:
         allow.append({"path": "docs/**", "reason": "covers nothing"})
         (root / ALLOW_FILE).write_text(json.dumps(allow), encoding="utf-8")
         cases.append(("stale entry fails the run", run(root) == 1))
+        with contextlib.redirect_stdout(io.StringIO()):
+            cases.append(("--ignore-stale passes a stale entry", check(root, root / ALLOW_FILE, True) == 0))
+            (root / "other.md").write_text(_expand("See <D>/other/x\n"), encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True)
+            cases.append(("--ignore-stale still fails a finding", check(root, root / ALLOW_FILE, True) == 1))
+            (root / "other.md").unlink()
+            subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True)
         (root / ALLOW_FILE).write_text(json.dumps([{"path": "*.py"}]), encoding="utf-8")
         cases.append(("entry without reason is a config error", run(root) == 2))
     return cases
@@ -296,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", type=Path, help="repository root (default: the git repo containing the cwd)")
     ap.add_argument("--allow", type=Path, help=f"allowlist file (default: <root>/{ALLOW_FILE})")
+    ap.add_argument("--ignore-stale", action="store_true",
+                    help="do not fail on an allowlist entry that covers nothing (with --allow from another tree)")
     ap.add_argument("--self-test", action="store_true", help="run the built-in rule cases and exit")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # findings quote file text; never die on a console codec
@@ -311,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
             root = Path(top.stdout.strip())
         else:
             root = args.root.resolve()
-        return check(root, args.allow or root / ALLOW_FILE)
+        return check(root, args.allow or root / ALLOW_FILE, args.ignore_stale)
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return 2
