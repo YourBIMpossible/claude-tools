@@ -271,8 +271,19 @@ def main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[0] == "--hash-line":
         print(sha256(argv[1].strip()))
         return 0
+    # --config-root DIR: scan the repository containing the cwd with DIR's identifiers and exceptions, read from
+    # DIR's files, and nothing of the scanned tree's own. The pre-push hook scans an earlier pushed commit this way
+    # with the tip's checkout, so that commit cannot except its own marker. An exception that matches nothing is
+    # then not a failure: it may cover a line a later commit adds.
+    config_root: Path | None = None
+    if len(argv) == 2 and argv[0] == "--config-root":
+        config_root = Path(argv[1])
+        if not config_root.is_dir():
+            print(f"CONFIG ERROR: --config-root is not a directory: {config_root}")
+            return 1
+        argv = []
     if argv:
-        print("usage: pre_publish_check.py [--hash-identifier NAME | --hash-line TEXT]")
+        print("usage: pre_publish_check.py [--hash-identifier NAME | --hash-line TEXT | --config-root DIR]")
         return 2
 
     root = Path(git("rev-parse", "--show-toplevel").strip())
@@ -281,6 +292,14 @@ def main(argv: list[str]) -> int:
     index_sha = {path: sha for path, label, sha in blobs if path == label}
 
     def config_text(rel: str) -> str | None:
+        if config_root is not None:
+            path = config_root / rel
+            if not path.is_file():
+                return None
+            text = decode(path.read_bytes())
+            if text is None:
+                raise ValueError(f"{rel}: not readable as text from {config_root}")
+            return text
         if rel in index_sha:
             data = contents[index_sha[rel]]
             text = decode(data) if data is not None else None
@@ -332,8 +351,8 @@ def main(argv: list[str]) -> int:
                 marker_hits.append(
                     f"{label}:{n}  [{rid}]  {excerpt}  line_sha256={line_hash[:16]}")
 
-    stale = [f"{k[0]}  [{k[1]}]  line_sha256={k[2][:16]}"
-             for k in sorted(exc_keys - used)]
+    stale = [] if config_root is not None else [f"{k[0]}  [{k[1]}]  line_sha256={k[2][:16]}"
+                                                for k in sorted(exc_keys - used)]
 
     print(f"pre-publish check: {len(files)} tracked files ({len(blobs)} blobs scanned), "
           f"{len(COMPILED) + 1} content rules, {len(ids)} private identifiers, "

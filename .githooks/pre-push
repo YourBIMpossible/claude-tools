@@ -16,8 +16,12 @@
 #       * the tip commit: the whole gate;
 #       * every earlier commit the remote does not have yet: the publication scans only (`gate.py --scans-only`:
 #         public-boundary check, machine-paths scan, secret scan), oldest first. No test suite runs on those: a red
-#         test in an earlier commit is not a leak. The scans are run by the TIP's gate.py, so an earlier commit
-#         that predates `--scans-only` is still scanned.
+#         test in an earlier commit is not a leak. The scans are run by the TIP's gate.py, with the TIP's scanners
+#         and the TIP's allowlists (.machine-paths-allow.json, tools/public-boundary-exceptions.json,
+#         tools/private-identifiers.sha256, .gitleaks.toml), never the earlier commit's own: scanned with its own,
+#         a commit could except its own leak and a later commit could remove the exception again. So content that
+#         needs an exception passes only when the exception is still in the tip, and an earlier commit that
+#         predates `--scans-only` is still scanned.
 #     "The remote does not have yet" = not reachable from the pushed ref's old value on the remote, nor from any of
 #     this clone's remote-tracking refs for that remote (so commits merged in from the default branch are not
 #     scanned again). A push to a bare URL has no tracking refs: every commit not under the old value is scanned.
@@ -159,6 +163,7 @@ if [ "$failed" -ne 0 ]; then
     echo "pre-push: fix the failures above, commit, push again. A vetted exception goes in the scanner's" >&2
     echo "pre-push: allowlist (.machine-paths-allow.json, tools/public-boundary-exceptions.json, .gitleaks.toml), not a bypass." >&2
     echo "pre-push: a failure in an EARLIER commit stays in history: rewrite that commit (rebase or squash), then push again." >&2
+    echo "pre-push: an earlier commit is scanned with the TIP's scanners and allowlists: an exception it needs must still be in the tip." >&2
     exit 1
 fi
 echo "pre-push: gate passed" >&2

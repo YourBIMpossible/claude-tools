@@ -10,7 +10,9 @@ literals are assembled at runtime so this file itself stays clean.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import stat
@@ -24,6 +26,8 @@ HOOK = ".githooks/pre-push"
 GATE = "tools/gate.py"
 MACHINE_PATHS = ".github/scripts/check_machine_paths.py"
 PRE_PUBLISH = "tools/pre_publish_check.py"
+EXCEPTIONS = "tools/public-boundary-exceptions.json"
+MACHINE_ALLOW = ".machine-paths-allow.json"
 COPIED = (HOOK, GATE, MACHINE_PATHS, PRE_PUBLISH, "local-audit/slop_prepass.py", ".gitleaks.toml")
 BS = "\\"
 DRIVE = "Q:"                                       # synthetic drive letter
@@ -123,6 +127,26 @@ def scanner_report(src: Path, rel: str) -> str:
 def verdict(out: str) -> str:
     lines = [ln for ln in out.splitlines() if ln.startswith("GATE ")]
     return lines[-1] if lines else ""
+
+
+def line_exception(path: str, rule: str, line: str) -> dict[str, str]:
+    """A public-boundary exception for one line, as tools/public-boundary-exceptions.json holds it."""
+    return {"path": path, "rule": rule, "line_sha256": hashlib.sha256(line.strip().encode("utf-8")).hexdigest(),
+            "reason": "granted by the commit that needs it"}
+
+
+def head(src: Path) -> str:
+    return git(src, "rev-parse", "HEAD").strip()[:12]
+
+
+def failed_steps(out: str, short: str) -> str:
+    """The GATE FAIL line of the scan the hook attributes to commit `short` ('' when that scan did not fail)."""
+    lines = out.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.startswith("pre-push: FAILED") and f"[{short}, " in ln:
+            verdicts = [x for x in lines[:i] if x.startswith("GATE ")]
+            return verdicts[-1] if verdicts else ""
+    return ""
 
 
 def branch(src: Path, name: str) -> None:
@@ -260,6 +284,77 @@ def main() -> int:
         rc, out = run(src, "git", "push", "-q", "origin", "several")
         check("a later push scans nothing the remote already has",
               rc == 0 and "pre-push: scanning " not in out, out)
+
+        # PR 50 review F1: an earlier commit is scanned with the TIP's scanners and allowlists, never its own.
+        # Scanned with its own, a commit could relax the scan for itself and a later commit could tidy up after it.
+        print("earlier commit excepts its own private marker")
+        branch(src, "selfexcept")
+        contact = f"Ask {PRIVATE_EMAIL} for access."
+        write(src, EXCEPTIONS, json.dumps([line_exception("docs/contact.md", "email-address", contact)]))
+        commit(src, "docs/contact.md", contact + "\n", "add a private email and except it")
+        widened = head(src)
+        git(src, "rm", "-q", "docs/contact.md", EXCEPTIONS)
+        git(src, "commit", "-q", "-m", "remove the email and the exception")
+        rc, out = run(src, "git", "push", "-q", "origin", "selfexcept")
+        check("an earlier commit that excepts its own private marker is refused",
+              rc != 0 and not remote_has(src, "selfexcept"), out)
+        check("the refusal is the public-boundary check on that commit",
+              "public-boundary check" in failed_steps(out, widened), out)
+
+        print("earlier commit allowlists its own secret")
+        branch(src, "selfsecret")
+        write(src, ".gitleaks.toml", "[extend]\nuseDefault = true\n\n[allowlist]\n"
+              "description = \"self-granted\"\npaths = ['''config[/\\\\]settings\\.txt''']\n")
+        commit(src, "config/settings.txt", f"token = {FAKE_TOKEN}\n", "add a secret and allowlist its file")
+        widened = head(src)
+        git(src, "checkout", "-q", "main", "--", ".gitleaks.toml")
+        git(src, "rm", "-q", "config/settings.txt")
+        git(src, "commit", "-q", "-m", "remove the secret, restore the config")
+        rc, out = run(src, "git", "push", "-q", "origin", "selfsecret")
+        check("an earlier commit that allowlists its own secret is refused",
+              rc != 0 and not remote_has(src, "selfsecret"), out)
+        check("the refusal is the secret scan on that commit",
+              "gitleaks secret scan" in failed_steps(out, widened) and FAKE_TOKEN not in out, out)
+
+        print("earlier commit allowlists its own machine path")
+        branch(src, "selfpath")
+        note = f"See {DRIVE}{BS}work{BS}repo{BS}notes.md for details."
+        write(src, MACHINE_ALLOW, json.dumps([{"path": "docs/notes.md", "reason": "self-granted"}]))
+        write(src, EXCEPTIONS, json.dumps([line_exception("docs/notes.md", "windows-drive-path", note)]))
+        commit(src, "docs/notes.md", note + "\n", "add a drive path and allowlist it twice")
+        widened = head(src)
+        git(src, "rm", "-q", "docs/notes.md", MACHINE_ALLOW, EXCEPTIONS)
+        git(src, "commit", "-q", "-m", "remove the path and both entries")
+        rc, out = run(src, "git", "push", "-q", "origin", "selfpath")
+        check("an earlier commit that allowlists its own machine path is refused",
+              rc != 0 and not remote_has(src, "selfpath"), out)
+        check("both path scans fail on that commit", "machine-paths guard scan" in failed_steps(out, widened)
+              and "public-boundary check" in failed_steps(out, widened), out)
+
+        print("earlier commit replaces a scanner")
+        branch(src, "selfscanner")
+        write(src, PRE_PUBLISH, "print('PASS: nothing looked at')\n")
+        commit(src, "docs/contact.md", contact + "\n", "add a private email and gut the scanner")
+        widened = head(src)
+        git(src, "checkout", "-q", "main", "--", PRE_PUBLISH)
+        git(src, "rm", "-q", "docs/contact.md")
+        git(src, "commit", "-q", "-m", "remove the email, restore the scanner")
+        rc, out = run(src, "git", "push", "-q", "origin", "selfscanner")
+        check("an earlier commit that replaces a scanner is refused",
+              rc != 0 and not remote_has(src, "selfscanner"), out)
+        check("the tip's scanner is the one that ran on it",
+              "public-boundary check" in failed_steps(out, widened) and "[email-address]" in out, out)
+
+        print("allowlist entries that stay to the tip")
+        branch(src, "keptentry")
+        commit(src, "docs/one.md", "First.\n", "a clean commit before the entry exists")
+        write(src, EXCEPTIONS, json.dumps([line_exception("docs/contact.md", "email-address", contact)]))
+        commit(src, "docs/contact.md", contact + "\n", "add a fixture with its exception")
+        commit(src, "docs/two.md", "Second.\n", "a clean commit after it")
+        rc, out = run(src, "git", "push", "-q", "origin", "keptentry")
+        check("a range whose exception is still in the tip pushes", rc == 0 and remote_has(src, "keptentry"), out)
+        check("the tip's entry does not fail the commit that predates what it covers",
+              out.count("pre-push: scanning ") == 2 and "pre-push: FAILED" not in out, out)
 
         print("commit without the gate")
         branch(src, "nogate")

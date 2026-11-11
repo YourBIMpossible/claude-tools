@@ -264,8 +264,29 @@ def main() -> int:
     check("the secret scan step runs this gate, not the scanned commit's copy",
           Path(scans[-1].argv[1]).resolve() == (REPO / "tools" / "gate.py").resolve()
           and scans[-1].argv[2:] == ["--secret-scan", "--root", str(REPO)], str(scans[-1].argv))
+    # PR 50 review F1: another checkout (an earlier pushed commit) is scanned with THIS checkout's scanners and
+    # allowlists, so that commit cannot relax the scan for itself.
+    with tempfile.TemporaryDirectory() as td:
+        other = Path(td).resolve()
+        foreign = gate.scan_steps(other, "python")
+        own = REPO.resolve()
+        check("another checkout keeps the same three scans",
+              [s.label for s in foreign] == [s.label for s in scans], str([s.label for s in foreign]))
+        check("its boundary check is this checkout's scanner with this checkout's exceptions",
+              foreign[0].argv == ["python", str(own / "tools" / "pre_publish_check.py"), "--config-root", str(own)],
+              str(foreign[0].argv))
+        check("its machine-paths scan is this checkout's guard with this checkout's allowlist",
+              foreign[1].argv == ["python", str(own / gate.GUARD), "--root", str(other), "--allow",
+                                  str(own / ".machine-paths-allow.json"), "--ignore-stale"], str(foreign[1].argv))
+        check("its secret scan takes .gitleaks.toml from this checkout",
+              Path(foreign[2].argv[1]).resolve() == (REPO / "tools" / "gate.py").resolve()
+              and foreign[2].argv[2:] == ["--secret-scan", "--root", str(other), "--config-root", str(own)],
+              str(foreign[2].argv))
+        check("no scan step of another checkout runs a file of that checkout",
+              all(not Path(a).resolve().is_relative_to(other) for s in foreign for a in s.argv[1:2]),
+              str([s.argv for s in foreign]))
     saved_scan_steps = gate.scan_steps
-    gate.scan_steps = lambda root: [gate.Step("stub scan", py("print('stub scan ran')"))]
+    gate.scan_steps = lambda root:[gate.Step("stub scan", py("print('stub scan ran')"))]
     try:
         out = io.StringIO()
         code = gate.main(["--root", str(REPO), "--scans-only"], out=out)
