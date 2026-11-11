@@ -694,8 +694,9 @@ def render_md(s: dict) -> str:
              f"segments unattributed (miss rate {_fmt(s['parse']['miss_rate'])}). "
              f"{s['parse']['paths_outside_repo']} path arguments fell outside the brief's repository "
              "(other repos, scratch, home) and are not scored. "
-             f"{s['parse'].get('paths_unresolved', 0)} path arguments could not be resolved to a working "
-             "directory and were not classified.", "",
+             f"{s['parse'].get('paths_unresolved', 0)} path arguments could not be located "
+             "(unknown working directory, $VAR/%VAR%/~ path, or `..` above the root) and were not "
+             "classified.", "",
              "Means; `n` counts episodes where the metric is defined. Lift is actual minus the "
              "shuffled same-repo baseline.", "",
              "| slice | n | " + " | ".join(cols) + " | hit lift | gap lift |",

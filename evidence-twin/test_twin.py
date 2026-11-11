@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -305,6 +306,47 @@ def test_verify_guard(tmp: Path, tasks: list[dict]) -> None:
           "the run's spend reaches the ledger")
     check(dump.is_file() and json.loads(dump.read_text(encoding="utf-8")) == [],
           "verify runs without the harness's Claude or Anthropic variables")
+    arm = plan["runs"][0]["arm"]
+    guard = twin.report([task], plan, kw["archive"], 100_000, 3)["guardrail"][arm]
+    check(guard == {"verified": 0, "checked": 0, "timed_out": 1},
+          "a timed-out verify is counted apart from a checked one (SA26-24)")
+
+
+def test_verify_kills_tree(tmp: Path) -> None:
+    """SA26-26: a verify past its limit is killed with every process it started; a grandchild
+    holding the output pipes neither outlives it nor holds the run past the limit."""
+    pidfile = tmp / "grandchild.pid"
+    script = tmp / "verify_spawns.py"
+    script.write_text("import subprocess, sys, time\n"
+                      "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                      f"open({pidfile.as_posix()!r}, 'w').write(str(p.pid))\n"
+                      "time.sleep(60)\n", encoding="utf-8")
+    t = time.monotonic()
+    verified, error = twin.run_verify([sys.executable, str(script), str(tmp)], cwd=tmp, env=dict(os.environ),
+                                      timeout=1.0)
+    took = time.monotonic() - t
+    check(verified is False and (error or "").startswith("timeout"), "a verify past its limit is a timeout")
+    check(took < 1.0 + twin.KILL_GRACE + 2.0, f"the timeout is bounded ({took:.1f}s)")
+    pid = int(pidfile.read_text(encoding="utf-8")) if pidfile.is_file() else None
+    alive = pid is not None and _alive(pid)
+    check(pid is not None and not alive, "the verify's grandchild is killed with it")
+
+
+def _alive(pid: int) -> bool:
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return str(pid) in out
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:  # a killed grandchild is reparented and reaped shortly after
+        try:
+            os.kill(pid, 0)
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                if fh.read().split(") ", 1)[1].startswith("Z"):
+                    return False
+        except (ProcessLookupError, FileNotFoundError):  # gone between the probe and the read
+            return False
+        time.sleep(0.05)
+    return True
 
 
 def test_negative_censored() -> None:
@@ -376,6 +418,7 @@ def main() -> int:
         test_batch(tmp, tasks)
         test_real(tmp)
         test_verify_guard(tmp, tasks)
+        test_verify_kills_tree(tmp)
         test_negative_censored()
         test_bench_blind(tmp)
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")

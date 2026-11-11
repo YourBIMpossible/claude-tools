@@ -203,14 +203,19 @@ def test_attribution_isolated_and_concurrent_writer(tmp: Path) -> None:
     assert bad["unattributed"] == ["pkg/new.py"] and not bad["isolated"]
 
 
+def fingerprints(repo: Path) -> dict[str, str | None]:
+    """Other worktrees' ``fp`` (``None`` when unobservable), the shape ``attribute`` compares."""
+    return {k: v["fp"] for k, v in causal.worktree_records(repo).items()}
+
+
 def test_other_worktree_movement_detected(tmp: Path) -> None:
     repo = make_repo(tmp)
     other = tmp / "other_wt"
     git(repo, "worktree", "add", "-q", "-b", "side", str(other))
-    before = causal.worktree_fingerprints(repo)
+    before = fingerprints(repo)
     assert list(before) and all(v != "missing" for v in before.values())
     (other / "a.txt").write_bytes(b"someone else")
-    after = causal.worktree_fingerprints(repo)
+    after = fingerprints(repo)
     s = causal.capture_state(repo, tmp / "s", label="start")
     res = causal.attribute(s, s, [], worktrees_start=before, worktrees_end=after)
     assert res["other_worktrees_moved"] and not res["isolated"]
@@ -319,7 +324,7 @@ def test_admission_gate(tmp: Path) -> None:
 def test_end_to_end_synthetic_episode(tmp: Path) -> None:
     repo = make_repo(tmp)
     ep = tmp / "episode"
-    wt0 = causal.worktree_fingerprints(repo)
+    wt0 = fingerprints(repo)
     s = causal.capture_state(repo, ep / "start", label="start")
     causal.freeze_history(repo, ep / "history")
     d0 = causal.dependency_fingerprint(s, TOOLS)
@@ -333,7 +338,7 @@ def test_end_to_end_synthetic_episode(tmp: Path) -> None:
               "history_problems": causal.verify_history(ep / "history"),
               "unsupported": causal.unsupported_state(repo),
               "attribution": causal.attribute(s, e, ["a.txt"], worktrees_start=wt0,
-                                              worktrees_end=causal.worktree_fingerprints(repo)),
+                                              worktrees_end=fingerprints(repo)),
               "dependency_drift": causal.dependency_drift(d0, causal.dependency_fingerprint(e, TOOLS), ["a.txt"]),
               "start_fidelity": [], "end_fidelity": [], "registration_problems": [],
               "worktrees": {"contaminating": [], "unknown": [], "shared_state_changed": False},
@@ -402,7 +407,7 @@ def test_worktree_status_failure_is_unknown_not_unmoved(tmp: Path) -> None:
     assert rec["fp"] is None and rec["paths"] is None
     assert rec["status_error"]["rc"] == 128 and rec["status_error"]["stderr"]
     assert rec["fp"] != healthy[key]["fp"]
-    assert causal.worktree_fingerprints(repo)[key] is None
+    assert fingerprints(repo)[key] is None
     # The record round-trips through JSON (the hooks persist it that way) and stays unobservable.
     broken = json.loads(json.dumps(broken))
     assert causal.unobservable_worktrees(healthy, broken) == [key]

@@ -5,6 +5,9 @@
   maintain [--quiet]   run maintenance now (the start hook launches it detached);
                        exit 0 ok, 3 warn, 4 fail, judged as the backstop judges it
   report               write the next §12 checkpoint (JSON and markdown) and commit it
+  rescreen             re-join and re-screen every joined episode; commit a corrections record;
+                       exit 0 complete, 1 skipped, 2 commit failed, 3 incomplete (an episode
+                       unread, malformed, failed or deferred; the gaps go to standard error)
   fn-audit sheet       write the next blind FN-audit sheet (plan §5.3)
   fn-audit score K     score sealed sheet K
   fn-audit amended K --note TEXT --tool-commit SHA
@@ -143,6 +146,16 @@ def main(argv: list[str] | None = None) -> int:
         if res.get("committed") is False:
             print("rescreen: corrections written but the metadata commit failed", file=sys.stderr)
             return 2
+        # a run that could not read, rescreen or reach every episode is incomplete, not clean
+        gaps = {"manifests_malformed": len(res.get("manifests_malformed") or []),
+                "manifests_unreadable": int(res.get("manifests_unreadable") or 0),
+                "child_failures": len(res.get("child_failures") or []),
+                "deferred": len(res.get("deferred") or [])}
+        if any(gaps.values()):
+            for k, n in gaps.items():
+                if n:
+                    print(f"rescreen: incomplete: {k} {n}", file=sys.stderr)
+            return 3
         return 0
     if args.cmd == "fn-audit":
         try:

@@ -204,8 +204,18 @@ def escaping_citations(brief: str) -> list[str]:
 # ``index.bin`` is a byte copy of ``.git/index``. Its stat data, object ids and flags are
 # binary numbers whose bytes can read as a path: inode 0x007e5c0e holds ``~\`` (a home
 # path), and an mtime of 0x6ae7743a before nanoseconds starting 0x2f reads ``t:/`` (a drive
-# root). Those fields are blanked before the path scan; names and extension text are
-# scanned as stored.
+# root). Those fields are blanked before the path scan, as are the ids, stat data, counts
+# and bitmaps of the TREE, REUC and UNTR extensions and the bodies of EOIE and IEOT; names
+# and text are scanned as stored, and so is any other extension, link included.
+#
+# What a blanked field can hold: counts, flags, offsets, hashes and bitmaps are checked
+# against the rest of the copy (EOIE whole, IEOT against the entries, EWAH bitmaps against
+# their size, UNTR dir_flags against git's flags), so text cannot hide in them. Object ids
+# and stat data are arbitrary bytes by nature and cannot be checked without the object store
+# and the original files, so a crafted index can carry text in them, as it can in an entry:
+# they are blanked unbounded, in TREE, REUC and UNTR as in the entries, each a fixed width
+# at a position the parse fixes. A link body (the shared index id and two bitmaps over the
+# shared index, which the copy does not hold) cannot be bounded and is scanned as stored.
 INDEX_STAT_BYTES = 40  # ctime and mtime (seconds, nanoseconds), dev, ino, mode, uid, gid, size
 
 
@@ -234,6 +244,153 @@ def _blank_cache_tree(data: bytes, out: bytearray, p: int, stop: int, hashsz: in
             p += hashsz
 
 
+REUC_MODE_RE = re.compile(rb"[0-7]{1,6}")
+
+
+def _blank_resolve_undo(data: bytes, out: bytearray, p: int, stop: int, hashsz: int) -> None:
+    """Blank the object ids in a ``REUC`` extension body: each entry is a path, three octal
+    modes and one id per nonzero mode. ValueError when it does not parse."""
+    while p < stop:
+        p = data.index(b"\0", p, stop) + 1  # the path
+        modes = []
+        for _ in range(3):
+            nul = data.index(b"\0", p, stop)
+            if not REUC_MODE_RE.fullmatch(data[p:nul]):
+                raise ValueError("resolve-undo mode is not octal")
+            modes.append(int(data[p:nul], 8))
+            p = nul + 1
+        for mode in modes:
+            if mode:
+                if p + hashsz > stop:
+                    raise ValueError("resolve-undo id truncated")
+                out[p:p + hashsz] = bytes(hashsz)
+                p += hashsz
+
+
+UNTR_STAT_BYTES = 36  # stat data without the mode: ctime, mtime, dev, ino, uid, gid, size
+# git writes DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES (6). Any value below
+# 1 << 10 is accepted; its four bytes cannot read as two text characters.
+UNTR_DIR_FLAGS_LIMIT = 1 << 10
+
+
+def _ewah_set_bits(data: bytes, p: int, stop: int) -> tuple[int, int, int]:
+    """The EWAH bitmap at ``p``: ``(bit_size, set bits, end)``. ValueError unless it has
+    the shape git writes: at least one word, runs and literal words that cover no more than
+    ``bit_size`` rounded up to a whole word, no bit set at or past ``bit_size``, and a
+    trailer naming the word position of the last run-length word. Every byte of such a
+    bitmap is then bounded by ``bit_size``."""
+    if p + 8 > stop:
+        raise ValueError("bitmap truncated")
+    bit_size, words = struct.unpack(">II", data[p:p + 8])
+    w = p + 8
+    rlw_end = w + 8 * words
+    if not words or rlw_end + 4 > stop:
+        raise ValueError("bitmap truncated")
+    bits = count = last_rlw = 0
+    while w < rlw_end:
+        last_rlw = (w - p - 8) // 8
+        (rlw,) = struct.unpack(">Q", data[w:w + 8])
+        w += 8
+        run, literals = (rlw >> 1) & 0xFFFFFFFF, rlw >> 33
+        bits += 64 * run
+        if bits + 64 * literals > (bit_size + 63) // 64 * 64:
+            raise ValueError("bitmap words past its size")
+        if rlw & 1 and run:
+            if bits > bit_size:
+                raise ValueError("bitmap sets bits past its size")
+            count += 64 * run
+        for _ in range(literals):
+            if w >= rlw_end:
+                raise ValueError("bitmap literal words truncated")
+            (word,) = struct.unpack(">Q", data[w:w + 8])
+            if word >> max(0, min(64, bit_size - bits)):
+                raise ValueError("bitmap sets bits past its size")
+            count += bin(word).count("1")
+            bits += 64
+            w += 8
+    if struct.unpack(">I", data[rlw_end:rlw_end + 4])[0] != last_rlw:
+        raise ValueError("bitmap names the wrong last run-length word")
+    return bit_size, count, rlw_end + 4
+
+
+def _blank_untracked_cache(data: bytes, out: bytearray, p: int, stop: int, hashsz: int) -> None:
+    """Blank everything in a ``UNTR`` extension body except its text: the environment
+    strings, the per-directory exclude file name and the directory and untracked names stay;
+    stat data, flags, ids, counts and bitmaps are set to NUL. ValueError when it does not
+    parse."""
+    start = p
+    ident, p = _index_varint(data, p)
+    out[start:p] = bytes(p - start)
+    p += ident  # NUL-terminated environment strings
+    fixed = 2 * UNTR_STAT_BYTES + 4 + 2 * hashsz  # two stat data, dir_flags, two ids
+    if p + fixed > stop:
+        raise ValueError("untracked cache header truncated")
+    (dir_flags,) = struct.unpack(">I", data[p + 2 * UNTR_STAT_BYTES:p + 2 * UNTR_STAT_BYTES + 4])
+    if dir_flags >= UNTR_DIR_FLAGS_LIMIT:
+        raise ValueError("untracked cache dir_flags outside git's flags")
+    out[p:p + fixed] = bytes(fixed)
+    p = data.index(b"\0", p + fixed, stop) + 1  # the per-directory exclude file name
+    start = p
+    blocks, p = _index_varint(data, p)
+    out[start:p] = bytes(p - start)
+    if not blocks:
+        if p != stop:
+            raise ValueError("bytes after an empty untracked cache")
+        return
+    seen = 0
+    pending = 1  # directory blocks still to read, depth first from the root
+    while pending:
+        pending -= 1
+        seen += 1
+        start = p
+        untracked, p = _index_varint(data, p)
+        subdirs, p = _index_varint(data, p)
+        out[start:p] = bytes(p - start)
+        for _ in range(untracked + 1):  # the directory name, then its untracked names
+            p = data.index(b"\0", p, stop) + 1
+        pending += subdirs
+    if seen != blocks:
+        raise ValueError("untracked cache block count differs")
+    start = p
+    counts = []
+    for _ in range(3):  # valid, check_only, hash_valid: at most one bit per directory block
+        bit_size, set_bits, p = _ewah_set_bits(data, p, stop)  # git stops at the last set bit
+        if bit_size > blocks:
+            raise ValueError("untracked cache bitmap longer than the block count")
+        counts.append(set_bits)
+    valid, _check_only, hashed = counts
+    p += valid * UNTR_STAT_BYTES + hashed * hashsz
+    if p >= stop or data[p:stop] != b"\0":  # git ends the body with one NUL
+        raise ValueError("untracked cache tail")
+    out[start:p] = bytes(p - start)
+
+
+def _eoie_fits(data: bytes, p: int, stop: int, end: int, hashsz: int, entries_end: int, headers: bytes) -> bool:
+    """Whether an ``EOIE`` body is exactly what git writes, so that none of its bytes is
+    free: it is the last extension, its offset is where the entries end, and its hash is
+    over the signature and size of every earlier extension."""
+    if stop != end or stop - p != 4 + hashsz or data[p:p + 4] != struct.pack(">I", entries_end):
+        return False
+    return (hashlib.sha1 if hashsz == 20 else hashlib.sha256)(headers).digest() == data[p + 4:stop]
+
+
+def _ieot_fits(data: bytes, p: int, stop: int, entry_offsets: list[int]) -> bool:
+    """Whether an ``IEOT`` body is version 1 with blocks that split the entries in order:
+    each block's offset is that of its first entry, each count is at least one and the counts
+    cover every entry once. Its bytes are then real offsets and counts, not free."""
+    size = stop - p
+    if size < 12 or (size - 4) % 8 or data[p:p + 4] != struct.pack(">I", 1):
+        return False
+    first = 0
+    for q in range(p + 4, stop, 8):
+        offset, count = struct.unpack(">II", data[q:q + 8])
+        if not count or first + count > len(entry_offsets) or entry_offsets[first] != offset:
+            return False
+        first += count
+    return first == len(entry_offsets)
+
+
+
 def _index_blanked(data: bytes, hashsz: int) -> bytes:
     if data[:4] != b"DIRC" or len(data) < 12 + hashsz:
         raise ValueError("not an index")
@@ -250,7 +407,9 @@ def _index_blanked(data: bytes, hashsz: int) -> bytes:
     out = bytearray(data)
     off = 12
     prev_len = 0
+    entry_offsets = []
     for _ in range(count):
+        entry_offsets.append(off)
         fixed = INDEX_STAT_BYTES + hashsz + 2
         (flags,) = struct.unpack(">H", data[off + fixed - 2:off + fixed])
         if flags & 0x4000:  # 16-bit extended flags follow
@@ -275,14 +434,26 @@ def _index_blanked(data: bytes, hashsz: int) -> bytes:
             if nxt > end or data[nul:nxt].strip(b"\0"):
                 raise ValueError("entry padding")
             off = nxt
+    entries_end = off
+    headers = b""  # each earlier extension's signature and size, which the EOIE hash covers
     while off < end:
         (size,) = struct.unpack(">I", data[off + 4:off + 8])
         body = off + 8
         if body + size > end:
             raise ValueError("extension overruns the checksum")
         out[off + 4:body] = bytes(4)
-        if data[off:off + 4] == b"TREE":
+        sig = data[off:off + 4]
+        if sig == b"TREE":
             _blank_cache_tree(data, out, body, body + size, hashsz)
+        elif sig == b"REUC":
+            _blank_resolve_undo(data, out, body, body + size, hashsz)
+        elif sig == b"UNTR":
+            _blank_untracked_cache(data, out, body, body + size, hashsz)
+        elif sig == b"EOIE" and _eoie_fits(data, body, body + size, end, hashsz, entries_end, headers):
+            out[body:body + size] = bytes(size)
+        elif sig == b"IEOT" and _ieot_fits(data, body, body + size, entry_offsets):
+            out[body:body + size] = bytes(size)
+        headers += data[off:body]
         off = body + size
     out[end:] = bytes(hashsz)
     return bytes(out)
@@ -290,8 +461,9 @@ def _index_blanked(data: bytes, hashsz: int) -> bytes:
 
 def index_scan_bytes(data: bytes) -> bytes:
     """``data`` with the binary fields of a git index (v2-v4, SHA-1 or SHA-256 ids) set to
-    NUL: entry stat data, ids, flags and v4 prefix lengths, extension sizes, cache-tree ids
-    and the trailing checksum. Names and all other extension bytes are kept. Bytes that do
+    NUL: entry stat data, ids, flags and v4 prefix lengths, extension sizes, cache-tree and
+    resolve-undo ids, the untracked cache's binary fields, EOIE and IEOT bodies that match
+    the copy exactly and the trailing checksum. Names, text and other extensions' bytes are kept. Bytes that do
     not parse as an index, or whose checksum does not match, come back unchanged and are
     scanned whole."""
     for hashsz in (20, 32):
@@ -424,7 +596,8 @@ def owner_review_path(stores: Stores, episode: str) -> Path:
 
 def load_owner_review(stores: Stores, episode: str) -> dict[str, Any] | None:
     """The owner's recorded review for one episode, or None. A file naming another
-    episode, or unreadable, is ignored and logged."""
+    episode, unreadable, or whose ``rules`` is not ``{rule: {state, basis}}``, is ignored
+    and logged."""
     p = owner_review_path(stores, episode)
     if not p.is_file():
         return None
@@ -435,6 +608,10 @@ def load_owner_review(stores: Stores, episode: str) -> dict[str, Any] | None:
         return None
     if not isinstance(rec, dict) or rec.get("episode_id") != episode:
         log_line(stores, f"owner review names another episode: {episode}")
+        return None
+    rules = rec.get("rules")
+    if rules is not None and not (isinstance(rules, dict) and all(isinstance(v, dict) for v in rules.values())):
+        log_line(stores, f"owner review malformed (rules): {episode}")
         return None
     return rec
 

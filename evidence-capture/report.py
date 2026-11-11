@@ -139,14 +139,17 @@ def blocker_partition(pop: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _sole_blocker(m: dict[str, Any]) -> str | None:
     """The one gate stopping an episode when exactly one of link, snapshot+boundary and
-    screen fails; None otherwise."""
+    screen fails; None otherwise. A screen blocker names every rule that is not ``no``
+    and ``observation`` when the observation was insufficient (the screen's own inputs)."""
     f = m["funnel"]
     failing = [g for g in mf.GATES if not f.get(g)]
     if len(failing) != 1:
         return None
     if failing[0] == "dependency_screen_clear":
-        yes = [r for r in ("X1", "X2", "X3", "X4", "X5") if mf.rule_state(m["exclusions"], r) != "no"]
-        return "screen:" + "+".join(yes)
+        causes = [r for r in mf.RULES if mf.rule_state(m["exclusions"], r) != "no"]
+        if not m.get("observation", {}).get("sufficient"):
+            causes.append("observation")
+        return "screen:" + "+".join(causes)
     return failing[0]
 
 

@@ -209,6 +209,10 @@ def test_footprints(tmp: Path) -> None:
     check(all((out1 / n).read_bytes() == (out2 / n).read_bytes()
               for n in ("footprints.jsonl", "unparsed.jsonl", "pool.jsonl", "summary.json", "distributions.md")),
           "two runs are byte-identical")
+    md = (out1 / "distributions.md").read_text("utf-8")
+    check("could not be located" in md and "$VAR/%VAR%/~" in md and "above the root" in md
+          and "resolved to a working directory" not in md,
+          "SA26-25: the unresolved label names every cause, not only an unknown working directory")
     trees = fpm.TreeIndex(True)
     check(trees.files(root, head) is not None and trees.files(root, head) == sorted(f"src/{n}" for n in ("a.py", "b.py", "c.py")),
           "tree index: a full object name lists the commit")
