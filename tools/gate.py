@@ -19,7 +19,9 @@ and under Windows PowerShell 5.1 (the shell the scheduled tasks use), as CI's tw
 The steps run in parallel, each with its own temporary directory, and their output is buffered: a passing step prints
 one line, a failing step prints all of its output (`--verbose` prints every step's output). Every step runs even when
 another fails, so one run shows every problem. The last line of output is the verdict (`GATE PASS ...` or
-`GATE FAIL ...`), and the exit status is 0 only for a pass.
+`GATE FAIL ...`), and the exit status is 0 only for a pass. The pass line is read alone, so it says what it does not
+cover: `GATE PASS: 29 of 29 steps passed; 4 suites not run here (listed above)` when this machine left suites out, and
+`... (publication scans only, no test suite)` for `--scans-only`.
 
 gitleaks is found through $GITLEAKS_BIN, then PATH, then <home>/.claude/bin (where the profile's tools/git_gate.py installs
 it), then this repo's bin/ (bin/README.md). Missing gitleaks fails the gate: the secret scan is not optional.
@@ -30,6 +32,7 @@ Usage:
   python tools/gate.py              # the whole gate, from anywhere inside the repository
   python tools/gate.py --verbose    # the same, printing every step's output (what CI runs)
   python tools/gate.py --root DIR   # another checkout of this repository
+  python tools/gate.py --scans-only --root DIR   # boundary, machine paths and secrets only (see scan_steps)
 """
 from __future__ import annotations
 
@@ -141,6 +144,20 @@ def default_steps(root: Path, python: str = sys.executable, windows: bool = os.n
     return steps, skipped
 
 
+def scan_steps(root: Path, python: str = sys.executable) -> list[Step]:
+    """The checks that decide whether a commit's content may be published: the public-boundary check, the
+    machine-paths scan and the secret scan. No test suite: a red test in an earlier commit is not a leak.
+
+    The pre-push hook runs these (`--scans-only`) on every pushed commit before the tip, because every pushed commit
+    stays in the public history. The secret scan step runs THIS file, so an earlier commit whose own gate predates
+    `--scans-only` is still scanned; the two scanners are the scanned commit's own, as in the full gate."""
+    return [
+        Step("public-boundary check", [python, "tools/pre_publish_check.py"]),
+        Step("machine-paths guard scan", [python, GUARD]),
+        Step("gitleaks secret scan", [python, str(Path(__file__).resolve()), "--secret-scan", "--root", str(root)]),
+    ]
+
+
 def find_gitleaks(root: Path, environ: dict | None = None,
                   which: Callable[[str], str | None] = shutil.which) -> str | None:
     environ = os.environ if environ is None else environ
@@ -236,11 +253,15 @@ def run_steps(steps: list[Step], cwd: Path, out: TextIO, verbose: bool = False,
     return failed, len(steps)
 
 
-def main(argv: list[str] | None = None, steps: list[Step] | None = None, out: TextIO | None = None) -> int:
+def main(argv: list[str] | None = None, steps: list[Step] | None = None, out: TextIO | None = None,
+         skipped: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="repository root (default: this clone)")
     ap.add_argument("--verbose", action="store_true", help="print every step's output, not only a failing step's")
     ap.add_argument("--secret-scan", action="store_true", help="run only the gitleaks step (the gate runs it so)")
+    ap.add_argument("--scans-only", action="store_true",
+                    help="run only the publication scans (boundary, machine paths, secrets) and no test suite; "
+                         "the pre-push hook runs this on each pushed commit before the tip")
     args = ap.parse_args(argv)
     out = out or sys.stdout
     for stream in (sys.stdout, sys.stderr):  # step output is relayed as text; never die on a console codec
@@ -249,10 +270,15 @@ def main(argv: list[str] | None = None, steps: list[Step] | None = None, out: Te
     root = args.root.resolve()
     if args.secret_scan:
         return secret_scan(root, out)
-    if steps is None:
+    scope = ""
+    if steps is None and args.scans_only:
+        steps, skipped = scan_steps(root), []
+        scope = " (publication scans only, no test suite)"
+    elif steps is None:
         steps, skipped = default_steps(root)
-        for line in skipped:
-            print(line, file=out)
+    skipped = skipped or []
+    for line in skipped:
+        print(line, file=out)
     failed, total = run_steps(steps, root, out, verbose=args.verbose)
     if total == 0:
         print("GATE FAIL: no steps ran, so nothing was checked", file=out, flush=True)
@@ -260,7 +286,10 @@ def main(argv: list[str] | None = None, steps: list[Step] | None = None, out: Te
     if failed:
         print(f"GATE FAIL: {len(failed)} of {total} steps failed: {', '.join(failed)}", file=out, flush=True)
         return 1
-    print(f"GATE PASS: {total} of {total} steps passed", file=out, flush=True)
+    # The verdict line is read alone, so it carries what it does not cover: the suites this machine left out.
+    if skipped:
+        scope += f"; {len(skipped)} suite{'' if len(skipped) == 1 else 's'} not run here (listed above)"
+    print(f"GATE PASS: {total} of {total} steps passed{scope}", file=out, flush=True)
     return 0
 
 

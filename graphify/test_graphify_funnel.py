@@ -972,6 +972,27 @@ class TempDirRule(FunnelCase):
         self.assertEqual(out["sessions"]["organic"], 0)
         self.assertEqual(out["sessions"]["excluded"][0]["reason"], "cwd in system temp dir")
 
+    def test_the_temp_rule_stops_at_a_path_separator(self):
+        # SA09-4: a bare prefix match took siblings that only share the temp dir's leading characters.
+        tmp = gf.norm(os.path.join(os.sep, "users", "u", "appdata", "local", "temp"))
+        for inside in (tmp, os.path.join(tmp, "x"), os.path.join(tmp, "a", "b")):
+            self.assertTrue(gf.under_dir(gf.norm(inside), tmp), inside)
+        for sibling in (tmp + "2", os.path.join(tmp + "2", "x"), os.path.join(tmp + "lates", "x"),
+                        os.path.dirname(tmp)):
+            self.assertFalse(gf.under_dir(gf.norm(sibling), tmp), sibling)
+        root = gf.norm(os.sep)      # a root already ends in its separator
+        self.assertTrue(gf.under_dir(gf.norm(os.path.join(os.sep, "x")), root))
+
+    def test_a_sibling_of_the_temp_dir_is_not_excluded(self):
+        # SA09-4 through the funnel: the session's cwd shares the temp dir's prefix and is not inside it.
+        Transcript(self.repo).greps(1).write(self.projects, "p", "s-sibling")
+        del self.cfg["funnel"]["exclude_temp_cwd"]
+        real_cwd = gf.norm(os.path.realpath(self.repo))
+        with mock.patch.object(gf.tempfile, "gettempdir", return_value=real_cwd[:-1]):
+            out = self.run_funnel()
+        self.assertEqual(out["sessions"]["organic"], 1)
+        self.assertEqual(out["sessions"]["excluded"], [])
+
 
 class Cli(FunnelCase):
     def test_main_writes_report_and_summary(self):

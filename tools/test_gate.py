@@ -237,6 +237,45 @@ def main() -> int:
                                                     "!= 'powershell.exe')"), (("GRAPHIFY_TEST_SHELL", "powershell.exe"),))])
     check("a step's own environment reaches it", code == 0, text)
 
+    print("the verdict counts what was left out (SA09-2)")
+    one = [gate.Step("one", py("print('one ran')"))]
+    left_out = ["not run here (Windows only): a/test_a.py", "not run here (no pwsh on PATH): b/test_b.py"]
+    out = io.StringIO()
+    code = gate.main(["--root", str(REPO)], steps=one, out=out, skipped=left_out)
+    text = out.getvalue()
+    check("a pass with suites left out says how many, in the verdict line", code == 0
+          and lines_of(text)[-1] == "GATE PASS: 1 of 1 steps passed; 2 suites not run here (listed above)", text)
+    check("each left-out suite is still listed before the verdict", all(ln in lines_of(text)[:-1] for ln in left_out),
+          text)
+    out = io.StringIO()
+    code = gate.main(["--root", str(REPO)], steps=one, out=out, skipped=left_out[:1])
+    check("one left-out suite reads as one", code == 0
+          and lines_of(out.getvalue())[-1] == "GATE PASS: 1 of 1 steps passed; 1 suite not run here (listed above)",
+          out.getvalue())
+    code, text = run_main(gate, one)
+    check("a pass with nothing left out keeps the plain verdict",
+          code == 0 and lines_of(text)[-1] == "GATE PASS: 1 of 1 steps passed", text)
+
+    print("publication scans only (SA09-1)")
+    scans = gate.scan_steps(REPO, "python")
+    check("the publication scans are the boundary check, the machine-paths scan and the secret scan",
+          [s.label for s in scans] == ["public-boundary check", "machine-paths guard scan", "gitleaks secret scan"],
+          str([s.label for s in scans]))
+    check("the secret scan step runs this gate, not the scanned commit's copy",
+          Path(scans[-1].argv[1]).resolve() == (REPO / "tools" / "gate.py").resolve()
+          and scans[-1].argv[2:] == ["--secret-scan", "--root", str(REPO)], str(scans[-1].argv))
+    saved_scan_steps = gate.scan_steps
+    gate.scan_steps = lambda root: [gate.Step("stub scan", py("print('stub scan ran')"))]
+    try:
+        out = io.StringIO()
+        code = gate.main(["--root", str(REPO), "--scans-only"], out=out)
+    finally:
+        gate.scan_steps = saved_scan_steps
+    text = out.getvalue()
+    check("--scans-only runs the scans and no suite, and its verdict says so", code == 0
+          and lines_of(text) == ["<== stub scan: ok in " + lines_of(text)[0].rsplit(" in ", 1)[-1],
+                                 "GATE PASS: 1 of 1 steps passed (publication scans only, no test suite)"], text)
+
     print("secret scan")
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

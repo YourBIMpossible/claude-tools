@@ -216,6 +216,51 @@ def main() -> int:
         check("the secret scan is the failing step", "gitleaks secret scan" in verdict(out), out)
         check("the secret is never printed", FAKE_TOKEN not in out, out)
 
+        # SA09-1: every pushed commit is published, not only the tip. The tip runs the whole gate; each earlier
+        # commit new to the remote runs the publication scans.
+        print("secret added, then removed, in the pushed range")
+        branch(src, "history")
+        commit(src, "config/settings.txt", f"token = {FAKE_TOKEN}\n", "add a secret")
+        leaked = git(src, "rev-parse", "HEAD").strip()[:12]
+        git(src, "rm", "-q", "config/settings.txt")
+        git(src, "commit", "-q", "-m", "remove the secret")
+        clean_tip = git(src, "rev-parse", "HEAD").strip()[:12]
+        rc, out = run(src, "git", "push", "-q", "origin", "history")
+        check("a secret in an earlier pushed commit blocks the push", rc != 0 and not remote_has(src, "history"), out)
+        check("the tip itself is clean and passes the whole gate",
+              f"pre-push: running the gate on {clean_tip} " in out and "GATE PASS" in out, out)
+        check("the earlier commit is scanned, and named as the one that failed",
+              f"pre-push: scanning {leaked} " in out and f"[{leaked}, " in out
+              and "gitleaks secret scan" in out, out)
+        check("the earlier commit's secret is never printed", FAKE_TOKEN not in out, out)
+
+        print("machine path added, then removed, in the pushed range")
+        branch(src, "pathhistory")
+        commit(src, "docs/notes.md", f"See {DRIVE}{BS}work{BS}repo{BS}notes.md for details.\n", "add drive path")
+        commit(src, "docs/notes.md", "See {repos}/repo/notes.md for details.\n", "fix the path")
+        rc, out = run(src, "git", "push", "-q", "origin", "pathhistory")
+        check("a machine path in an earlier pushed commit blocks the push",
+              rc != 0 and not remote_has(src, "pathhistory") and "machine-paths guard scan" in out, out)
+
+        print("several clean commits")
+        branch(src, "several")
+        commit(src, "docs/one.md", "First.\n", "one")
+        first = git(src, "rev-parse", "HEAD").strip()[:12]
+        commit(src, "docs/two.md", "Second.\n", "two")
+        second = git(src, "rev-parse", "HEAD").strip()[:12]
+        commit(src, "docs/three.md", "Third.\n", "three")
+        rc, out = run(src, "git", "push", "-q", "origin", "several")
+        check("several clean commits push", rc == 0 and remote_has(src, "several"), out)
+        check("each earlier commit is scanned once, oldest first",
+              out.count("pre-push: scanning ") == 2
+              and out.index(f"pre-push: scanning {first} ") < out.index(f"pre-push: scanning {second} "), out)
+        check("only the tip runs the test suites", out.count("pre-push: running the gate on ") == 1
+              and out.count("publication scans only") == 2, out)
+        commit(src, "docs/four.md", "Fourth.\n", "four")
+        rc, out = run(src, "git", "push", "-q", "origin", "several")
+        check("a later push scans nothing the remote already has",
+              rc == 0 and "pre-push: scanning " not in out, out)
+
         print("commit without the gate")
         branch(src, "nogate")
         git(src, "rm", "-q", GATE)
