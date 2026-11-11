@@ -592,13 +592,143 @@ def test_index_scan_bytes_keeps_binary_extensions_off_layout(root: Path) -> None
         crafted += hashlib.sha1(crafted).digest()
         assert outside[:16] in review.index_scan_bytes(crafted), sig
     # An untracked cache whose valid bitmap is longer than its one block: scanned whole.
-    one = bytes([0]) + bytes(2 * 36 + 4 + 40) + b".gitignore\0" + bytes([1, 0, 0]) + b"\0"
-    bitmap = struct.pack(">II", 2, 1) + struct.pack(">Q", 2 << 33) + struct.pack(">Q", 3) + struct.pack(">I", 0)
-    ok = struct.pack(">II", 1, 0) + struct.pack(">I", 0)
-    untr = one + bitmap + ok + ok + outside + b"\0"
-    crafted = raw[:end] + b"UNTR" + struct.pack(">I", len(untr)) + untr
-    crafted += hashlib.sha1(crafted).digest()
+    bitmap = _ewah(2, [3])
+    untr = _untr(valid=bitmap, stat=outside[:16] + bytes(20))
+    assert review.index_scan_bytes(_with_extension(raw, b"UNTR", _untr())) != raw[:end], "the control parses"
+    crafted = _with_extension(raw, b"UNTR", untr)
     assert review.index_scan_bytes(crafted) == crafted
+
+
+def _ewah(bit_size: int, literals: list[int], rlw: int | None = None, rlw_pos: int = 0) -> bytes:
+    """An EWAH bitmap as git serializes it: one RLW (``rlw``, default: no run and
+    ``len(literals)`` literal words), the literal words, then the last RLW's word position."""
+    words = [len(literals) << 33 if rlw is None else rlw] + literals
+    return struct.pack(">II", bit_size, len(words)) + b"".join(struct.pack(">Q", w) for w in words) + struct.pack(">I", rlw_pos)
+
+
+def _untr(dir_flags: int = 6, valid: bytes | None = None, empty: bytes | None = None, stat: bytes = bytes(36)) -> bytes:
+    """An untracked cache body with one (root) directory block whose stat data is valid."""
+    head = bytes([0]) + bytes(2 * 36) + struct.pack(">I", dir_flags) + bytes(40) + b".gitignore\0"
+    empty = _ewah(0, []) if empty is None else empty
+    return head + bytes([1, 0, 0]) + b"\0" + (_ewah(1, [1]) if valid is None else valid) + empty + empty + stat + b"\0"
+
+
+def _with_extension(raw: bytes, sig: bytes, body: bytes, hashsz: int = 20) -> bytes:
+    """``raw`` with one more extension before a freshly computed checksum."""
+    crafted = raw[:-hashsz] + sig + struct.pack(">I", len(body)) + body
+    return crafted + (hashlib.sha1 if hashsz == 20 else hashlib.sha256)(crafted).digest()
+
+
+def _layout(raw: bytes) -> tuple[list[int], int, bytes]:
+    """A v2/v3 SHA-1 index's entry offsets, the offset where its entries end, and the
+    signature and size of each extension, concatenated (what git's EOIE hash covers)."""
+    offsets = []
+    off = 12
+    for _ in range(struct.unpack(">I", raw[8:12])[0]):
+        offsets.append(off)
+        off += (62 + (struct.unpack(">H", raw[off + 60:off + 62])[0] & 0xFFF) + 8) & ~7
+    entries_end, headers = off, b""
+    while off < len(raw) - 20:
+        headers += raw[off:off + 8]
+        off += 8 + struct.unpack(">I", raw[off + 4:off + 8])[0]
+    return offsets, entries_end, headers
+
+
+def test_index_scan_bytes_checks_eoie_fully(root: Path) -> None:
+    """XREVIEW-CT49 F1: an EOIE body of the right size was blanked whatever it held. It is
+    blanked only when it is the last extension, its offset is where the entries end and its
+    hash is git's hash over the earlier extensions' signatures and sizes."""
+    raw = (tc.make_repo(root) / ".git" / "index").read_bytes()
+    _offsets, entries_end, headers = _layout(raw)
+    outside = b"/opt/elsewhere/data.csv\0"
+    real = struct.pack(">I", entries_end) + hashlib.sha1(headers).digest()
+    good = _with_extension(raw, b"EOIE", real)
+    assert not _extension_bodies(good, review.index_scan_bytes(good))[b"EOIE"].strip(b"\0"), "git's layout is blanked"
+    wrong_offset = struct.pack(">I", entries_end + 8) + real[4:]
+    not_last = _with_extension(good, b"ZZZZ", b"")
+    for crafted in (_with_extension(raw, b"EOIE", outside), _with_extension(raw, b"EOIE", wrong_offset),
+                    _with_extension(raw, b"EOIE", real[:4] + outside[:20]), not_last):
+        assert review.index_scan_bytes(crafted)[len(raw) - 20 + 8:][:24] == crafted[len(raw) - 20 + 8:][:24], crafted[-44:]
+
+
+def test_index_scan_bytes_bounds_ieot(root: Path) -> None:
+    """XREVIEW-CT49 F1: any IEOT body of version 1 and a whole number of 8-byte blocks was
+    blanked, so text padded to eight bytes hid there. Each block's offset must now be the
+    offset of its first entry and the counts must cover every entry exactly once."""
+    raw = (tc.make_repo(root) / ".git" / "index").read_bytes()
+    offsets, _end, _headers = _layout(raw)
+    n = len(offsets)
+    assert n >= 2, n
+    outside = b"/opt/elsewhere/data.csv\0"
+    v1 = struct.pack(">I", 1)
+    for body in (v1 + struct.pack(">II", 12, n), v1 + struct.pack(">IIII", 12, 1, offsets[1], n - 1)):
+        good = _with_extension(raw, b"IEOT", body)
+        assert not _extension_bodies(good, review.index_scan_bytes(good))[b"IEOT"].strip(b"\0"), body
+    for body in (v1 + outside,  # padded text: 24 bytes, three "blocks"
+                 v1 + struct.pack(">II", 12, n) + outside[:8],  # a real block, then text
+                 v1 + struct.pack(">II", 12, n + 1),  # counts past the entries
+                 v1 + struct.pack(">IIII", 12, 1, offsets[1] + 8, n - 1),  # an offset off an entry
+                 v1 + struct.pack(">IIII", 12, 0, 12, n),  # an empty block
+                 v1):  # no blocks
+        crafted = _with_extension(raw, b"IEOT", body)
+        assert review.index_scan_bytes(crafted)[-20 - len(body):-20] == body, body
+
+
+def test_index_scan_bytes_blanks_real_ieot(root: Path) -> None:
+    """The IEOT git writes for a large index (several threads) is blanked, v3 and v4."""
+    repo = root / "big"
+    tc.git(root, "init", "-q", "-b", "main", str(repo))
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input=b"", capture_output=True, check=True).stdout.decode().strip()
+    listing = "".join(f"100644 {blob}\tf{i:06d}\n" for i in range(25000))
+    subprocess.run(["git", "update-index", "--index-info"], cwd=repo, input=listing.encode(), check=True)
+    for key, value in (("index.threads", "4"), ("index.recordOffsetTable", "true"), ("index.recordEndOfIndexEntries", "true")):
+        tc.git(repo, "config", key, value)
+    for version in ("4", "3"):
+        tc.git(repo, "update-index", "--index-version", version)
+        raw = (repo / ".git" / "index").read_bytes()
+        out = review.index_scan_bytes(raw)
+        for sig in (b"IEOT", b"EOIE"):
+            at = raw.rindex(sig)
+            size = struct.unpack(">I", raw[at + 4:at + 8])[0]
+            assert size and not out[at + 8:at + 8 + size].strip(b"\0"), (version, sig)
+
+
+def test_index_scan_bytes_scans_link_whole(root: Path) -> None:
+    """XREVIEW-CT49 F1: a link body is a shared index id and two EWAH bitmaps over the shared
+    index, which the copy does not hold, so none of it can be bounded; an id of text and text
+    in a bitmap's literal words were blanked. The link body is now scanned as stored."""
+    repo = tc.make_repo(root)
+    raw = (repo / ".git" / "index").read_bytes()
+    # The link git writes for a split index, with both bitmaps after a change and a removal.
+    tc.git(repo, "update-index", "--split-index")
+    (repo / "README.md").write_text("# changed\n", encoding="utf-8")
+    tc.git(repo, "add", "README.md")
+    tc.git(repo, "rm", "-q", "--cached", "src/alpha.py")
+    split = (repo / ".git" / "index").read_bytes()
+    real = _extension_bodies(split, split)[b"link"]
+    assert len(real) > 20, "both bitmaps are written"
+    assert _extension_bodies(split, review.index_scan_bytes(split))[b"link"] == real, "git's link is kept"
+    outside = b"/opt/elsewhere/data.csv\0"
+    words = [struct.unpack(">Q", outside[k:k + 8])[0] for k in range(0, 24, 8)]
+    for link in (b"/opt/elsewhere/data1",  # an id alone
+                 bytes(20) + _ewah(64 * 3, words) + _ewah(0, [])):  # literal words
+        crafted = _with_extension(raw, b"link", link)
+        assert _extension_bodies(crafted, review.index_scan_bytes(crafted))[b"link"] == link, link
+
+
+def test_index_scan_bytes_bounds_untracked_cache(root: Path) -> None:
+    """XREVIEW-CT49 F1: an untracked cache's dir_flags, the zero-fill runs of its bitmaps and
+    each bitmap's last-RLW position were blanked unchecked. An untracked cache with flags
+    outside git's set, a run past the bitmap's size or a wrong RLW position is scanned whole."""
+    raw = (tc.make_repo(root) / ".git" / "index").read_bytes()
+    good = _with_extension(raw, b"UNTR", _untr())
+    assert review.index_scan_bytes(good) != good, "the control parses"
+    tmp = struct.unpack(">I", b"/tmp")[0]
+    for body in (_untr(dir_flags=1 << 10),
+                 _untr(empty=_ewah(0, [], rlw=tmp << 1)),  # a zero run of 0x2f746d70 words
+                 _untr(valid=_ewah(1, [1], rlw_pos=tmp))):
+        crafted = _with_extension(raw, b"UNTR", body)
+        assert review.index_scan_bytes(crafted) == crafted, body
 
 
 def test_deny_glob_double_star_matches_root(root: Path) -> None:
