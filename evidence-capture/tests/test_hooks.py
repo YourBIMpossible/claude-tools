@@ -351,8 +351,26 @@ def test_end_waits_for_episode_lock(root: Path) -> None:
         pipeline._unlock(pipeline.episode_lock(fx.stores, ep))
     assert res["action"] == "busy", res
     assert fx.episode(sid)["capture"]["phase"] == "started", "a busy episode is left untouched"
-    res = pipeline.run_end({"session_id": sid, "transcript_path": str(tp)}, fx.env)
+    # This end runs in this process, so the Fixture's unbudgeted shim does not cover it: raise
+    # the end budget the same way, or a loaded machine records partial / held (unknown:X7).
+    old_budget = pipeline.END_BUDGET_S
+    pipeline.END_BUDGET_S = UNBUDGETED_S
+    try:
+        res = pipeline.run_end({"session_id": sid, "transcript_path": str(tp)}, fx.env)
+    finally:
+        pipeline.END_BUDGET_S = old_budget
     assert res["action"] == "ended" and res["review"] == "materialized", res
+
+
+def test_end_waits_for_episode_lock_is_unbudgeted(root: Path) -> None:
+    """The in-process end above asserts a materialized review, so it must not depend on the
+    end wall-clock budget: with the budget forced to zero (any machine is over it) it still passes."""
+    old = pipeline.END_BUDGET_S
+    pipeline.END_BUDGET_S = 0.0
+    try:
+        test_end_waits_for_episode_lock(root)
+    finally:
+        pipeline.END_BUDGET_S = old
 
 
 def test_boundary_overrides(root: Path) -> None:
