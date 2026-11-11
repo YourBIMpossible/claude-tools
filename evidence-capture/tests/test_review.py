@@ -566,6 +566,39 @@ def test_privacy_scope_ignores_resolve_undo_ids(root: Path) -> None:
     cut = clean[:-20] + b"REUC" + struct.pack(">I", len(entry) - 1) + entry[:-1]
     (snap / "index.bin").write_bytes(cut + hashlib.sha1(cut).digest())
     assert review.index_scan_bytes((snap / "index.bin").read_bytes()) == (snap / "index.bin").read_bytes()
+    # A REUC mode that is not plain octal does not parse either.
+    loose = entry.replace(b"100644", b"+00644", 1)
+    odd = clean[:-20] + b"REUC" + struct.pack(">I", len(loose)) + loose
+    odd += hashlib.sha1(odd).digest()
+    assert review.index_scan_bytes(odd) == odd
+
+
+def test_index_scan_bytes_keeps_binary_extensions_off_layout(root: Path) -> None:
+    """SA09-3: link, EOIE and IEOT bodies are blanked whole only in the exact layout git
+    writes, and an untracked cache whose bitmaps do not match its block count is not parsed:
+    text hidden in a body of the wrong shape is still scanned."""
+    repo = tc.make_repo(root)
+    tc.git(repo, "config", "index.recordEndOfIndexEntries", "true")
+    tc.git(repo, "config", "index.recordOffsetTable", "true")
+    tc.git(repo, "update-index", "--index-version", "3")  # rewrites the index with EOIE
+    raw = (repo / ".git" / "index").read_bytes()
+    bodies = _extension_bodies(raw, review.index_scan_bytes(raw))
+    assert b"EOIE" in bodies and not bodies[b"EOIE"].strip(b"\0"), sorted(bodies)
+    outside = b"/opt/elsewhere/data.csv"
+    end = len(raw) - 20
+    for sig, body in ((b"EOIE", outside), (b"IEOT", struct.pack(">I", 1) + outside),
+                      (b"IEOT", struct.pack(">I", 2) + outside[:16]), (b"link", bytes(20) + outside)):
+        crafted = raw[:end] + sig + struct.pack(">I", len(body)) + body
+        crafted += hashlib.sha1(crafted).digest()
+        assert outside[:16] in review.index_scan_bytes(crafted), sig
+    # An untracked cache whose valid bitmap is longer than its one block: scanned whole.
+    one = bytes([0]) + bytes(2 * 36 + 4 + 40) + b".gitignore\0" + bytes([1, 0, 0]) + b"\0"
+    bitmap = struct.pack(">II", 2, 1) + struct.pack(">Q", 2 << 33) + struct.pack(">Q", 3) + struct.pack(">I", 0)
+    ok = struct.pack(">II", 1, 0) + struct.pack(">I", 0)
+    untr = one + bitmap + ok + ok + outside + b"\0"
+    crafted = raw[:end] + b"UNTR" + struct.pack(">I", len(untr)) + untr
+    crafted += hashlib.sha1(crafted).digest()
+    assert review.index_scan_bytes(crafted) == crafted
 
 
 def test_deny_glob_double_star_matches_root(root: Path) -> None:

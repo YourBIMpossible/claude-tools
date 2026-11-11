@@ -235,6 +235,9 @@ def _blank_cache_tree(data: bytes, out: bytearray, p: int, stop: int, hashsz: in
             p += hashsz
 
 
+REUC_MODE_RE = re.compile(rb"[0-7]{1,6}")
+
+
 def _blank_resolve_undo(data: bytes, out: bytearray, p: int, stop: int, hashsz: int) -> None:
     """Blank the object ids in a ``REUC`` extension body: each entry is a path, three octal
     modes and one id per nonzero mode. ValueError when it does not parse."""
@@ -243,6 +246,8 @@ def _blank_resolve_undo(data: bytes, out: bytearray, p: int, stop: int, hashsz: 
         modes = []
         for _ in range(3):
             nul = data.index(b"\0", p, stop)
+            if not REUC_MODE_RE.fullmatch(data[p:nul]):
+                raise ValueError("resolve-undo mode is not octal")
             modes.append(int(data[p:nul], 8))
             p = nul + 1
         for mode in modes:
@@ -256,8 +261,9 @@ def _blank_resolve_undo(data: bytes, out: bytearray, p: int, stop: int, hashsz: 
 UNTR_STAT_BYTES = 36  # stat data without the mode: ctime, mtime, dev, ino, uid, gid, size
 
 
-def _ewah_set_bits(data: bytes, p: int, stop: int) -> tuple[int, int]:
-    """Count the set bits of the EWAH bitmap at ``p``: ``(count, end)``."""
+def _ewah_set_bits(data: bytes, p: int, stop: int) -> tuple[int, int, int]:
+    """The EWAH bitmap at ``p``: ``(bit_size, set bits, end)``. ValueError when it does not
+    parse or sets a bit at or past ``bit_size``, which git never writes."""
     if p + 8 > stop:
         raise ValueError("bitmap truncated")
     bit_size, words = struct.unpack(">II", data[p:p + 8])
@@ -270,19 +276,21 @@ def _ewah_set_bits(data: bytes, p: int, stop: int) -> tuple[int, int]:
         (rlw,) = struct.unpack(">Q", data[w:w + 8])
         w += 8
         run, literals = (rlw >> 1) & 0xFFFFFFFF, rlw >> 33
-        if rlw & 1:
-            count += max(0, min(64 * run, bit_size - bits))
+        if rlw & 1 and run:
+            if bits + 64 * run > bit_size:
+                raise ValueError("bitmap sets bits past its size")
+            count += 64 * run
         bits += 64 * run
         for _ in range(literals):
             if w >= rlw_end:
                 raise ValueError("bitmap literal words truncated")
             (word,) = struct.unpack(">Q", data[w:w + 8])
-            if bits < bit_size:
-                word &= (1 << min(64, bit_size - bits)) - 1
-                count += bin(word).count("1")
+            if word >> max(0, min(64, bit_size - bits)):
+                raise ValueError("bitmap sets bits past its size")
+            count += bin(word).count("1")
             bits += 64
             w += 8
-    return count, rlw_end + 4
+    return bit_size, count, rlw_end + 4
 
 
 def _blank_untracked_cache(data: bytes, out: bytearray, p: int, stop: int, hashsz: int) -> None:
@@ -321,13 +329,37 @@ def _blank_untracked_cache(data: bytes, out: bytearray, p: int, stop: int, hashs
     if seen != blocks:
         raise ValueError("untracked cache block count differs")
     start = p
-    valid, p = _ewah_set_bits(data, p, stop)
-    _check_only, p = _ewah_set_bits(data, p, stop)
-    hashed, p = _ewah_set_bits(data, p, stop)
+    counts = []
+    for _ in range(3):  # valid, check_only, hash_valid: at most one bit per directory block
+        bit_size, set_bits, p = _ewah_set_bits(data, p, stop)  # git stops at the last set bit
+        if bit_size > blocks:
+            raise ValueError("untracked cache bitmap longer than the block count")
+        counts.append(set_bits)
+    valid, _check_only, hashed = counts
     p += valid * UNTR_STAT_BYTES + hashed * hashsz
     if p >= stop or data[p:stop] != b"\0":  # git ends the body with one NUL
         raise ValueError("untracked cache tail")
     out[start:p] = bytes(p - start)
+
+
+def _binary_extension_fits(sig: bytes, data: bytes, p: int, stop: int, hashsz: int) -> bool:
+    """Whether a ``link``, ``EOIE`` or ``IEOT`` body, which holds no names, has exactly the
+    layout git writes; only then is it blanked whole, else it is scanned as stored."""
+    size = stop - p
+    if sig == b"EOIE":  # the offset of the first extension, then a hash
+        return size == 4 + hashsz
+    if sig == b"IEOT":  # version 1, then (offset, entry count) per block
+        return size >= 4 and (size - 4) % 8 == 0 and data[p:p + 4] == struct.pack(">I", 1)
+    # link: the shared index id, then the delete and replace bitmaps when present
+    if size == hashsz:
+        return True
+    try:
+        q = p + hashsz
+        for _ in range(2):
+            _bits, _set, q = _ewah_set_bits(data, q, stop)
+    except (ValueError, struct.error):
+        return False
+    return q == stop
 
 
 # Extensions whose bodies hold no names, only ids, offsets, counts and bitmaps.
@@ -388,7 +420,7 @@ def _index_blanked(data: bytes, hashsz: int) -> bytes:
             _blank_resolve_undo(data, out, body, body + size, hashsz)
         elif sig == b"UNTR":
             _blank_untracked_cache(data, out, body, body + size, hashsz)
-        elif sig in INDEX_BINARY_EXTENSIONS:
+        elif sig in INDEX_BINARY_EXTENSIONS and _binary_extension_fits(sig, data, body, body + size, hashsz):
             out[body:body + size] = bytes(size)
         off = body + size
     out[end:] = bytes(hashsz)
