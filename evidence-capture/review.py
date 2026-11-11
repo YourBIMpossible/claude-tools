@@ -204,8 +204,9 @@ def escaping_citations(brief: str) -> list[str]:
 # ``index.bin`` is a byte copy of ``.git/index``. Its stat data, object ids and flags are
 # binary numbers whose bytes can read as a path: inode 0x007e5c0e holds ``~\`` (a home
 # path), and an mtime of 0x6ae7743a before nanoseconds starting 0x2f reads ``t:/`` (a drive
-# root). Those fields are blanked before the path scan; names and extension text are
-# scanned as stored.
+# root). Those fields are blanked before the path scan, as are the ids, stat data, counts
+# and bitmaps of the TREE, REUC, UNTR, link, EOIE and IEOT extensions; names and text are
+# scanned as stored, and so is any other extension.
 INDEX_STAT_BYTES = 40  # ctime and mtime (seconds, nanoseconds), dev, ino, mode, uid, gid, size
 
 
@@ -232,6 +233,105 @@ def _blank_cache_tree(data: bytes, out: bytearray, p: int, stop: int, hashsz: in
                 raise ValueError("cache tree id truncated")
             out[p:p + hashsz] = bytes(hashsz)
             p += hashsz
+
+
+def _blank_resolve_undo(data: bytes, out: bytearray, p: int, stop: int, hashsz: int) -> None:
+    """Blank the object ids in a ``REUC`` extension body: each entry is a path, three octal
+    modes and one id per nonzero mode. ValueError when it does not parse."""
+    while p < stop:
+        p = data.index(b"\0", p, stop) + 1  # the path
+        modes = []
+        for _ in range(3):
+            nul = data.index(b"\0", p, stop)
+            modes.append(int(data[p:nul], 8))
+            p = nul + 1
+        for mode in modes:
+            if mode:
+                if p + hashsz > stop:
+                    raise ValueError("resolve-undo id truncated")
+                out[p:p + hashsz] = bytes(hashsz)
+                p += hashsz
+
+
+UNTR_STAT_BYTES = 36  # stat data without the mode: ctime, mtime, dev, ino, uid, gid, size
+
+
+def _ewah_set_bits(data: bytes, p: int, stop: int) -> tuple[int, int]:
+    """Count the set bits of the EWAH bitmap at ``p``: ``(count, end)``."""
+    if p + 8 > stop:
+        raise ValueError("bitmap truncated")
+    bit_size, words = struct.unpack(">II", data[p:p + 8])
+    w = p + 8
+    rlw_end = w + 8 * words
+    if rlw_end + 4 > stop:
+        raise ValueError("bitmap truncated")
+    bits = count = 0
+    while w < rlw_end:
+        (rlw,) = struct.unpack(">Q", data[w:w + 8])
+        w += 8
+        run, literals = (rlw >> 1) & 0xFFFFFFFF, rlw >> 33
+        if rlw & 1:
+            count += max(0, min(64 * run, bit_size - bits))
+        bits += 64 * run
+        for _ in range(literals):
+            if w >= rlw_end:
+                raise ValueError("bitmap literal words truncated")
+            (word,) = struct.unpack(">Q", data[w:w + 8])
+            if bits < bit_size:
+                word &= (1 << min(64, bit_size - bits)) - 1
+                count += bin(word).count("1")
+            bits += 64
+            w += 8
+    return count, rlw_end + 4
+
+
+def _blank_untracked_cache(data: bytes, out: bytearray, p: int, stop: int, hashsz: int) -> None:
+    """Blank everything in a ``UNTR`` extension body except its text: the environment
+    strings, the per-directory exclude file name and the directory and untracked names stay;
+    stat data, flags, ids, counts and bitmaps are set to NUL. ValueError when it does not
+    parse."""
+    start = p
+    ident, p = _index_varint(data, p)
+    out[start:p] = bytes(p - start)
+    p += ident  # NUL-terminated environment strings
+    fixed = 2 * UNTR_STAT_BYTES + 4 + 2 * hashsz  # two stat data, dir_flags, two ids
+    if p + fixed > stop:
+        raise ValueError("untracked cache header truncated")
+    out[p:p + fixed] = bytes(fixed)
+    p = data.index(b"\0", p + fixed, stop) + 1  # the per-directory exclude file name
+    start = p
+    blocks, p = _index_varint(data, p)
+    out[start:p] = bytes(p - start)
+    if not blocks:
+        if p != stop:
+            raise ValueError("bytes after an empty untracked cache")
+        return
+    seen = 0
+    pending = 1  # directory blocks still to read, depth first from the root
+    while pending:
+        pending -= 1
+        seen += 1
+        start = p
+        untracked, p = _index_varint(data, p)
+        subdirs, p = _index_varint(data, p)
+        out[start:p] = bytes(p - start)
+        for _ in range(untracked + 1):  # the directory name, then its untracked names
+            p = data.index(b"\0", p, stop) + 1
+        pending += subdirs
+    if seen != blocks:
+        raise ValueError("untracked cache block count differs")
+    start = p
+    valid, p = _ewah_set_bits(data, p, stop)
+    _check_only, p = _ewah_set_bits(data, p, stop)
+    hashed, p = _ewah_set_bits(data, p, stop)
+    p += valid * UNTR_STAT_BYTES + hashed * hashsz
+    if p >= stop or data[p:stop] != b"\0":  # git ends the body with one NUL
+        raise ValueError("untracked cache tail")
+    out[start:p] = bytes(p - start)
+
+
+# Extensions whose bodies hold no names, only ids, offsets, counts and bitmaps.
+INDEX_BINARY_EXTENSIONS = (b"link", b"EOIE", b"IEOT")
 
 
 def _index_blanked(data: bytes, hashsz: int) -> bytes:
@@ -281,8 +381,15 @@ def _index_blanked(data: bytes, hashsz: int) -> bytes:
         if body + size > end:
             raise ValueError("extension overruns the checksum")
         out[off + 4:body] = bytes(4)
-        if data[off:off + 4] == b"TREE":
+        sig = data[off:off + 4]
+        if sig == b"TREE":
             _blank_cache_tree(data, out, body, body + size, hashsz)
+        elif sig == b"REUC":
+            _blank_resolve_undo(data, out, body, body + size, hashsz)
+        elif sig == b"UNTR":
+            _blank_untracked_cache(data, out, body, body + size, hashsz)
+        elif sig in INDEX_BINARY_EXTENSIONS:
+            out[body:body + size] = bytes(size)
         off = body + size
     out[end:] = bytes(hashsz)
     return bytes(out)
@@ -290,8 +397,9 @@ def _index_blanked(data: bytes, hashsz: int) -> bytes:
 
 def index_scan_bytes(data: bytes) -> bytes:
     """``data`` with the binary fields of a git index (v2-v4, SHA-1 or SHA-256 ids) set to
-    NUL: entry stat data, ids, flags and v4 prefix lengths, extension sizes, cache-tree ids
-    and the trailing checksum. Names and all other extension bytes are kept. Bytes that do
+    NUL: entry stat data, ids, flags and v4 prefix lengths, extension sizes, cache-tree and
+    resolve-undo ids, the untracked cache's binary fields, the link/EOIE/IEOT bodies and the
+    trailing checksum. Names, text and other extensions' bytes are kept. Bytes that do
     not parse as an index, or whose checksum does not match, come back unchanged and are
     scanned whole."""
     for hashsz in (20, 32):

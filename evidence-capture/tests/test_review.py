@@ -493,6 +493,81 @@ def test_index_scan_bytes_blanks_only_binary_fields(root: Path) -> None:
     assert {"v2", "sha256"} <= set(with_tree), with_tree
 
 
+def _extension_bodies(raw: bytes, out: bytes, hashsz: int = 20) -> dict[bytes, bytes]:
+    """The blanked body of each extension in ``out``, located by the sizes in ``raw``
+    (``out`` has them blanked)."""
+    off = 12
+    for _ in range(struct.unpack(">I", raw[8:12])[0]):
+        off += (62 + (struct.unpack(">H", raw[off + 60:off + 62])[0] & 0xFFF) + 8) & ~7
+    bodies = {}
+    while off < len(raw) - hashsz:
+        size = struct.unpack(">I", raw[off + 4:off + 8])[0]
+        bodies[raw[off:off + 4]] = out[off + 8:off + 8 + size]
+        off += 8 + size
+    return bodies
+
+
+def test_index_scan_bytes_blanks_resolve_undo_and_untracked_cache(root: Path) -> None:
+    """SA09-3: the resolve-undo (REUC) and untracked-cache (UNTR) extensions git writes hold
+    object ids, stat data, flags, counts and bitmaps beside their names. Only the names and
+    text are scanned; every binary byte is blanked."""
+    repo = tc.make_repo(root)
+    tc.git(repo, "checkout", "-q", "-b", "side")
+    (repo / "README.md").write_text("# side\n", encoding="utf-8")
+    tc.git(repo, "commit", "-q", "-am", "side")
+    tc.git(repo, "checkout", "-q", "main")
+    (repo / "README.md").write_text("# main\n", encoding="utf-8")
+    tc.git(repo, "commit", "-q", "-am", "main")
+    subprocess.run(["git", "merge", "-q", "side"], cwd=repo, capture_output=True, check=False)  # conflicts
+    (repo / "README.md").write_text("# merged\n", encoding="utf-8")
+    tc.git(repo, "add", "README.md")  # records the conflict in REUC
+    (repo / "notes.txt").write_text("n\n", encoding="utf-8")
+    (repo / "sub").mkdir()
+    (repo / "sub" / "new.txt").write_text("n\n", encoding="utf-8")
+    tc.git(repo, "config", "core.untrackedCache", "true")
+    tc.git(repo, "update-index", "--untracked-cache")
+    tc.git(repo, "status", "--porcelain")  # fills UNTR (-uall bypasses the cache)
+    tc.git(repo, "status", "--porcelain")  # and writes it
+    raw = (repo / ".git" / "index").read_bytes()
+    out = review.index_scan_bytes(raw)
+    assert out != raw and len(out) == len(raw)
+    bodies = _extension_bodies(raw, out)
+    assert {b"REUC", b"UNTR"} <= set(bodies), sorted(bodies)
+    names = {b"README.md", b"100644", b".gitignore", b"notes.txt", b"sub/", b"sub", b"src", b"new.txt"}  # src: a tracked dir
+    for sig in (b"REUC", b"UNTR"):
+        runs = [r for r in bodies[sig].split(b"\0") if r]
+        left = [r for r in runs if r not in names and not r.startswith(b"Location ")]
+        assert not left, (sig, "binary bytes left in the scan", left)
+        assert b"README.md" in runs if sig == b"REUC" else {b".gitignore", b"new.txt"} <= set(runs), (sig, runs)
+
+
+def test_privacy_scope_ignores_resolve_undo_ids(root: Path) -> None:
+    """SA09-3 probe: a REUC object id whose bytes read as an outside path excluded the
+    episode (privacy_scope) although no path left the repository."""
+    st = make_stores(root)
+    repo = tc.make_repo(root)
+    m, i = episode(st, repo)
+    snap = st.snapshots / m["episode_id"]
+    clean = (snap / "index.bin").read_bytes()
+    oid = (b"D:" if os.name == "nt" else b"/opt") + (b"/elsewhere/data.cs" if os.name == "nt" else b"/elsewhere/data1")
+    assert len(oid) == 20
+    entry = b"\0".join([b"README.md", b"100644", b"100644", b"100644", b""]) + oid * 3
+    body = clean[:-20] + b"REUC" + struct.pack(">I", len(entry)) + entry
+    (snap / "index.bin").write_bytes(body + hashlib.sha1(body).digest())
+    priv = review.privacy_check(m, snap, i)
+    assert priv["passed"], priv
+    real = review.index_scan_bytes
+    try:
+        review.index_scan_bytes = lambda data: data  # the scan before the fix
+        assert review.privacy_check(m, snap, i)["by_check"]["path_outside_repo"] >= 1, "the probe's hit"
+    finally:
+        review.index_scan_bytes = real
+    # A REUC that does not parse is scanned whole (fail closed).
+    cut = clean[:-20] + b"REUC" + struct.pack(">I", len(entry) - 1) + entry[:-1]
+    (snap / "index.bin").write_bytes(cut + hashlib.sha1(cut).digest())
+    assert review.index_scan_bytes((snap / "index.bin").read_bytes()) == (snap / "index.bin").read_bytes()
+
+
 def test_deny_glob_double_star_matches_root(root: Path) -> None:
     """``**/x`` means x at any depth, the repository root included: a root-level private
     file must not pass the screen because fnmatch has no ``**``."""
