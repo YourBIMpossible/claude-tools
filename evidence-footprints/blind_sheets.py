@@ -161,7 +161,8 @@ def render_sheet(blind_id: str, row: dict, fp: fpm.Footprint, texts: list[str] |
             first_touch.setdefault(p, (idx, role))
     out += [f"- `{p}` ({r}, {i})" for p, (i, r) in sorted(first_touch.items())] or ["- (none)"]
     out += ["", f"Paths outside this repository (not scored): {fp.outside}",
-            f"Paths whose working directory could not be resolved (not classified): {fp.unresolved}", ""]
+            f"Paths that could not be located — unknown working directory, $VAR/%VAR%/~ path, "
+            f"or `..` above the root (not classified): {fp.unresolved}", ""]
     return "\n".join(out)
 
 

@@ -36,6 +36,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import stat
 import statistics
 import subprocess
@@ -292,12 +293,49 @@ def score_run(state: StreamState, repo: Path, task: dict) -> dict:
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill ``proc`` and, where it can be found, every process it started: ``taskkill /T`` on
+    Windows; on POSIX the process group when ``proc`` leads its own (``start_new_session``),
+    else ``proc`` alone."""
     if proc.poll() is not None:
         return
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
-    else:
-        proc.kill()
+        return
+    try:
+        if os.getpgid(proc.pid) == proc.pid:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+    except ProcessLookupError:
+        return
+    proc.kill()
+
+
+# Seconds to drain a killed verify's pipes. A process that escaped the tree kill and still
+# holds them must not hold the run: past this the pipes are abandoned.
+KILL_GRACE = 5.0
+
+
+def run_verify(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float) -> tuple[bool, str | None]:
+    """``(verified, verify_error)`` for one verify command. Past ``timeout`` the command is
+    killed with every process it started and the result is ``(False, "timeout after …")``;
+    the whole call is bounded by ``timeout + KILL_GRACE``."""
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=os.name != "nt")
+    try:
+        proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        try:
+            proc.communicate(timeout=KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+            proc.kill()
+            proc.wait(timeout=KILL_GRACE)
+            return False, f"timeout after {timeout:g}s; output pipes still held after the kill"
+        return False, f"timeout after {timeout:g}s"
+    return proc.returncode == 0, None
 
 
 # Built-in plugins whose availability a remote feature flag decides per launch, so two runs of
@@ -438,13 +476,8 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
     verify_error = None
     if task.get("verify"):
         # verify.py imports the run's edited code: it gets the run's environment, not the harness's.
-        try:
-            v = subprocess.run([sys.executable, task["verify"], str(repo)], cwd=repo, capture_output=True,
-                               text=True, env=env, timeout=VERIFY_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            verified, verify_error = False, f"timeout after {VERIFY_TIMEOUT:g}s"
-        else:
-            verified = v.returncode == 0
+        verified, verify_error = run_verify([sys.executable, task["verify"], str(repo)], cwd=repo, env=env,
+                                            timeout=VERIFY_TIMEOUT)
     scored = score_run(state, repo, task)
     trace = [] if rmtree(work, tries=30) else [f"scratch not deleted: {work}"]
     trace += clear_project_trace(projects, repo)
@@ -619,13 +652,16 @@ def report(tasks: list[dict], plan_obj: dict, archive: Path, cap: int, seed: int
             metas.setdefault((run["task_id"], run["arm"]), []).append(read_json(path))
         else:
             missing.append(run["run_id"])
-    lab, real, guard = {}, {}, {arm: {"verified": 0, "checked": 0} for arm in ARMS}
+    # a verify that timed out says nothing about the edit: it is counted apart, never as a fail
+    lab, real, guard = {}, {}, {arm: {"verified": 0, "checked": 0, "timed_out": 0} for arm in ARMS}
     for t in sorted(tasks, key=lambda t: t["task_id"]):
         a = sorted(metas.get((t["task_id"], "A"), []), key=lambda m: m["repeat"])
         b = sorted(metas.get((t["task_id"], "B"), []), key=lambda m: m["repeat"])
         for arm, ms in (("A", a), ("B", b)):
             for m in ms:
-                if m.get("verified") is not None:
+                if (m.get("verify_error") or "").startswith("timeout"):
+                    guard[arm]["timed_out"] += 1
+                elif m.get("verified") is not None:
                     guard[arm]["checked"] += 1
                     guard[arm]["verified"] += bool(m["verified"])
         if not a or not b or len(a) != len(b):

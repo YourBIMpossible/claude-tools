@@ -401,7 +401,8 @@ def _pend_or_lose(stores: Stores | None, env: dict[str, str], rec: dict[str, Any
     if error is None:
         return {"action": "pending", "episode_id": rec["episode_id"], "reason": reason}
     log_line(stores if stores is not None and stores.meta.is_dir() else None,
-             f"start {rec['episode_id']}: LOST, pending record not written ({error}); cause: {reason[:300]}")
+             f"start {rec['episode_id']} started_at {rec.get('started_at') or '-'}: LOST, "
+             f"pending record not written ({error}); cause: {reason[:300]}")
     return {"action": "lost", "episode_id": rec["episode_id"], "reason": reason, "error": error}
 
 
@@ -1072,7 +1073,8 @@ def _is_capture_failure(m: dict[str, Any]) -> bool:
 
 def capture_failure_records(stores: Stores, env: dict[str, str]) -> tuple[list[str], list[str]]:
     """``(start times, problems)`` of every capture failure on record: failed manifests,
-    pending records and records claimed by a drain still in flight (``.draining`` files).
+    pending records, records claimed by a drain still in flight (``.draining`` files) and
+    starts logged LOST because their pending record could not be written.
 
     A record an in-flight drain already turned into a manifest is counted once. A pending
     or claimed file that exists but cannot be read, and a record without a readable start
@@ -1106,7 +1108,38 @@ def capture_failure_records(stores: Stores, env: dict[str, str]) -> tuple[list[s
                 continue
             seen.add(ep)
             times.append(rec["started_at"])
+    for ep, started in _lost_starts(stores, env, problems):
+        if ep not in seen:
+            seen.add(ep)
+            times.append(started)
     return sorted(times), problems
+
+
+_LOST_LINE = re.compile(r"^(\S+) start (\S+?)(?: started_at (\S+))?: LOST, ")
+
+
+def _lost_starts(stores: Stores, env: dict[str, str], problems: list[str]) -> list[tuple[str, str]]:
+    """``(episode, start time)`` of every start logged LOST (its pending record could not be
+    written), from ``capture.log`` and the temp-dir fallback log. A line from before start
+    times were logged counts at the line's own time. An unreadable log is a problem."""
+    out = []
+    logs = [stores.meta / "capture.log",
+            Path(env.get("TEMP") or env.get("TMPDIR") or ".") / "ec-capture-failures.log"]
+    for f in logs:
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            problems.append(f"log unreadable {f.name}: {type(exc).__name__}")
+            continue
+        for line in lines:
+            hit = _LOST_LINE.match(line)
+            if hit is None:
+                continue
+            started = hit.group(3) if hit.group(3) not in (None, "-") else hit.group(1)
+            out.append((hit.group(2), started))
+    return out
 
 
 def failure_streaks(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:

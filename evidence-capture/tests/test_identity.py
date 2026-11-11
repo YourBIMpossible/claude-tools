@@ -113,14 +113,17 @@ def test_unidentified_client_fails_closed_without_failing_capture(root: Path) ->
 
 
 class _TrippableClock:
-    """``time`` as pipeline sees it: ``perf_counter`` reads 0 until tripped, then a value
-    past the start budget; everything else is the real module."""
+    """``time`` as pipeline sees it: ``perf_counter`` reads 0 until tripped, then ``after``
+    (default: a value past the start budget); everything else is the real module."""
 
-    def __init__(self) -> None:
+    def __init__(self, after: float | None = None) -> None:
         self.tripped = False
+        self.after = after
 
     def perf_counter(self) -> float:
-        return (pipeline.START_BUDGET_MS + 500) / 1000 if self.tripped else 0.0
+        if not self.tripped:
+            return 0.0
+        return self.after if self.after is not None else (pipeline.START_BUDGET_MS + 500) / 1000
 
     def __getattr__(self, name: str) -> Any:
         return getattr(time, name)
@@ -167,6 +170,50 @@ def test_over_budget_start_keeps_identity_verdict(root: Path) -> None:
     assert res["action"] == "ended" and res["status"] == "partial", res
     m = fx.episode(sid)
     assert m["capture"]["status"] == "partial" and m["capture"]["errors"] == ["start_over_budget"], m["capture"]
+    assert m["client"]["problem"] == "pid_missing", m["client"]
+    b = m["boundary"]
+    assert not b["trusted"] and b["reason"] == "identity_unverified:pid_missing", b
+    assert m["review"]["state"] == "held" and m["review"]["reason"] == "unknown:X7", m["review"]
+    assert load_inconclusive(m) is not None, "the wall-clock tests must recognise this shape as load"
+
+
+def test_over_budget_end_keeps_identity_verdict(root: Path) -> None:
+    """SA26-12, by construction: an end that runs over ``END_BUDGET_S`` (the clock is tripped
+    after the screen) records ``end_over_budget`` and ends ``partial``, never ``failed``;
+    the client problem and the untrusted boundary are unchanged by it, the review is held
+    on X7, and the wall-clock tests read the shape as load."""
+    try:
+        import yaml  # noqa: F401
+    except ImportError as exc:  # the fixture repo carries config.yaml: every capture would add config:yaml_unavailable
+        raise Skip("PyYAML missing (pip install pyyaml): the capture errors could not be pinned to the budget") from exc
+    fx = Fixture(root)
+    env = {k: v for k, v in fx.env.items() if k != ci.ENV_PID}
+    sid = str(uuid.uuid4())
+    ts = iso(now_utc())
+    old_start = pipeline.START_BUDGET_MS
+    pipeline.START_BUDGET_MS = 10 ** 9  # only the end is under test: a loaded machine must not put the start over
+    try:
+        res = pipeline.run_start({"session_id": sid, "prompt": PROMPT, "cwd": str(fx.repo)}, env, now=ts)
+    finally:
+        pipeline.START_BUDGET_MS = old_start
+    assert res["action"] == "captured", res
+    clock = _TrippableClock(after=pipeline.END_BUDGET_S + 1.0)
+    real_time, real_screen = pipeline.time, pipeline.screen
+
+    def screen_then_trip(*args: Any, **kw: Any) -> Any:
+        out = real_screen(*args, **kw)
+        clock.tripped = True
+        return out
+    tp = fx.transcript(sid, PROMPT, None, ts)
+    pipeline.time, pipeline.screen = clock, screen_then_trip  # type: ignore[assignment]
+    try:
+        res = pipeline.run_end({"session_id": sid, "transcript_path": str(tp), "cwd": str(fx.repo)}, env)
+    finally:
+        pipeline.time, pipeline.screen = real_time, real_screen  # type: ignore[assignment]
+    assert res["action"] == "ended" and res["status"] == "partial", res
+    m = fx.episode(sid)
+    assert m["capture"]["status"] == "partial" and m["capture"]["errors"] == ["end_over_budget"], m["capture"]
+    assert m["capture"]["end_ms"] > pipeline.END_BUDGET_S * 1000, m["capture"]
     assert m["client"]["problem"] == "pid_missing", m["client"]
     b = m["boundary"]
     assert not b["trusted"] and b["reason"] == "identity_unverified:pid_missing", b
@@ -288,7 +335,7 @@ def test_no_command_line_or_secret_reads(root: Path) -> None:
 
 
 TESTS = [test_end_to_end_trusted_and_no_path, test_unidentified_client_fails_closed_without_failing_capture,
-         test_over_budget_start_keeps_identity_verdict, test_observe, test_resolve_cache_and_drift, test_load_boundary_reasons,
+         test_over_budget_start_keeps_identity_verdict, test_over_budget_end_keeps_identity_verdict, test_observe, test_resolve_cache_and_drift, test_load_boundary_reasons,
          test_acceptance_takes_effect_in_maintenance, test_tested_identity, test_no_command_line_or_secret_reads]
 
 

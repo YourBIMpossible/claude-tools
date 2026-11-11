@@ -424,7 +424,8 @@ def owner_review_path(stores: Stores, episode: str) -> Path:
 
 def load_owner_review(stores: Stores, episode: str) -> dict[str, Any] | None:
     """The owner's recorded review for one episode, or None. A file naming another
-    episode, or unreadable, is ignored and logged."""
+    episode, unreadable, or whose ``rules`` is not ``{rule: {state, basis}}``, is ignored
+    and logged."""
     p = owner_review_path(stores, episode)
     if not p.is_file():
         return None
@@ -435,6 +436,10 @@ def load_owner_review(stores: Stores, episode: str) -> dict[str, Any] | None:
         return None
     if not isinstance(rec, dict) or rec.get("episode_id") != episode:
         log_line(stores, f"owner review names another episode: {episode}")
+        return None
+    rules = rec.get("rules")
+    if rules is not None and not (isinstance(rules, dict) and all(isinstance(v, dict) for v in rules.values())):
+        log_line(stores, f"owner review malformed (rules): {episode}")
         return None
     return rec
 

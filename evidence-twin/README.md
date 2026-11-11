@@ -67,7 +67,11 @@ Each archived run holds `stream.jsonl`, `diff.patch` (against the starting HEAD)
 `stderr.txt` and `meta.json` (CLI version, model, init counts, tokens, target reach,
 verify result, planted files touched, sha256 of stream and diff). `verify.py` runs in the
 run's environment with a 120 s limit; a verify that hangs is recorded as unverified
-(`verify_error`), and the run's spend still reaches the ledger.
+(`verify_error`), and the run's spend still reaches the ledger. At the limit the verify's
+whole process tree is killed (its own process group on POSIX, `taskkill /T` on Windows)
+and its output is read for at most 5 s more, so a grandchild holding the pipes cannot
+stall the run. The report's guardrail counts a timed-out verify as `timed_out`, apart
+from `checked`/`verified`: a hang says nothing about the edit.
 
 ## Lab controls
 

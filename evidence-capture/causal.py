@@ -40,6 +40,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -448,13 +449,16 @@ HOOK_TOOLS: dict[str, list[str]] = {"git": ["git", "--version"], "node": ["node"
 
 
 def tool_versions_async(tools: dict[str, list[str]] | None = None) -> dict[str, subprocess.Popen[bytes] | str]:
-    """Start every version probe at once; ``collect_tool_versions`` reaps them."""
+    """Start every version probe at once; ``collect_tool_versions`` reaps them. Only a
+    missing executable is ``absent``; any other spawn error is ``unrecorded:<error>``."""
     out: dict[str, subprocess.Popen[bytes] | str] = {"python": sys.version.split()[0]}
     for name, argv in sorted((tools or HOOK_TOOLS).items()):
         try:
             out[name] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except OSError:
+        except FileNotFoundError:
             out[name] = "absent"
+        except OSError as exc:
+            out[name] = f"unrecorded:{type(exc).__name__}"
     return out
 
 
@@ -787,6 +791,9 @@ def shared_git_state(repo: Path) -> str:
     return sha256_bytes(b"\0\0".join(parts))
 
 
+READ_FLOOR_S = 0.05
+
+
 def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, Any]]:
     """Every OTHER worktree sharing this repository: ``{path: {"fp", "head", "paths"}}``,
     where ``fp`` is sha256(HEAD + status) and ``paths`` the paths its status names
@@ -820,17 +827,30 @@ def worktree_records(repo: Path, timeout: float = 30.0) -> dict[str, dict[str, A
                 proc.communicate()
                 raise
             procs[path] = (fields.get(b"HEAD", b""), proc, probe)
-        for path, (head, proc, probe) in procs.items():
+        # One deadline for every status and probe: they all run at once, so N worktrees
+        # (hung or not) cost about ``timeout`` together, never ``timeout`` each. Statuses are
+        # reaped first so a hung probe cannot spend a status's time. Past the deadline each
+        # wait still gets READ_FLOOR_S, enough to drain a process that already exited
+        # (``communicate(timeout=0)`` raises before reading its pipes).
+        deadline = time.monotonic() + timeout
+
+        def left() -> float:
+            return max(READ_FLOOR_S, deadline - time.monotonic())
+
+        statuses: dict[str, tuple[bytes, bytes]] = {}
+        for path, (_, proc, _) in procs.items():
             try:
-                status, err = proc.communicate(timeout=timeout)
+                statuses[path] = proc.communicate(timeout=left())
             except subprocess.TimeoutExpired:
                 raise CausalError("worktree_status_timeout") from None
+        for path, (head, proc, probe) in procs.items():
+            status, err = statuses[path]
             if proc.returncode != 0:
                 out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
                              "status_error": {"rc": proc.returncode,
                                               "stderr": err.decode("utf-8", "replace").strip()[:2000]}}
                 continue
-            mismatch = _toplevel_mismatch(path, timeout, probe)
+            mismatch = _toplevel_mismatch(path, left(), probe)
             if mismatch is not None:
                 out[path] = {"fp": None, "head": head.decode() or None, "paths": None,
                              "status_error": {"rc": 0, "stderr": mismatch}}
@@ -877,11 +897,6 @@ def unobservable_worktrees(*records: dict[str, dict[str, Any]] | None) -> list[s
     """Worktrees any given record set could not observe (``fp`` is ``None``: the status
     command failed). Such a worktree has no state to compare, so it can never be unmoved."""
     return sorted({k for recs in records if recs for k, v in recs.items() if (v or {}).get("fp") is None})
-
-
-def worktree_fingerprints(repo: Path, timeout: float = 30.0) -> dict[str, str | None]:
-    """``None`` for a worktree whose status could not be observed."""
-    return {k: v["fp"] for k, v in worktree_records(repo, timeout).items()}
 
 
 INSTALL_WORDS = ("npm install", "npm ci", "pnpm install", "yarn install", "yarn add", "npm i ",
@@ -963,10 +978,15 @@ def attribute(start: dict[str, Any], end: dict[str, Any], agent_writes: list[str
 
 
 def _tool_version(argv: list[str]) -> str:
+    """The tool's first version line; ``absent`` only when the executable is missing."""
     try:
         proc = subprocess.run(argv, capture_output=True, timeout=20)
-    except (OSError, subprocess.TimeoutExpired):
+    except FileNotFoundError:
         return "absent"
+    except subprocess.TimeoutExpired:
+        return "unrecorded:timeout"
+    except OSError as exc:
+        return f"unrecorded:{type(exc).__name__}"
     text = (proc.stdout or proc.stderr).decode("utf-8", "replace").strip()
     return text.splitlines()[0] if proc.returncode == 0 and text else f"error:{proc.returncode}"
 

@@ -262,12 +262,146 @@ def test_sa15_x6_x7_are_unresolved_not_scope(root: Path) -> None:
     assert report.blocker_partition([x])["classes"] == {"scope_excluded": 1}
 
 
+# ------------------------------------------------------------------- 2026-10-26 audit (SA26-*)
+
+def test_sa26_8_lost_start_is_a_capture_failure(root: Path) -> None:
+    """SA26-8: a start whose pending record cannot be written is counted as a capture failure
+    at its start time, so the health check and the failure streaks see it."""
+    st = plain_stores(root)
+    tmp = root / "tmp"
+    env = {"TEMP": str(tmp)}
+    rec = {"episode_id": "cap_sa26_8_0000", "started_at": "2026-10-26T10:00:00.000000Z"}
+    with patched(pipeline, "record_pending", lambda e, r: "PermissionError: denied"):  # the pending append fails
+        assert pipeline._pend_or_lose(st, env, rec, "stores unwritable")["action"] == "lost"
+        times, problems = pipeline.capture_failure_records(st, env)
+        assert times == [rec["started_at"]] and problems == [], (times, problems)
+        # the same lost start logged again (a retried drain) is still one failure
+        assert pipeline._pend_or_lose(st, env, rec, "stores unwritable")["action"] == "lost"
+        assert pipeline.capture_failure_records(st, env)[0] == [rec["started_at"]]
+        # with no stores the line goes to the temp-dir log, which is read too
+        rec2 = {"episode_id": "cap_sa26_8_0001", "started_at": "2026-10-26T11:00:00.000000Z"}
+        with patched(store.os, "environ", {**store.os.environ, "TEMP": str(tmp)}):
+            assert pipeline._pend_or_lose(None, env, rec2, "no stores")["action"] == "lost"
+    assert pipeline.capture_failure_records(st, env)[0] == [rec["started_at"], rec2["started_at"]]
+    # a LOST line written before start times were logged counts at the line's own time
+    with (st.meta / "capture.log").open("a", encoding="utf-8") as fh:
+        fh.write("2026-10-26T12:00:00.000000Z start cap_sa26_8_0002: LOST, pending record not written (x); cause: y\n")
+    assert pipeline.capture_failure_records(st, env)[0][-1] == "2026-10-26T12:00:00.000000Z"
+
+
+def test_sa26_10_malformed_owner_review_is_ignored(root: Path) -> None:
+    """SA26-10: an owner review whose rules are not ``{rule: {state, basis}}`` is ignored and
+    logged, never raised from refresh or checkpoint."""
+    st = plain_stores(root)
+    ep = "cap_sa26_10_0000"
+    path = review.owner_review_path(st, ep)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for bad in ({"X2": "no"}, ["X2"], "X2", {"X2": {"state": "no"}, "X3": None}):
+        path.write_text(json.dumps({"episode_id": ep, "rules": bad}), encoding="utf-8")
+        assert review.load_owner_review(st, ep) is None, bad
+    good = {"episode_id": ep, "rules": {"X2": {"state": "no", "basis": "owner read the diff"}}}
+    path.write_text(json.dumps(good), encoding="utf-8")
+    assert review.load_owner_review(st, ep) == good
+    path.write_text(json.dumps({"episode_id": ep}), encoding="utf-8")  # no rules at all stays valid
+    assert review.load_owner_review(st, ep) == {"episode_id": ep}
+    m = tc.base_manifest("fix alpha")
+    mf.refresh(m, (review.load_owner_review(st, ep) or {}).get("rules"))
+    assert "owner review malformed" in (st.meta / "capture.log").read_text(encoding="utf-8")
+
+
+def test_sa26_13_worktree_probes_share_one_deadline(root: Path) -> None:
+    """SA26-13: hung toplevel probes cost one timeout in total, not one per worktree."""
+    repo = root / "repo"
+    env = {**store.os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t"}
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+    repo.mkdir()
+    git("init", "-q")
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    git("add", "a.txt")
+    git("commit", "-qm", "a")
+    for i in range(4):
+        git("worktree", "add", "-q", "--detach", str(root / f"wt{i}"))
+
+    def hung(_path: str) -> subprocess.Popen[bytes]:
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    with patched(causal, "_toplevel_probe", hung):
+        t = time.monotonic()
+        recs = causal.worktree_records(repo, timeout=1.0)
+        took = time.monotonic() - t
+    assert len(recs) == 4 and all(r["fp"] is None for r in recs.values()), recs
+    assert all("timeout" in r["status_error"]["stderr"] for r in recs.values()), recs
+    assert took < 2.5, f"4 hung probes took {took:.1f}s against a 1 s timeout"
+
+
+def test_sa26_14_spawn_error_is_not_absent(root: Path) -> None:
+    """SA26-14: only a missing executable is "absent"; a spawn error or a timeout is unrecorded."""
+    blocked = root / "not-executable"
+    blocked.write_text("", encoding="utf-8")
+    blocked.chmod(0o644)
+    missing = str(root / "no-such-tool")
+    got = causal.collect_tool_versions(causal.tool_versions_async({"gone": [missing], "blocked": [str(blocked)]}), 5.0)
+    assert got["gone"] == "absent", got
+    if store.os.name != "nt":  # Windows has no execute bit: the file is a bad image, still not absent
+        assert got["blocked"] == "unrecorded:PermissionError", got
+    assert causal._tool_version([missing]) == "absent"
+
+    def timeout(*a: Any, **k: Any) -> Any:
+        raise subprocess.TimeoutExpired(a[0], 20)
+
+    with patched(causal.subprocess, "run", timeout):
+        assert causal._tool_version(["git", "--version"]) == "unrecorded:timeout"
+
+
+def test_sa26_15_sole_screen_blocker_names_its_cause(root: Path) -> None:
+    """SA26-15: a screen gate that fails alone always names why, never a bare ``screen:``."""
+    m = tc.base_manifest("fix alpha")
+    m["funnel"] = {k: k != "dependency_screen_clear" for k in mf.FUNNEL}
+    m["exclusions"] = [{"rule": r, "state": "no"} for r in mf.RULES]
+    m["observation"]["sufficient"] = False
+    assert report._sole_blocker(m) == "screen:observation"
+    m["observation"]["sufficient"] = True
+    m["exclusions"] = [{"rule": r, "state": "unknown" if r == "X7" else "no"} for r in mf.RULES]
+    assert report._sole_blocker(m) == "screen:X7"
+    m["exclusions"] = [{"rule": r, "state": "yes" if r in ("X2", "X6") else "no"} for r in mf.RULES]
+    assert report._sole_blocker(m) == "screen:X2+X6"
+
+
+def test_sa26_27_rescreen_cli_fails_an_incomplete_run(root: Path) -> None:
+    """SA26-27: malformed or unreadable manifests, child failures and deferred episodes exit 3
+    and are named on stderr; a commit failure still exits 2."""
+    st = plain_stores(root)
+    clean = {"action": "rescreened", "changed": [], "committed": True, "child_failures": [], "deferred": [],
+             "manifests_malformed": [], "manifests_unreadable": 0}
+    cases = ((clean, 0, None),
+             ({**clean, "manifests_malformed": ["e1"]}, 3, "manifests_malformed 1"),
+             ({**clean, "manifests_unreadable": 2}, 3, "manifests_unreadable 2"),
+             ({**clean, "child_failures": [{"episode_id": "e", "cause": "exit 3"}]}, 3, "child_failures 1"),
+             ({**clean, "deferred": ["e2", "e3"]}, 3, "deferred 2"),
+             ({**clean, "deferred": ["e2"], "committed": False}, 2, "metadata commit failed"))
+    for res, rc, says in cases:
+        err = io.StringIO()
+        with patched(capture, "_stores", lambda env: st), patched(rescreen, "run_rescreen", lambda s, e: res), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            got = capture.main(["rescreen"])
+        assert got == rc, (res, got)
+        assert (says in err.getvalue()) if says else err.getvalue() == "", err.getvalue()
+
+
 TESTS: list[Callable[[Path], None]] = [
     test_sa5_start_steps_share_one_budget, test_sa6_stuck_open_pointers_are_counted,
     test_sa7_unreadable_failure_records_cap_health, test_sa8_rescreen_child_failure_and_commit_failure_surface,
     test_sa10_expire_keeps_every_deletion, test_sa11_both_deletion_errors_are_kept,
     test_sa12_unreadable_git_config_raises, test_sa13_unread_small_file_marks_lfs_scan_incomplete,
-    test_sa14_failed_history_read_is_not_a_rewrite, test_sa15_x6_x7_are_unresolved_not_scope]
+    test_sa14_failed_history_read_is_not_a_rewrite, test_sa15_x6_x7_are_unresolved_not_scope,
+    test_sa26_8_lost_start_is_a_capture_failure, test_sa26_10_malformed_owner_review_is_ignored,
+    test_sa26_13_worktree_probes_share_one_deadline, test_sa26_14_spawn_error_is_not_absent,
+    test_sa26_15_sole_screen_blocker_names_its_cause, test_sa26_27_rescreen_cli_fails_an_incomplete_run]
 
 
 def main() -> int:
