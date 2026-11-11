@@ -211,9 +211,11 @@ def secret_scan(root: Path, out: TextIO, config_root: Path | None = None) -> int
     """gitleaks over the tracked tree, as CI scans its fresh checkout: ignored and untracked files are not published.
 
     The gitleaks config is `config_root`'s .gitleaks.toml (default: root's own). The pre-push hook passes the tip's
-    checkout when it scans an earlier commit, so that commit's own .gitleaks.toml cannot allowlist its own secret."""
+    checkout when it scans an earlier commit, so that commit's own .gitleaks.toml cannot allowlist its own secret.
+    The gitleaks binary is looked up from `config_root` too: the last place looked is a checkout's bin/, and an
+    earlier commit that ships its own bin/gitleaks must not be scanned by it (it could find nothing on purpose)."""
     config = (config_root or root) / GITLEAKS_CONFIG
-    gitleaks = find_gitleaks(root)
+    gitleaks = find_gitleaks(config_root or root)
     if not gitleaks:
         print(f"gitleaks not found ($GITLEAKS_BIN, PATH, <home>/.claude/bin, bin/). Install {GITLEAKS_PIN}: run the "
               "profile's `python tools/git_gate.py`, or follow bin/README.md. The secret scan is required.", file=out)

@@ -70,6 +70,20 @@ def run(root: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int,
     return r.returncode, (r.stdout + r.stderr).replace("\r\n", "\n")
 
 
+def run_no_gitleaks(root: Path, home: Path, *args: str) -> tuple[int, str]:
+    """`run` as on a machine with no gitleaks installed: none named by GITLEAKS_BIN, none on PATH, none under the
+    home folder (`home` is an empty one). The only place left to look is bin/ of a checkout."""
+    env = {k: v for k, v in ENV.items() if k.upper() != "GITLEAKS_BIN"}
+    path_key = next((k for k in env if k.upper() == "PATH"), "PATH")
+    env[path_key] = os.pathsep.join(
+        d for d in env.get(path_key, "").split(os.pathsep)
+        if d and not any((Path(d) / name).is_file() for name in ("gitleaks", "gitleaks.exe")))
+    env["HOME"] = env["USERPROFILE"] = str(home)
+    r = subprocess.run(list(args), cwd=root, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=env, stdin=subprocess.DEVNULL)
+    return r.returncode, (r.stdout + r.stderr).replace("\r\n", "\n")
+
+
 def git(root: Path, *args: str) -> str:
     rc, out = run(root, "git", *args)
     if rc != 0:
@@ -344,6 +358,31 @@ def main() -> int:
               rc != 0 and not remote_has(src, "selfscanner"), out)
         check("the tip's scanner is the one that ran on it",
               "public-boundary check" in failed_steps(out, widened) and "[email-address]" in out, out)
+
+        # Review N1: where no gitleaks is installed, the last place the gate looks is bin/ of a checkout. For an
+        # earlier commit that must be the TIP's bin/: a commit that ships its own "gitleaks" would scan itself clean.
+        print("earlier commit ships its own gitleaks")
+        branch(src, "selfbinary")
+        shipped = src / "bin" / ("gitleaks.exe" if os.name == "nt" else "gitleaks")
+        shipped.parent.mkdir(exist_ok=True)
+        if os.name == "nt":
+            shutil.copyfile(os.environ["ComSpec"], shipped)  # cmd.exe: ignores the arguments, exits 0 at end of input
+        else:
+            shipped.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shipped.chmod(shipped.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        commit(src, "config/settings.txt", f"token = {FAKE_TOKEN}\n", "add a secret and a scanner that finds nothing")
+        widened = head(src)
+        git(src, "rm", "-q", "-r", "config/settings.txt", "bin")
+        git(src, "commit", "-q", "-m", "remove the secret and the scanner")
+        empty_home = tmp / "empty-home"
+        empty_home.mkdir()
+        rc, out = run_no_gitleaks(src, empty_home, "git", "push", "-q", "origin", "selfbinary")
+        check("an earlier commit that ships its own gitleaks is refused",
+              rc != 0 and not remote_has(src, "selfbinary"), out)
+        # The decisive check: that commit's secret scan must not pass. With no gitleaks in the tip's bin/ either, the
+        # scan fails closed ("gitleaks not found") instead of running the scanner the commit brought along.
+        check("its secret scan fails closed; the scanner it ships is not the one used",
+              "gitleaks secret scan" in failed_steps(out, widened) and FAKE_TOKEN not in out, out)
 
         print("allowlist entries that stay to the tip")
         branch(src, "keptentry")

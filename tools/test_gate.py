@@ -317,6 +317,17 @@ def main() -> int:
             gate.find_gitleaks = saved
         check("missing gitleaks fails the scan and names the fix", rc == 1 and "git_gate.py" in out.getvalue()
               and "required" in out.getvalue(), out.getvalue())
+        # Review N1: the binary is looked up where the config is, never in the scanned tree.
+        looked: list[Path] = []
+        gate.find_gitleaks = lambda r, environ=None, which=None: looked.append(Path(r)) or None
+        try:
+            with tempfile.TemporaryDirectory() as other:
+                gate.secret_scan(root, io.StringIO(), config_root=Path(other))
+                gate.secret_scan(root, io.StringIO())
+                check("the scanner is looked up from the config's checkout, and from the scanned one only when "
+                      "they are the same", looked == [Path(other), root], str(looked))
+        finally:
+            gate.find_gitleaks = saved
 
     gitleaks = gate.find_gitleaks(REPO)
     check("gitleaks is installed here (the gate needs it)", gitleaks is not None,
