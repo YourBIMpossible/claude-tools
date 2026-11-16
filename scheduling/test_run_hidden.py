@@ -30,6 +30,7 @@ LAUNCHER = HERE / "run-hidden.js"
 WSCRIPT = (Path(os.environ["SystemRoot"]) / "System32" / "wscript.exe") if os.environ.get("SystemRoot") else Path("wscript.exe")
 
 results = []
+skipped = []
 
 
 def check(name, cond, detail=""):
@@ -38,6 +39,8 @@ def check(name, cond, detail=""):
 
 
 def skip(name, why):
+    """A check this machine cannot run: listed and counted as skipped, never as passed."""
+    skipped.append(name)
     print(f"SKIP: {name} -- {why}")
 
 
@@ -111,23 +114,29 @@ def main():
             "json.dump({'console': bool(h), 'visible': bool(h and ctypes.windll.user32.IsWindowVisible(h))},"
             " open(sys.argv[1], 'w'))\n", encoding="utf-8")
         ctl = tmp / "control.json"
-        subprocess.run([str(py), str(cprobe), str(ctl)], timeout=60, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
+        c = subprocess.run([str(py), str(cprobe), str(ctl)], timeout=60, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
+        # A control that failed is a broken test, not a headless machine: it must not turn into a SKIP.
+        check("the control probe (a fresh console) ran", c.returncode == 0 and ctl.is_file(),
+              f"rc={c.returncode} wrote={ctl.is_file()}")
         control = json.loads(ctl.read_text()) if ctl.is_file() else {}
         hidden = tmp / "hidden.json"
-        launch(py, cprobe, hidden)
+        h = launch(py, cprobe, hidden)
         seen = json.loads(hidden.read_text()) if hidden.is_file() else None
-        check("the probe ran through the launcher", seen is not None)
-        if not control.get("visible"):
+        check("the probe ran through the launcher", h.returncode == 0 and seen is not None,
+              f"rc={h.returncode} seen={seen}")
+        if c.returncode == 0 and not control.get("visible"):
             skip("no visible console window", "the control (a fresh console) was not visible here, so this machine "
                  "cannot show the difference (a service or headless session)")
-        else:
+        elif control.get("visible"):
             check("the child's console window is not visible (window style 0)",
                   seen is not None and seen.get("visible") is False, f"seen={seen} control={control}")
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
     failed = [n for n, ok in results if not ok]
-    print(f"\n{len(results) - len(failed)}/{len(results)} passed")
+    # A skipped check is in the denominator and not in the passed count, and the line says how many were skipped.
+    print(f"\n{len(results) - len(failed)}/{len(results) + len(skipped)} passed"
+          + (f", {len(skipped)} skipped: {', '.join(skipped)}" if skipped else ""))
     return 1 if failed else 0
 
 
