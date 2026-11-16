@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 GATE = REPO / "tools" / "gate.py"
@@ -308,8 +309,13 @@ def main() -> int:
     print("secret scan")
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        check("no gitleaks anywhere is found as none", gate.find_gitleaks(root, environ={}, which=which_only()) is None
-              or (Path.home() / ".claude" / "bin").is_dir())
+        # SA16-CT-21: hermetic. The home folder is a temp one whose <home>/.claude/bin exists but holds no gitleaks, so
+        # the answer never depends on this machine's own home.
+        home = root / "home"
+        (home / ".claude" / "bin").mkdir(parents=True)
+        with mock.patch.object(Path, "home", lambda: home):
+            none_found = gate.find_gitleaks(root, environ={}, which=which_only())
+        check("no gitleaks anywhere is found as none", none_found is None, str(none_found))
         check("GITLEAKS_BIN wins", gate.find_gitleaks(root, environ={"GITLEAKS_BIN": "x-gl"}, which=which_only("gitleaks"))
               == "x-gl")
         (root / "bin").mkdir()
