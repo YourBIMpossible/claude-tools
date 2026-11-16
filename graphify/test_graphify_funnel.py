@@ -1201,6 +1201,30 @@ class InputVisibility(FunnelCase):
         self.assertEqual(out["inputs"]["problems"], [])
         self.assertNotIn("Input problems", gf.render(out))
 
+    def test_input_problems_cap_pass_verdicts(self):
+        # SA16-CT-2: a PASS must not ride on inputs that were not read. With an input problem, every
+        # PASS is capped to INSUFFICIENT EVIDENCE; a FAIL found in what was read stays a FAIL.
+        sub = Transcript(self.repo, T0 + timedelta(minutes=1)).query("who calls sync").greps(2) \
+            .reads(self.backend_files(2))
+        Transcript(self.repo).hint().subagent("a2", "Explore", sub).write(self.projects, "p", "s-ok")
+        self.log_record("who calls sync", T0 + timedelta(minutes=1, seconds=2))
+        clean = self.run_funnel()
+        self.assertEqual(clean["inputs"]["problems"], [])
+        self.assertEqual((clean["availability"]["graph_resolution"], clean["routing"]["verdict"],
+                          clean["execution"]["verdict"]), (gf.PASS, gf.PASS, gf.PASS))
+        with self.log.open("a", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+        Transcript(self.repo).greps(6).reads(self.backend_files(3)).write(self.projects, "p", "s-bypass")
+        out = self.run_funnel()
+        self.assertTrue(out["inputs"]["problems"])
+        self.assertEqual(out["routing"]["verdict"], gf.FAIL)
+        verdicts = [out["availability"][k] for k in ("verdict", "graph_resolution", "hint_delivery")] + \
+            [out[k]["verdict"] for k in ("execution", "measurement")]
+        self.assertNotIn(gf.PASS, verdicts)
+        self.assertEqual((out["availability"]["graph_resolution"], out["execution"]["verdict"]),
+                         (gf.INSUFFICIENT, gf.INSUFFICIENT))
+        self.assertNotIn(f"| {gf.PASS} |", gf.render(out))
+
     def test_missing_unconfigured_and_non_file_log(self):
         out = self.run_funnel(log=self.root / "nope.log")
         self.assertEqual(out["inputs"]["query_log"]["status"], "missing")
