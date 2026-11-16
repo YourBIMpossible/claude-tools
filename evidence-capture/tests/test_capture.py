@@ -245,6 +245,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
     (repo / "notes.txt").write_text("u\n", encoding="utf-8")
     orig = snapshot._read_artifacts
     calls = {"n": 0}
+    snaps: dict[str, dict] = {}  # each case's own snapshot, by episode (SA16-CT-25)
 
     def tamper(r: Path, dl: snapshot.Deadline) -> dict[str, bytes]:
         calls["n"] += 1
@@ -260,6 +261,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
     assert "status_sha256" in snap["bracket"]["diff"]
     assert not (st.snapshots / "cap_cc1").exists() and not list(st.tmp.iterdir())
+    snaps["cap_cc1"] = snap
     git(repo, "checkout", "-q", "--", "src/alpha.py")
 
     # untracked file appearing between passes
@@ -275,6 +277,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
     finally:
         snapshot._read_artifacts = orig
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
+    snaps["cap_cc2"] = snap
     (repo / "late.txt").unlink()
 
     # index write between passes (git add) → index sha/mtime differ
@@ -291,6 +294,7 @@ def test_concurrent_change_bracket(root: Path) -> None:
         snapshot._read_artifacts = orig
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change", snap
     assert "index_sha256" in snap["bracket"]["diff"]
+    snaps["cap_cc3"] = snap
     git(repo, "reset", "-q")
 
     # a lock file at the bracket
@@ -301,12 +305,15 @@ def test_concurrent_change_bracket(root: Path) -> None:
     finally:
         lock.unlink()
     assert snap["state"] == "failed" and snap["reason"] == "concurrent_change" and "lock" in snap["detail"], snap
-    # each failed snapshot is permanently ineligible
-    for ep in ("cap_cc1", "cap_cc2", "cap_cc3", "cap_cc4"):
+    snaps["cap_cc4"] = snap
+    # each failed snapshot is permanently ineligible: every case judged on its own snapshot
+    assert list(snaps) == ["cap_cc1", "cap_cc2", "cap_cc3", "cap_cc4"], list(snaps)
+    assert len({id(s) for s in snaps.values()}) == 4
+    for ep, ep_snap in snaps.items():
         m = base_manifest("p")
-        m["start_snapshot"] = snap
+        m["start_snapshot"] = ep_snap
         mf.refresh(m)
-        assert rule(m, "X6") == "yes" and not m["funnel"]["start_snapshot_complete"]
+        assert rule(m, "X6") == "yes" and not m["funnel"]["start_snapshot_complete"], (ep, ep_snap)
 
 
 def test_snapshot_failed_is_final(root: Path) -> None:
