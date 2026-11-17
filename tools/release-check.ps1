@@ -5,8 +5,8 @@
 #
 # Gates:
 #   1. Gitleaks secret scan (bin/gitleaks.exe — fetch per bin/README.md)
-#   2. Public-boundary check (tools/pre_publish_check.py) + its tests
-#   3. Every test suite the CI `gates` job runs (keep the two lists identical)
+#   2. tools/gate.py: the public-boundary check, the machine-path guard and every
+#      suite in its TEST_SUITES (the one list CI runs; no second list here)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Push-Location $root
@@ -40,30 +40,9 @@ Step "Gitleaks (published tree only)" {
         & $gitleaks detect --source $dst --no-git --config (Join-Path $root '.gitleaks.toml') --no-banner
     } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 }
-Step "Public-boundary check" { python tools/pre_publish_check.py }
-Step "Public-boundary checker tests" { python tools/test_pre_publish_check.py }
-Step "Machine-path guard self-test" { python .github/scripts/check_machine_paths.py --self-test }
-Step "Machine-path guard" { python .github/scripts/check_machine_paths.py }
-Step "ctxcheck tests"        { python ctxcheck/test_ctxcheck.py }
-Step "ctxdex secret-gate tests" { python ctxdex/test_ctxdex_gate.py }
-Step "local-audit census-only guard" { python local-audit/test_local_audit.py }
-Step "slop_prepass self-test" { python local-audit/slop_prepass.py --self-test }
-Step "graphify refresh failure-accounting tests" { python graphify/test_refresh_graphs.py }
-Step "graphify health-check boundary tests" { python graphify/test_health_check.py }
-Step "scheduling hidden-launcher tests" { python scheduling/test_run_hidden.py }
-Step "graphify adoption-funnel tests" { python graphify/test_graphify_funnel.py }
-Step "evidence-relevance tests" { python evidence-relevance/test_measure_relevance.py }
-Step "evidence-archive evacuation tests" { python evidence-archive/test_evacuate_worktree.py }
-Step "evidence-capture capture/screen tests" { python evidence-capture/tests/test_capture.py }
-Step "evidence-capture lock tests" { python evidence-capture/tests/test_locks.py }
-Step "evidence-capture identity tests" { python evidence-capture/tests/test_identity.py }
-Step "evidence-capture review tests" { python evidence-capture/tests/test_review.py }
-Step "evidence-capture snapshot tests" { python evidence-capture/tests/test_snapshot.py }
-Step "evidence-capture causal-state tests" { python evidence-capture/tests/test_causal.py }
-Step "evidence-capture host-probe tests" { python evidence-capture/tests/test_host_probe.py }
-Step "evidence-footprints tests" { python evidence-footprints/test_footprints.py }
-Step "evidence-footprints blind-sheet tests" { python evidence-footprints/test_blind_sheets.py }
-Step "evidence-twin tests" { python evidence-twin/test_twin.py }
+# The boundary check, the machine-path guard, every test suite and a secret scan of the tracked
+# working tree: tools/gate.py is the one list (TEST_SUITES) the pre-push hook and CI run.
+Step "Repository gate (tools/gate.py)" { python tools/gate.py }
 
 Pop-Location
 if ($fail -gt 0) { Write-Host "`n$fail gate(s) FAILED." -ForegroundColor Red; exit 1 }

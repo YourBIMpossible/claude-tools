@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 GATE = REPO / "tools" / "gate.py"
@@ -135,6 +136,14 @@ def main() -> int:
           f"not in TEST_SUITES: {sorted(set(suites_on_disk) - set(listed))}\n"
           f"listed but not tracked: {sorted(set(listed) - set(suites_on_disk))}")
     check("the suite list has no duplicates", len(listed) == len(set(listed)), str(listed))
+    # SA16-CT-1: the release gate prints "All release gates passed", so it must run every gate suite: by running this
+    # gate (the one list), or by naming each suite. A hand list that drifts behind TEST_SUITES fails here.
+    release = [ln for ln in (REPO / "tools" / "release-check.ps1").read_text(encoding="utf-8").splitlines()
+               if not ln.lstrip().startswith("#")]
+    runs_gate = any(re.search(r"\bpython\b\s+tools[/\\]gate\.py\b", ln) for ln in release)
+    not_named = [s for s in listed if not any(s in ln for ln in release)]
+    check("release-check.ps1 runs every gate suite (it runs tools/gate.py, or names each one)",
+          runs_gate or not not_named, f"release-check.ps1 runs neither tools/gate.py nor: {not_named}")
     win, win_skipped = gate.default_steps(REPO, "python", windows=True, which=which_only("pwsh", "powershell.exe"),
                                            has_module=installed)
     labels = [s.label for s in win]
@@ -300,8 +309,13 @@ def main() -> int:
     print("secret scan")
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        check("no gitleaks anywhere is found as none", gate.find_gitleaks(root, environ={}, which=which_only()) is None
-              or (Path.home() / ".claude" / "bin").is_dir())
+        # SA16-CT-21: hermetic. The home folder is a temp one whose <home>/.claude/bin exists but holds no gitleaks, so
+        # the answer never depends on this machine's own home.
+        home = root / "home"
+        (home / ".claude" / "bin").mkdir(parents=True)
+        with mock.patch.object(Path, "home", lambda: home):
+            none_found = gate.find_gitleaks(root, environ={}, which=which_only())
+        check("no gitleaks anywhere is found as none", none_found is None, str(none_found))
         check("GITLEAKS_BIN wins", gate.find_gitleaks(root, environ={"GITLEAKS_BIN": "x-gl"}, which=which_only("gitleaks"))
               == "x-gl")
         (root / "bin").mkdir()

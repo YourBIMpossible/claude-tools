@@ -332,6 +332,9 @@ def test_reconstruct_entries_stay_in_the_clone(root: Path) -> None:
             assert exc.reason == "unsafe_entry_path"
         REPORT["symlink_escape"] = f"refused ({kind})"
     assert not any(outside.iterdir()) and not (root / "escape.txt").exists()
+    if kind is None:  # the path checks above passed, but the symlink escape was never tried: not a pass (SA16-CT-36)
+        raise SkipTest("symlink escape unverified: this machine can create neither a symlink nor a junction "
+                       "(the entry-path refusals above passed)")
 
 
 def _current_sid() -> str:

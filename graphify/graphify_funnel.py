@@ -37,7 +37,8 @@ Relative config paths resolve against the config file's folder, as in GraphifyCo
 
 Input problems (missing/unreadable/corrupt query log, unreadable or undated transcripts,
 missing subagent metadata) are counted in the JSON "inputs" block and listed in the report;
-they are never read as low volume.
+they are never read as low volume, and while any is present no stage can PASS (a PASS is
+capped to INSUFFICIENT EVIDENCE; a FAIL stands).
 
 Run: python graphify_funnel.py [--days 7] [--out report.md] [--json summary.json]
 """
@@ -1449,6 +1450,10 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         "sessions_without_cwd": no_cwd,
     }
     inputs["problems"] = input_problems(inputs)
+    # A PASS is a claim about all the evidence; with inputs unread it is at most INSUFFICIENT.
+    # A FAIL found in what was read stands.
+    if inputs["problems"]:
+        v1, v1a, v1b, v2, v3, v4 = (INSUFFICIENT if v == PASS else v for v in (v1, v1a, v1b, v2, v3, v4))
 
     return {
         "window": {"since": since.isoformat(), "until": until.isoformat()},
@@ -1527,7 +1532,7 @@ def render(summary: dict) -> str:
          f"Query log: {q['path'] or 'not configured'} ({q['status']}, {q['records_in_window']} query records "
          f"in window).", ""]
     if inp["problems"]:
-        L += ["**Input problems (verdicts below are missing this evidence; this is not low volume):**",
+        L += ["**Input problems (verdicts below are missing this evidence, so none can PASS; this is not low volume):**",
               *[f"- {x}" for x in inp["problems"]], ""]
     L += ["| Stage | Verdict | Evidence |", "|---|---|---|",
          f"| 1a Graph resolution | {a['graph_resolution']} | {a['graph_backed']}/{s['organic']} organic sessions "
