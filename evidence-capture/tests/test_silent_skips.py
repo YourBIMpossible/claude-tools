@@ -353,6 +353,34 @@ def test_corrupt_store_config_is_logged_not_unconfigured(root: Path) -> None:
     assert "store config unreadable" in lines[1] and "list.json" in lines[1] and "not an object" in lines[1], lines
 
 
+def test_cli_names_an_unreadable_store_config(root: Path) -> None:
+    """SA11-CT-27 residual: the CLI refusal names a store config that exists but cannot be
+    read, instead of only 'not configured'; a missing config keeps the plain message."""
+    import capture
+
+    tmp = root / "tmp"
+    tmp.mkdir()
+    saved = {k: os.environ.get(k) for k in ("TEMP", "TMP", "TMPDIR")}
+    os.environ.update(TEMP=str(tmp), TMP=str(tmp), TMPDIR=str(tmp))
+    try:
+        cfg = root / "corrupt.json"
+        cfg.write_text('{"meta": "x", ', encoding="utf-8")
+        msgs = {}
+        for label, path in (("corrupt", cfg), ("absent", root / "absent.json")):
+            try:
+                capture._stores({}, path)
+            except SystemExit as exc:
+                msgs[label] = str(exc)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert "not configured" in msgs["corrupt"] and "corrupt.json" in msgs["corrupt"]         and "unreadable" in msgs["corrupt"], msgs
+    assert "unreadable" not in msgs["absent"], msgs
+
+
 def test_tmp_orphan_stat_and_remove_failures_are_logged(root: Path) -> None:
     """SA11-CT-28: an orphan whose age cannot be read, or that rmtree could not remove, is
     one line in the capture log rather than skipped without a trace."""
@@ -391,6 +419,7 @@ TESTS = [
     test_git_failure_is_not_read_as_not_a_repository,
     test_failed_remote_listing_is_not_no_remote,
     test_corrupt_store_config_is_logged_not_unconfigured,
+    test_cli_names_an_unreadable_store_config,
     test_tmp_orphan_stat_and_remove_failures_are_logged,
 ]
 

@@ -42,13 +42,15 @@ import audit  # noqa: E402
 import pipeline  # noqa: E402
 from report import write_checkpoint  # noqa: E402
 from review import expire  # noqa: E402
-from store import Stores, init_meta_repo, init_stores, resolve_stores  # noqa: E402
+from store import USER_CONFIG, Stores, config_problem, init_meta_repo, init_stores, resolve_stores  # noqa: E402
 
 
-def _stores(env: dict[str, str]) -> Stores:
-    st = resolve_stores(env)
+def _stores(env: dict[str, str], config: Path = USER_CONFIG) -> Stores:
+    st = resolve_stores(env, config)
     if st is None:
-        raise SystemExit("capture stores are not configured (EC_CAPTURE_META / EC_CAPTURE_CONTENT or user config)")
+        problem = config_problem(config)
+        raise SystemExit("capture stores are not configured (EC_CAPTURE_META / EC_CAPTURE_CONTENT or user config)"
+                         + (f": {problem}" if problem else ""))
     return st
 
 
