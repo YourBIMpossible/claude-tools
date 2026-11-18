@@ -39,8 +39,9 @@ Input problems (missing/unreadable/corrupt query log, unreadable or undated tran
 unreadable git repos) are counted in the JSON "inputs" block and listed in the report;
 they are never read as low volume, and while any is present no stage can PASS (a PASS is
 capped to INSUFFICIENT EVIDENCE; a FAIL stands). Agents of unknown type (missing subagent
-metadata, unreadable agent definitions) are judged shell-capable, the worst case for routing,
-so they are listed as notes ("inputs.notes") and cap no verdict.
+metadata, unreadable agent definitions, plugin agents) are judged shell-capable, the worst case
+for routing, so they are listed as notes ("inputs.notes") and cap no verdict; their bypasses are
+unproven, so routing FAILs only on a bypass by a unit known to have a shell.
 
 Run: python graphify_funnel.py [--days 7] [--out report.md] [--json summary.json]
 """
@@ -245,6 +246,9 @@ AGENT_TOOLS = {"Agent", "Task"}
 EXPLORE_AGENT_TYPES = {"Explore", "general-purpose", "Plan"}   # spawn statistics only
 # Built-in subagent types without a shell; custom ones are judged by their definition.
 NO_SHELL_AGENTS = {"claude-code-guide", "statusline-setup"}
+# Built-in subagent types that have a shell without any definition file (a fork inherits the
+# parent's tools). A project or user definition of the same name still takes precedence.
+SHELL_BUILTIN_AGENTS = {"general-purpose", "Explore", "Plan", "fork"}
 
 # Shell commands read from a Bash/PowerShell call, per command segment (lowercased).
 SHELL_CD_CMDS = {"cd", "pushd", "chdir", "set-location", "sl", "push-location"}
@@ -1214,7 +1218,7 @@ def find_agent_definition(agent_type: str, cwd: str | None, user_agents: Path | 
 
 def agent_has_shell(agent_type: str | None, cwd: str | None, user_agents: Path | None,
                     problems: list[str] | None = None) -> bool | None:
-    """False when the agent provably has no Bash/PowerShell; None when its definition is unknown.
+    """True/False when the agent provably has / has no Bash/PowerShell; None when its tools are unknown.
 
     A `tools` field absent or `*` means every tool; a pattern grant such as Bash(git:*)
     counts as a shell; only a bare entry in disallowedTools removes one.
@@ -1227,7 +1231,7 @@ def agent_has_shell(agent_type: str | None, cwd: str | None, user_agents: Path |
         return None
     fm = find_agent_definition(agent_type, cwd, user_agents, problems)
     if fm is None:
-        return None
+        return True if agent_type in SHELL_BUILTIN_AGENTS else None
     tools = _tool_names(fm.get("tools"))
     denied = set(_tool_names(fm.get("disallowedTools")) or [])
     if not tools or "*" in tools:
@@ -1269,7 +1273,8 @@ def input_problems(inputs: dict) -> list[str]:
 # An agent whose type or definition is unknown is judged shell-capable, so it stays a routing
 # exploration unit; its transcript is still read and no other stage looks at agent types. That
 # is the worst case for routing: a PASS reached this way holds for any true type (an agent that
-# called graphify had a shell), so these gaps are reported but cap no verdict.
+# called graphify had a shell), so these gaps are reported but cap no verdict. Its bypass is
+# unproven (it may have had no shell), so routing FAILs only on a bypass by a unit known to have one.
 TYPE_UNKNOWN_INPUTS = (
     ("subagent_metadata_problems", "subagent(s) without readable metadata (type unknown, judged shell-capable)"),
     ("agent_definitions_unreadable", "agent definition file(s) could not be read (agent judged shell-capable)"),
@@ -1388,8 +1393,9 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     # A subagent without a shell cannot run graphify: its lookups show the graph was
     # unusable to it, not that it was bypassed.
     agent_def_problems: list[str] = []
-    unusable = [u for u in eligible if u.unit_id != "main"
-                and agent_has_shell(u.agent_type, u.cwd, user_agents, agent_def_problems) is False]
+    has_shell = {id(u): True if u.unit_id == "main"
+                 else agent_has_shell(u.agent_type, u.cwd, user_agents, agent_def_problems) for u in eligible}
+    unusable = [u for u in eligible if has_shell[id(u)] is False]
     exploration = [u for u in eligible if u not in unusable]
     no_path_evidence = [u for u in units if u.enough_lookups() and not (u.files | u.search_paths)]
     used = [u for u in exploration if u.routing_calls()]
@@ -1398,8 +1404,16 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     other_callers = [u for u in units if u.routing_calls() and u not in eligible]
     after_hint = [u for u in exploration if post_hint(u.session)]
     spawns = [sp for u in units for sp in u.spawned if sp["type"] in EXPLORE_AGENT_TYPES]
-    if bypassed:
+    # A bypass by a unit of unknown type may be a unit that had no shell: evidence, not a FAIL.
+    type_unknown_bypassed = [u for u in bypassed if has_shell[id(u)] is None]
+    bypassed_by_type: dict[str, int] = {}
+    for u in bypassed:
+        kind = "main" if u.unit_id == "main" else "unknown" if has_shell[id(u)] is None else u.agent_type
+        bypassed_by_type[kind] = bypassed_by_type.get(kind, 0) + 1
+    if len(bypassed) > len(type_unknown_bypassed):
         v2 = FAIL
+    elif bypassed:
+        v2 = INSUFFICIENT
     elif exploration:
         v2 = PASS
     else:
@@ -1517,6 +1531,8 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} files={len(u.files)} "
                          f"in_graph={u.covered(scope_of[id(u)])} "
                          f"cwd={u.cwd}" for u in bypassed],
+            "bypassed_type_unknown": [u.label for u in type_unknown_bypassed],
+            "bypassed_by_type": bypassed_by_type,
             "copied_tool_uses_excluded": routing_copies,
             "graph_unusable_units": len(unusable),
             "graph_unusable": [f"{u.label} searches={u.searches} reads={u.reads} "
@@ -1569,8 +1585,8 @@ def render(summary: dict) -> str:
         L += ["**Input problems (verdicts below are missing this evidence, so none can PASS; this is not low volume):**",
               *[f"- {x}" for x in inp["problems"]], ""]
     if inp["notes"]:
-        L += ["**Agents of unknown type (judged shell-capable, so a PASS still holds; a routing FAIL may "
-              "include them):**", *[f"- {x}" for x in inp["notes"]], ""]
+        L += ["**Agents of unknown type (judged shell-capable, so a PASS still holds; their bypasses alone "
+              "cannot FAIL routing):**", *[f"- {x}" for x in inp["notes"]], ""]
     L += ["| Stage | Verdict | Evidence |", "|---|---|---|",
          f"| 1a Graph resolution | {a['graph_resolution']} | {a['graph_backed']}/{s['organic']} organic sessions "
          f"resolved a graph; {len(a['expected_graph_missing'])} in graph-expected repos without one |",
@@ -1626,7 +1642,11 @@ def render(summary: dict) -> str:
     if r["bypassed"]:
         shown = r["bypassed"][:BYPASS_SHOWN]
         L += ["", f"**Bypassed (routing failures to investigate this week; largest {len(shown)} of "
-                  f"{len(r['bypassed'])}, full list in the JSON summary):**", *[f"- {x}" for x in shown]]
+                  f"{len(r['bypassed'])}, full list in the JSON summary):**", *[f"- {x}" for x in shown],
+              "", f"By agent type: {r['bypassed_by_type']}."]
+        if r["bypassed_type_unknown"]:
+            L += [f"{len(r['bypassed_type_unknown'])} of them by agents of unknown type (they may have had no "
+                  "shell, so they alone cannot FAIL routing): " + ", ".join(r["bypassed_type_unknown"][:BYPASS_SHOWN])]
     L += ["", "## 3 Execution", "",
           f"- Calls: {e['calls']} by status {e['by_status']}; logged: {e['logged']}; bare CLI (outside wrapper): {e['bare_cli_calls']}; "
           f"copies from continued/forked transcripts excluded: {e['copied_calls_excluded']}; "

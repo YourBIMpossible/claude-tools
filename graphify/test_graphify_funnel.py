@@ -221,11 +221,43 @@ class AnyAgentType(FunnelCase):
         self.assertIn("backend-endpoint-reviewer:c1", out["bypassed"][0])
 
     def test_unknown_type_is_judged_shell_capable(self):
+        """An agent of unknown type stays an exploration unit (the worst case for routing), but its
+        bypass is unproven: it may have had no shell. Alone it caps routing at INSUFFICIENT, never FAIL."""
         sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))
         Transcript(self.repo).subagent("u1", "", sub).write(self.projects, "p", "s-untyped")
         out = self.run_funnel()
-        self.assertEqual(out["routing"]["verdict"], gf.FAIL)
+        self.assertEqual(out["routing"]["verdict"], gf.INSUFFICIENT)
+        self.assertEqual(out["routing"]["exploration_units"], 1)
+        self.assertEqual(len(out["routing"]["bypassed_type_unknown"]), 1)
+        self.assertIn("subagent:u1", out["routing"]["bypassed_type_unknown"][0])
         self.assertIn("judged shell-capable", " ".join(out["inputs"]["notes"]))
+        self.assertIn("1 of them by agents of unknown type", gf.render(out))
+
+    def test_a_proven_bypass_still_fails_beside_a_type_unknown_one(self):
+        t = Transcript(self.repo)
+        for agent, kind in (("u1", ""), ("g1", "general-purpose")):
+            t.subagent(agent, kind, Transcript(self.repo).greps(2).reads(self.backend_files(3)))
+        t.write(self.projects, "p", "s-mixed")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["verdict"], gf.FAIL)
+        self.assertEqual((len(out["bypassed"]), len(out["bypassed_type_unknown"])), (2, 1))
+        self.assertEqual(out["bypassed_by_type"], {"general-purpose": 1, "unknown": 1})
+
+    def test_builtin_shell_agents_are_proven_bypasses(self):
+        """general-purpose, Explore, Plan and fork have a shell without any definition file."""
+        t = Transcript(self.repo)
+        for i, kind in enumerate(("general-purpose", "Explore", "Plan", "fork")):
+            t.subagent(f"b{i}", kind, Transcript(self.repo).greps(2).reads(self.backend_files(3)))
+        t.write(self.projects, "p", "s-builtin")
+        out = self.run_funnel()["routing"]
+        self.assertEqual((out["verdict"], len(out["bypassed"]), out["bypassed_type_unknown"]), (gf.FAIL, 4, []))
+
+    def test_plugin_agent_bypass_is_type_unknown(self):
+        sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))
+        Transcript(self.repo).subagent("p1", "toolkit:reviewer", sub).write(self.projects, "p", "s-plugin")
+        out = self.run_funnel()["routing"]
+        self.assertEqual((out["verdict"], len(out["bypassed_type_unknown"])), (gf.INSUFFICIENT, 1))
+        self.assertEqual(out["bypassed_by_type"], {"unknown": 1})
 
 
 class ShellLookups(FunnelCase):
@@ -496,7 +528,8 @@ class GraphUnusable(FunnelCase):
     def test_unreadable_agent_definition_is_recorded(self):
         """SA16-CT-16: an agent file that cannot be read is recorded, never skipped as if absent.
 
-        The agent is then judged shell-capable (A18: a note, not a PASS cap), so this bypass FAILs."""
+        The agent is then judged shell-capable (A18: a note, not a PASS cap), but a bypass by an agent
+        whose tools are unknown is unproven, so alone it is INSUFFICIENT, not FAIL."""
         (self.repo / ".claude" / "agents" / "reviewer.md").mkdir(parents=True)   # open() on a dir: OSError
         self.session_with("reviewer", "s-unreadable-def")
         out = self.run_funnel()
@@ -505,7 +538,8 @@ class GraphUnusable(FunnelCase):
         self.assertIn("reviewer.md", bad[0])
         self.assertTrue(any("1 agent definition file(s) could not be read" in n for n in out["inputs"]["notes"]))
         self.assertIn("1 agent definition file(s) could not be read", gf.render(out))
-        self.assertEqual(out["routing"]["verdict"], gf.FAIL)
+        self.assertEqual(out["routing"]["verdict"], gf.INSUFFICIENT)
+        self.assertEqual(len(out["routing"]["bypassed_type_unknown"]), 1)
 
     def test_repo_identity_os_error_is_an_input_problem(self):
         """SA16-CT-17: a cwd whose git repo cannot be read is recorded, never silently 'no repo'."""
