@@ -953,7 +953,11 @@ def spawn_maintenance(env: dict[str, str]) -> bool:
         subprocess.Popen([sys.executable, str(PKG / "capture.py"), "maintain", "--quiet"], env=env,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          close_fds=True, creationflags=flags, start_new_session=os.name != "nt")
-    except OSError:
+    except OSError as exc:
+        # the caller ignores the result: the failure is recorded here, where it happened
+        st = resolve_stores(env)
+        log_line(st if st is not None and st.meta.is_dir() else None,
+                 f"start: maintenance not launched: {type(exc).__name__}: {exc}")
         return False
     return True
 
@@ -1070,14 +1074,14 @@ def capture_failure_records(stores: Stores, env: dict[str, str]) -> tuple[list[s
     pending records, records claimed by a drain still in flight (``.draining`` files) and
     starts logged LOST because their pending record could not be written.
 
-    A record an in-flight drain already turned into a manifest is counted once. A pending
-    or claimed file that exists but cannot be read, and a record without a readable start
-    time, is a problem: the failures behind it are unknown, never zero."""
-    failed = {m.get("episode_id"): m["started_at"] for m in scan_manifests(stores).manifests
-              if _is_capture_failure(m)}
+    A record an in-flight drain already turned into a manifest is counted once. A manifest,
+    pending or claimed file that exists but cannot be read, and a record without a readable
+    start time, is a problem: the failures behind it are unknown, never zero."""
+    scan = scan_manifests(stores)
+    failed = {m.get("episode_id"): m["started_at"] for m in scan.manifests if _is_capture_failure(m)}
     times = list(failed.values())
     seen = set(failed)
-    problems: list[str] = []
+    problems: list[str] = [f"manifest unreadable {name}" for name in scan.unreadable]
     src = _pending_file(env)
     for f in [src, *sorted(src.parent.glob(f"{src.name}.*.draining"))]:
         try:
@@ -1275,7 +1279,7 @@ def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None)
         if content_ok:
             exp = expire(stores, now=now, commit=False)
             counts.update(expired_deleted=exp["expired_deleted"], expire_errors=exp["errors"],
-                          expire_undated=exp["undated"])
+                          expire_undated=exp["undated"], expire_seals_unreadable=exp["seals_unreadable"])
         ptr = retire_open_pointers(stores, now)
         counts.update(open_pointers_retired=len(ptr["retired"]), open_unjoined_stale=ptr["open_unjoined"][:20],
                       open_pointers_dangling=ptr["dangling"], open_pointers_unreadable=ptr["unreadable"],
@@ -1337,6 +1341,9 @@ def maintain_findings(counts: dict[str, Any]) -> tuple[list[str], list[str]]:
         warnings.append(f"episodes_busy: {counts['busy_skipped']}")
     if counts.get("expire_undated"):
         warnings.append(f"undated_content: {counts['expire_undated']}")
+    if counts.get("expire_seals_unreadable"):
+        # an unread seal is ignored by expiry: the content it seals may be expired early
+        warnings.append(f"seals_unreadable: {counts['expire_seals_unreadable']}")
     if counts.get("review_errors"):
         warnings.append(f"review_errors: {counts['review_errors']}")
     if counts.get("failure_streaks"):

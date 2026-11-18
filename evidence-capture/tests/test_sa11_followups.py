@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -52,7 +53,55 @@ def test_dead_pipeline_helpers_are_gone(root: Path) -> None:
     assert not hasattr(pipeline, "captured_root_gone")
 
 
-TESTS = [test_dead_pipeline_helpers_are_gone]
+def test_failure_records_report_unreadable_manifests(root: Path) -> None:
+    """SA11-CT-52: a manifest scan_manifests cannot read hides whether that episode's
+    capture failed; capture_failure_records reports it as a problem, never as zero."""
+    st = plain_stores(root)
+    (st.manifests / "cap_bad.json").write_text("{not json", encoding="utf-8")
+    tmp = root / "tmp"
+    tmp.mkdir()
+    times, problems = pipeline.capture_failure_records(st, {"TEMP": str(tmp)})
+    assert times == [] and problems == ["manifest unreadable cap_bad.json"], (times, problems)
+
+
+def test_spawn_maintenance_failure_is_logged(root: Path) -> None:
+    """SA11-CT-54: a maintenance launch that fails is logged by spawn_maintenance itself
+    (its caller ignores the result), not only noticed later by the backstop's age check."""
+    st = plain_stores(root)
+    tmp = root / "tmp"
+    tmp.mkdir()
+    env = {store.ENV_META: str(st.meta), store.ENV_CONTENT: str(st.content), "TEMP": str(tmp)}
+
+    def refuse(*a: Any, **k: Any) -> None:
+        raise OSError(8, "Exec format error")
+
+    with patched(subprocess, "Popen", refuse):
+        assert pipeline.spawn_maintenance(env) is False
+    log = (st.meta / "capture.log").read_text(encoding="utf-8")
+    assert "maintenance not launched: OSError" in log, log
+
+
+def test_maintain_warns_on_unreadable_seals(root: Path) -> None:
+    """SA11-CT-19 follow-up: review.expire reports seal files it could not read; the
+    maintenance pass carries the count and maintain_findings warns on it."""
+    st = plain_stores(root)
+    subprocess.run(["git", "-C", str(st.meta), "init", "-q"], check=True, capture_output=True)
+    tmp = root / "tmp"
+    tmp.mkdir()
+
+    def expire(stores: store.Stores, *, now: str, commit: bool) -> dict[str, int]:
+        return {"expired_deleted": 0, "errors": 0, "undated": 0, "seals_unreadable": 2}
+
+    with patched(pipeline, "expire", expire):
+        counts = pipeline.run_maintain(st, {"TEMP": str(tmp)})
+    assert counts.get("expire_seals_unreadable") == 2, counts
+    _, warnings = pipeline.maintain_findings(counts)
+    assert "seals_unreadable: 2" in warnings, warnings
+    assert pipeline.maintain_findings({"action": "maintained", "expire_seals_unreadable": 0}) == ([], [])
+
+
+TESTS = [test_dead_pipeline_helpers_are_gone, test_failure_records_report_unreadable_manifests,
+         test_spawn_maintenance_failure_is_logged, test_maintain_warns_on_unreadable_seals]
 
 
 def main() -> int:
