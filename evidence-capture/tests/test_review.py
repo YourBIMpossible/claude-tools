@@ -313,7 +313,8 @@ def test_privacy_scope_rejects(root: Path) -> None:
         assert got["retention"]["deletion_verified"] is True and not got["funnel"]["privacy_cleared"]
         assert outside not in json.dumps(got), "findings carry hashes, never the path"
         by_check = got["review"]["privacy"]["by_check"]
-        assert [k for k, v in by_check.items() if v] == [expect] if expect else True, (name, by_check)
+        # SA11-CT-59: exactly the expected check fired; no conditional, so an empty expect fails
+        assert expect and [k for k, v in by_check.items() if v] == [expect], (name, expect, by_check)
         return by_check
 
     assert run("prompt-path", "path_outside_repo", prompt=f"compare with {outside}")["path_outside_repo"] >= 1
