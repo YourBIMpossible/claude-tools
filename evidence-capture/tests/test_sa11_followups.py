@@ -22,7 +22,9 @@ from typing import Any, Iterator
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 sys.path.insert(0, str(PKG))
+import backstop  # noqa: E402
 import pipeline  # noqa: E402
+import report  # noqa: E402
 import store  # noqa: E402
 
 PASSED: list[str] = []
@@ -100,7 +102,48 @@ def test_maintain_warns_on_unreadable_seals(root: Path) -> None:
     assert pipeline.maintain_findings({"action": "maintained", "expire_seals_unreadable": 0}) == ([], [])
 
 
-TESTS = [test_dead_pipeline_helpers_are_gone, test_failure_records_report_unreadable_manifests,
+def test_checkpoint_names_unreadable_maintenance_and_audits(root: Path) -> None:
+    """SA11-CT-55: an unreadable maintenance.json and an unreadable FN audit are named in
+    the checkpoint's notes; neither silently becomes an empty record or an older audit."""
+    st = plain_stores(root)
+    (st.meta / "maintenance.json").write_text("{not json", encoding="utf-8")
+    audits = st.meta / "audits"
+    audits.mkdir(parents=True, exist_ok=True)
+    (audits / "fn-audit-1.json").write_text(json.dumps({"n": 3}), encoding="utf-8")
+    (audits / "fn-audit-2.json").write_text("{not json", encoding="utf-8")
+    _, ck = report.write_checkpoint(st, n=1, now="2026-11-17T00:00:00.000000Z", commit=False)
+    notes = ck["notes"]
+    assert any(n.startswith("maintenance.json unreadable (JSONDecodeError)") for n in notes), notes
+    assert any("fn-audit-2.json" in n and "fn-audit-1.json" in n for n in notes), notes
+    assert ck["fn_audit"]["n"] == 3, ck["fn_audit"]
+    (st.meta / "maintenance.json").write_text(json.dumps([1]), encoding="utf-8")
+    _, ck = report.write_checkpoint(st, n=2, now="2026-11-17T00:00:00.000000Z", commit=False)
+    assert any(n.startswith("maintenance.json unreadable (not an object)") for n in ck["notes"]), ck["notes"]
+
+
+def test_unreadable_backstop_status_is_a_warning(root: Path) -> None:
+    """SA11-CT-56: an unreadable previous status file no longer silently resets the
+    history and the failure streak: the pass warns, and the unreadable file is kept."""
+    status = root / "backstop-status.json"
+    for body in ("{not json", json.dumps([1])):
+        status.write_text(body, encoding="utf-8")
+        rec = {"at": "2026-11-17T00:00:00.000000Z", "status": "ok", "problems": [], "warnings": [],
+               "exit": backstop.EXIT_OK}
+        backstop._record(rec, status, None)
+        assert rec["status"] == "warn" and rec["exit"] == backstop.EXIT_WARN, rec
+        assert any(w.startswith("status_history_unreadable") for w in rec["warnings"]), rec
+        kept = status.with_name(status.name + ".unreadable")
+        assert kept.read_text(encoding="utf-8") == body
+        doc = json.loads(status.read_text(encoding="utf-8"))
+        assert doc["history"][0]["status"] == "warn", doc
+    rec = {"at": "2026-11-17T01:00:00.000000Z", "status": "fail", "problems": ["x"], "warnings": [],
+           "exit": backstop.EXIT_FAIL}
+    backstop._record(rec, status, None)  # a readable file again: the streak counts on
+    assert rec["warnings"] == [] and json.loads(status.read_text(encoding="utf-8"))["consecutive_failures"] == 1
+
+
+TESTS = [test_checkpoint_names_unreadable_maintenance_and_audits, test_unreadable_backstop_status_is_a_warning,
+         test_dead_pipeline_helpers_are_gone, test_failure_records_report_unreadable_manifests,
          test_spawn_maintenance_failure_is_logged, test_maintain_warns_on_unreadable_seals]
 
 

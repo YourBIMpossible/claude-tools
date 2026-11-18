@@ -185,19 +185,26 @@ def _dir_bytes(d: Path) -> int:
     return total
 
 
-def _latest_audit(stores: Stores) -> dict[str, Any] | None:
-    best = None
+def _latest_audit(stores: Stores) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """``(record, file name, unreadable)``: the newest readable FN audit and every audit
+    file that could not be read as an object (the caller names them; never skipped silently)."""
+    best: tuple[int, dict[str, Any], str] | None = None
+    unreadable: list[str] = []
     for p in sorted((stores.meta / "audits").glob("fn-audit-*.json")):
         stem = p.name[len("fn-audit-"):-len(".json")]
         if not stem.isdigit():
             continue
         try:
             rec = read_json(p)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            unreadable.append(f"{p.name} ({type(exc).__name__})")
+            continue
+        if not isinstance(rec, dict):
+            unreadable.append(f"{p.name} (not an object)")
             continue
         if best is None or int(stem) > best[0]:
-            best = (int(stem), rec)
-    return best[1] if best else None
+            best = (int(stem), rec, p.name)
+    return (best[1], best[2], unreadable) if best else (None, None, unreadable)
 
 
 def _isolation(stores: Stores) -> dict[str, Any]:
@@ -227,7 +234,8 @@ def _isolation(stores: Stores) -> dict[str, Any]:
 
 def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, now: str | None = None,
                      maintenance: dict[str, Any] | None = None,
-                     backstop: dict[str, Any] | None = None) -> dict[str, Any]:
+                     backstop: dict[str, Any] | None = None,
+                     maintenance_unreadable: str | None = None) -> dict[str, Any]:
     now = now or iso(now_utc())
     scan = scan_manifests(stores)
     # One classification for every count: each well-formed manifest is read refreshed (rules
@@ -246,6 +254,8 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
                  for m in views), key=lambda m: m["started_at"])
     maint = maintenance or {}
     notes: list[str] = []
+    if maintenance_unreadable is not None:
+        notes.append(f"maintenance.json unreadable ({maintenance_unreadable}): maintenance counts below read as 0")
     if backstop is not None and backstop.get("state") != "ok":
         notes.append(f"maintenance backstop {backstop.get('state')}: last success {backstop.get('last_ok')}, "
                      f"{backstop.get('consecutive_failures', 0)} consecutive failure(s)")
@@ -372,7 +382,11 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
                                             for m in suff for e in m["prior_context"].get("prior_context_evidence", [])))}
 
     # FN audit
-    audit = _latest_audit(stores)
+    audit, audit_name, audits_unreadable = _latest_audit(stores)
+    if audits_unreadable:
+        notes.append(f"{len(audits_unreadable)} FN audit file(s) unreadable and ignored: "
+                     + ", ".join(audits_unreadable[:20])
+                     + (f"; fn_audit is from {audit_name}" if audit_name else "; no readable FN audit"))
     reviews_needed = [m["episode_id"] for m in ms if mf.provisional_candidate(m["funnel"])]
     cbc = sum(1 for ep in reviews_needed if (owners.get(ep) or {}).get("case_by_case"))
     fn_audit: dict[str, Any] = {"n": 0, "audited_at": None, "sheet_sha256": None, "labels_sealed": False,
@@ -523,13 +537,20 @@ def write_checkpoint(stores: Stores, *, tool_commit: str | None = None, n: int |
                      backstop: dict[str, Any] | None = None) -> tuple[Path, dict[str, Any]]:
     n = n or next_checkpoint_n(stores)
     maint: dict[str, Any] = {}
+    maint_unreadable: str | None = None
     mp = stores.meta / "maintenance.json"
     if mp.is_file():
         try:
-            maint = read_json(mp)
-        except (OSError, ValueError):
-            maint = {}
-    ck = build_checkpoint(stores, n, tool_commit=tool_commit, now=now, maintenance=maint, backstop=backstop)
+            raw = read_json(mp)
+        except (OSError, ValueError) as exc:
+            maint_unreadable = type(exc).__name__
+        else:
+            if isinstance(raw, dict):
+                maint = raw
+            else:
+                maint_unreadable = "not an object"
+    ck = build_checkpoint(stores, n, tool_commit=tool_commit, now=now, maintenance=maint, backstop=backstop,
+                          maintenance_unreadable=maint_unreadable)
     out = stores.meta / "checkpoints" / f"ckpt-{n}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(out, ck)
