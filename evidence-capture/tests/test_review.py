@@ -954,6 +954,28 @@ def test_seal_extends(root: Path) -> None:
     assert res["expired_deleted"] == 1 and not (st.payloads / ep).exists(), "an uncommitted seal edit voids it"
 
 
+def test_sa11_ct19_unreadable_seal_is_counted(root: Path) -> None:
+    """SA11-CT-19: an unreadable seal still fails closed (the payload expires) but the
+    expiry result counts it and the capture log names it; the commit result is returned."""
+    base = make_stores(root)
+    repo = tc.make_repo(root)
+    m, i = episode(base, repo)
+    review.review_episode(base, m, i)
+    ep = m["episode_id"]
+    sums = common.sha256_file(base.payloads / ep / "SHA256SUMS")
+    seals = _seal_repo(root, [{"episode_id": "cap_other", "sums_sha256": sums, "until": "2027-12-31T00:00:00Z"}])
+    (seals / "seals" / "broken.json").write_text("{not json", encoding="utf-8")
+    st = dataclasses.replace(base, seal_dirs=(seals / "seals",))
+    res = review.expire(st, now=common.plus_days(ENDED, 91))
+    assert res["expired_deleted"] == 1 and not (st.payloads / ep).exists(), "fails closed"
+    assert res.get("seals_unreadable") == 1, res
+    assert res.get("committed") is True, res
+    log = (st.meta / "capture.log").read_text(encoding="utf-8")
+    assert "seal unreadable" in log and "broken.json" in log, log[-400:]
+    res = review.expire(st, now=common.plus_days(ENDED, 92), commit=False)
+    assert res["seals_unreadable"] == 1 and res["committed"] is None, res
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

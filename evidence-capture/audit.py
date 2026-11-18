@@ -18,10 +18,13 @@
    Any miss in ``live_remote``, ``outward_action`` or ``other_session`` requires a screen
    amendment before further candidates are admitted (``record_amendment``).
 4. ``admission_check`` gates each first-batch episode: a scored, sealed audit covering
-   it with no pending amendment, the episode still a provisional candidate with a
+   it with no pending amendment, its result file committed and unmodified, the episode still a provisional candidate with a
    verified payload, and a complete case-by-case owner review
    (``review/<episode_id>.json`` → ``case_by_case``: every category and prior context
    labelled ``not_needed`` with a basis), whatever the audit showed.
+
+``build_sheet``, ``score`` and ``record_amendment`` return ``committed``: the metadata
+commit's result (``None`` when ``commit`` is false). It is never written into the files.
 """
 from __future__ import annotations
 
@@ -151,10 +154,9 @@ def build_sheet(stores: Stores, *, now: str | None = None, commit: bool = True) 
               "episodes": [{"episode_id": m["episode_id"], "screen": screen_values(m)} for m in cands]}
     sp = screen_path(stores, k)
     write_json_atomic(sp, screen)
-    if commit:
-        commit_meta(stores, [lp, sp], f"capture fn-audit {k}: sheet ({len(cands)} episodes)")
+    committed = commit_meta(stores, [lp, sp], f"capture fn-audit {k}: sheet ({len(cands)} episodes)")         if commit else None
     log_line(stores, f"fn-audit {k}: sheet with {len(cands)} episode(s)")
-    return {"audit": k, "episodes": len(cands), "labels": lp, "screen": sp}
+    return {"audit": k, "episodes": len(cands), "labels": lp, "screen": sp, "committed": committed}
 
 
 def labels_sealed(stores: Stores, k: int) -> list[str]:
@@ -232,10 +234,9 @@ def score(stores: Stores, k: int, *, now: str | None = None, commit: bool = True
     }
     rp = result_path(stores, k)
     write_json_atomic(rp, result)
-    if commit:
-        commit_meta(stores, [rp], f"capture fn-audit {k}: scored ({misses} miss(es))")
+    committed = commit_meta(stores, [rp], f"capture fn-audit {k}: scored ({misses} miss(es))") if commit else None
     log_line(stores, f"fn-audit {k}: scored, misses {misses}, amend {amend or 'none'}")
-    return result
+    return {**result, "committed": committed}
 
 
 def record_amendment(stores: Stores, k: int, note: str, tool_commit: str | None, *, now: str | None = None,
@@ -251,9 +252,8 @@ def record_amendment(stores: Stores, k: int, note: str, tool_commit: str | None,
     res["amendments"].append({"at": now or iso(now_utc()), "note": note.strip()[:500], "tool_commit": tool_commit})
     res["screen_amended_after_audit"] = True
     write_json_atomic(rp, res)
-    if commit:
-        commit_meta(stores, [rp], f"capture fn-audit {k}: screen amendment recorded")
-    return res
+    committed = commit_meta(stores, [rp], f"capture fn-audit {k}: screen amendment recorded") if commit else None
+    return {**res, "committed": committed}
 
 
 # ---------------------------------------------------------------------- admission
@@ -276,15 +276,19 @@ def admission_check(stores: Stores, episode: str) -> dict[str, Any]:
     """Whether ``episode`` may enter the first paid batch; every reason it may not."""
     reasons: list[str] = []
     audit = None
+    audit_path: Path | None = None
     for k in sheet_numbers(stores):
         rp = result_path(stores, k)
         if rp.is_file():
             res = read_json(rp)
             if episode in res.get("episodes", []):
-                audit = res
-    if audit is None:
+                audit, audit_path = res, rp
+    if audit is None or audit_path is None:
         reasons.append("not covered by a scored FN audit")
     else:
+        # a result whose metadata commit failed (or was edited since) gates nothing
+        if not _committed_unmodified(stores, audit_path):
+            reasons.append("audit result not committed or modified since commit")
         if audit["amend_screen_required"] and not audit["screen_amended_after_audit"]:
             reasons.append("screen amendment pending for " + ",".join(audit["amend_screen_required"]))
         if audit.get("labels_sha256") != sha256_file(labels_path(stores, audit["audit"])):

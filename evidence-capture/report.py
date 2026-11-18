@@ -535,7 +535,8 @@ def write_checkpoint(stores: Stores, *, tool_commit: str | None = None, n: int |
     write_json_atomic(out, ck)
     md = out.with_suffix(".md")
     md.write_text(render_markdown(ck), encoding="utf-8", newline="\n")
-    if commit:
-        commit_meta(stores, [out, md], f"capture checkpoint {n}")
+    # ``_committed`` (not part of the written record): the metadata commit's result, None
+    # when ``commit`` is false; the CLI exits non-zero on False
+    ck["_committed"] = commit_meta(stores, [out, md], f"capture checkpoint {n}") if commit else None
     ck["_sha256"] = sha256_file(out)
     return out, ck
