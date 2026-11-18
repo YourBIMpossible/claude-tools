@@ -270,7 +270,6 @@ _PATHLIKE_RE = re.compile(r"^[\w.~\-\\/: ]+$")
 _GLOB_CHARS = "*?[{"
 
 # Routing heuristic thresholds (tool counts are a proxy for "cross-file exploration").
-SHELL_TOOLS = ("Bash", "PowerShell")
 AGENT_DEF_MAX_BYTES = 256 << 10
 _LIST_SPLIT_RE = re.compile(r",(?![^()]*\))")  # commas outside Bash(...) patterns
 SUBAGENT_MIN_LOOKUPS = 3      # searches + reads for a subagent of any type
@@ -1078,10 +1077,6 @@ def match_records(calls: list[Call], records: list[dict]) -> None:
             free.remove(cands[0])
 
 
-def coverage(session: Session) -> Callable[[str], bool]:
-    return coverage_for(session.resolved, session.repo)
-
-
 def coverage_for(resolved: dict | None, repo: str | None) -> Callable[[str], bool]:
     """Path predicate for the code a resolved graph covers.
 
@@ -1386,8 +1381,10 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
                 graph_cache[u.cwd] = (dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r,
                                       repo_identity(u.cwd, resolver, repo_problems))
             u.resolved, u.repo = graph_cache[u.cwd]
-    routing_copies = mark_routing_copies([u for s in organic for u in s.units.values()])
     units = [u for s in organic for u in s.units.values() if u.resolved]
+    # Copies are settled among graph-backed holders only: a later holder with no graph must
+    # not take a lookup away from the unit that routing actually judges (SA02-9).
+    routing_copies = mark_routing_copies(units)
     scope_of = {id(u): coverage_for(u.resolved, u.repo) for u in units}
     eligible = [u for u in units if u.is_exploration(scope_of[id(u)])]
     # A subagent without a shell cannot run graphify: its lookups show the graph was

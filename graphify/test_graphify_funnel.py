@@ -851,6 +851,21 @@ class OrganicSeparation(FunnelCase):
         r = self.run_funnel()["routing"]
         self.assertEqual((r["graph_backed_units"], r["exploration_units"], len(r["bypassed"])), (2, 1, 1))
 
+    def test_copy_held_by_a_graphless_unit_does_not_drop_the_graph_backed_one(self):
+        # SA02-9: the latest holder of a shared tool_use id resolves to no graph. Copies are
+        # settled among graph-backed holders only, so the graph-backed unit keeps its lookups.
+        t = Transcript(self.repo).greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "p", "s-orig")
+        t.t += timedelta(hours=1)
+        t.greps(1)
+        for rec in t.lines:
+            rec["cwd"] = str(self.other)
+        t.write(self.projects, "q", "s-elsewhere")
+        r = self.run_funnel()["routing"]
+        self.assertEqual((r["graph_backed_units"], r["exploration_units"], len(r["bypassed"])), (1, 1, 1))
+
     def test_continuation_call_covers_its_copied_exploration(self):
         # SA26-6: a continued transcript holds the earlier lookups and then queries graphify
         # itself; the conversation is one used unit, not a bypass plus a used unit.
