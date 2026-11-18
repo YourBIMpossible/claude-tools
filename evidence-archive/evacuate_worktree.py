@@ -332,13 +332,18 @@ def write_receipt(report: Report, archive: Path, now: datetime) -> str:
 def verify_receipt(receipt: Path) -> tuple[bool, list[str]]:
     """Re-hash every archived copy named in a receipt against its recorded sha256."""
     doc = json.loads(receipt.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        raise ValueError(f"receipt top level is {type(doc).__name__}, not an object")
     problems: list[str] = []
     checked = 0
     files = doc.get("files")
     if not isinstance(files, list):  # SA11-CT-68: a receipt that lists nothing verifies nothing
         problems.append("receipt has no files list")
         files = []
-    for f in files:
+    for i, f in enumerate(files):
+        if not isinstance(f, dict):  # a malformed entry is a failed check, not a crash
+            problems.append(f"files[{i}] is not an object ({type(f).__name__})")
+            continue
         if f["action"] in BLOCKING or not f.get("archive_path"):
             continue
         checked += 1
@@ -381,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "verify":
         try:
             ok, lines = verify_receipt(args.receipt)
-        except (OSError, json.JSONDecodeError, KeyError) as exc:
+        except (OSError, ValueError, KeyError) as exc:  # JSONDecodeError is a ValueError
             print(f"REFUSED: unreadable receipt: {exc}", file=sys.stderr)
             return 2
         for line in lines:
