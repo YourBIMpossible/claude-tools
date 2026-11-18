@@ -94,7 +94,7 @@ def main() -> int:
             "old_not_searched": o1["capped"], "new_not_searched": n["capped"],
             "old_vs_old_same_files": o1["files"] == o2["files"],
             "old_vs_new_same_files": o1["files"] == n["files"],
-            "new_files_missing_from_both_old": len(o1["files"] | o2["files"]) and len((o1["files"] | o2["files"]) - n["files"]),
+            "old_files_missing_from_new": len((o1["files"] | o2["files"]) - n["files"]),  # either old run's files absent from new
         })
 
     summary = {
