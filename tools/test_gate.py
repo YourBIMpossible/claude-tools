@@ -175,7 +175,8 @@ def main() -> int:
           ["graphify/test_refresh_graphs.py (pwsh 7)"], str(lin_labels))
     _, bare_skipped = gate.default_steps(REPO, "python", windows=False, which=which_only(), has_module=installed)
     check("no pwsh: the PowerShell suites are left out with a line naming why",
-          sum("no pwsh" in ln for ln in bare_skipped) == 2, str(bare_skipped))
+          sum("no pwsh" in ln for ln in bare_skipped) == sum(n == "powershell" for _, n in gate.TEST_SUITES),
+          str(bare_skipped))
     no_pkg, no_pkg_skipped = gate.default_steps(REPO, "python", windows=True,
                                                 which=which_only("pwsh", "powershell.exe"),
                                                 has_module=lambda module: module != "evidence_compiler")
