@@ -45,6 +45,15 @@ SESSION_C = "00000000-0000-4000-8000-00000000000c"
 SESSION_GONE = "00000000-0000-4000-8000-0000000000ff"
 
 
+def all_keys(value: Any) -> set[str]:
+    """Every dict key at any depth of a JSON-shaped value."""
+    if isinstance(value, dict):
+        return set(value).union(*(all_keys(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(all_keys(v) for v in value))
+    return set()
+
+
 def packet(pid: str, session: str, prompt: str, created: str, *, selected: bool = True,
            source_kind: str = "human") -> dict[str, Any]:
     evidence = [{
@@ -288,9 +297,10 @@ def test_build(tmp: Path) -> None:
     check(s["sha_conflicts"] == ["ep_00000000000000f1"], "summary lists conflicts")
     check("ep_00000000000000a3" in s["prompts"]["hash_mismatch"], "summary lists prompt hash mismatches")
     footprint_keys = {"hit", "coverage", "waste", "rediscovery", "gap", "head_start"}
-    check(not any(footprint_keys & set(json.dumps(r)) for r in rows.values())
-          and not any(k in r for r in rows.values() for k in footprint_keys),
-          "rows hold no Footprints fields")
+    check(footprint_keys & all_keys({"observed": [{"x": {"waste": 1}}]}) == {"waste"},
+          "Footprints-field probe finds a key nested in a list (positive control)")
+    found = set().union(*(footprint_keys & all_keys(r) for r in rows.values()))
+    check(not found, f"rows hold no Footprints fields at any depth (found {sorted(found)})")
 
     be.build(sources, troots, cohorts, tmp / "out2")
     for name in ("episodes.jsonl", "build.json"):
