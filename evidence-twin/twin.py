@@ -294,27 +294,54 @@ def score_run(state: StreamState, repo: Path, task: dict) -> dict:
     }
 
 
-def kill_tree(proc: subprocess.Popen) -> None:
+def kill_tree(proc: subprocess.Popen) -> str | None:
     """Kill ``proc`` and, where it can be found, every process it started: ``taskkill /T`` on
     Windows; on POSIX the process group when ``proc`` leads its own (``start_new_session``),
-    else ``proc`` alone."""
+    else ``proc`` alone. ``None`` when the kill went through (or ``proc`` had already exited),
+    else why it did not (SA11-CT-63): a failed ``taskkill`` falls back to killing ``proc``
+    alone and is still reported, so no caller trusts a tree kill that never happened."""
     if proc.poll() is not None:
-        return
+        return None
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
-        return
+        try:
+            r = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+                               timeout=KILL_GRACE)
+        except (OSError, subprocess.SubprocessError) as exc:
+            why = f"taskkill could not run: {type(exc).__name__}: {exc}"
+        else:
+            if r.returncode == 0:
+                return None
+            why = f"taskkill rc {r.returncode}: {(r.stderr or b'').decode('utf-8', 'replace').strip()[:200]}"
+        if proc.poll() is not None:
+            return None  # it exited while taskkill ran: nothing left to kill
+        try:
+            proc.kill()
+        except OSError as exc:
+            return f"{why}; kill fallback failed: {type(exc).__name__}: {exc}"
+        return f"{why}; fell back to killing the process alone"
+    group_error = None
     try:
         if os.getpgid(proc.pid) == proc.pid:
             os.killpg(proc.pid, signal.SIGKILL)
-            return
+            return None
     except ProcessLookupError:
-        return
-    proc.kill()
+        return None
+    except OSError as exc:
+        group_error = f"killpg failed: {type(exc).__name__}: {exc}"
+    try:
+        proc.kill()
+    except OSError as exc:
+        return "; ".join(filter(None, (group_error, f"kill failed: {type(exc).__name__}: {exc}")))
+    return None if group_error is None else f"{group_error}; fell back to killing the process alone"
 
 
 # Seconds to drain a killed verify's pipes. A process that escaped the tree kill and still
 # holds them must not hold the run: past this the pipes are abandoned.
 KILL_GRACE = 5.0
+
+# Seconds a run's CLI may keep running after its output closed before it is killed: the wait
+# for its exit is bounded, never ``proc.wait()`` with no limit (SA11-CT-63).
+EXIT_GRACE = 30.0
 
 
 def run_verify(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float) -> tuple[bool, str | None]:
@@ -326,7 +353,8 @@ def run_verify(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: floa
     try:
         proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        kill_tree(proc)
+        why = kill_tree(proc)
+        note = f"; kill: {why}" if why else ""
         try:
             proc.communicate(timeout=KILL_GRACE)
         except subprocess.TimeoutExpired:
@@ -334,9 +362,12 @@ def run_verify(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: floa
                 if pipe is not None:
                     pipe.close()
             proc.kill()
-            proc.wait(timeout=KILL_GRACE)
-            return False, f"timeout after {timeout:g}s; output pipes still held after the kill"
-        return False, f"timeout after {timeout:g}s"
+            try:
+                proc.wait(timeout=KILL_GRACE)
+            except subprocess.TimeoutExpired:
+                return False, f"timeout after {timeout:g}s{note}; the verify did not exit after the kill"
+            return False, f"timeout after {timeout:g}s{note}; output pipes still held after the kill"
+        return False, f"timeout after {timeout:g}s{note}"
     return proc.returncode == 0, None
 
 
@@ -451,14 +482,33 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
 
     state = StreamState()
     killed: list[str] = []
+    process_errors: list[str] = []
     started = time.monotonic()
     target_seconds = None
     with (out / "stream.jsonl").open("w", encoding="utf-8", newline="\n") as stream, \
             (out / "stderr.txt").open("w", encoding="utf-8") as err:
         proc = subprocess.Popen(claude_cmd(claude, task["prompt"], model, settings), cwd=repo,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err, env=env,
-                                text=True, encoding="utf-8", errors="replace")
-        timer = threading.Timer(wall, lambda: (killed.append("wall"), kill_tree(proc)))
+                                text=True, encoding="utf-8", errors="replace",
+                                start_new_session=os.name != "nt")
+        # The wall timer and the cap check both kill through here, under one lock with the
+        # end-of-output flag: a timer that fires once the output is complete is a no-op, so a
+        # finished run is never labelled killed (SA11-CT-64). A failed kill is recorded, and a
+        # later trigger (the wall after a cap kill) tries again.
+        lock = threading.Lock()
+        output_done = threading.Event()
+
+        def kill(reason: str) -> None:
+            with lock:
+                if output_done.is_set() or proc.poll() is not None:
+                    return
+                if not killed:
+                    killed.append(reason)
+                why = kill_tree(proc)
+                if why:
+                    process_errors.append(f"{reason} kill: {why}")
+
+        timer = threading.Timer(wall, kill, args=("wall",))
         timer.start()
         try:
             assert proc.stdout is not None
@@ -474,11 +524,26 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
                     if target_seconds is None and len(state.calls) > before and score_run(state, repo, task)["reached"]:
                         target_seconds = round(time.monotonic() - started, 1)
                 if state.tokens() > cap and not killed:
-                    killed.append("cap")
-                    kill_tree(proc)
-            proc.wait()
+                    kill("cap")
+            with lock:
+                output_done.set()
+            # Bounded: a CLI that outlives its output, or survives a failed kill, never hangs
+            # the batch (SA11-CT-63). One still running after the kill is recorded below.
+            grace = KILL_GRACE if killed else EXIT_GRACE
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                process_errors.append(f"did not exit {grace:g}s after its output closed; killed")
+                why = kill_tree(proc)
+                if why:
+                    process_errors.append(f"exit kill: {why}")
+                try:
+                    proc.wait(timeout=KILL_GRACE)
+                except subprocess.TimeoutExpired:
+                    process_errors.append(f"still running {KILL_GRACE:g}s after the kill (pid {proc.pid})")
         finally:
             timer.cancel()
+    exit_code = proc.returncode  # None: the CLI was still running when the harness stopped waiting
     seconds = round(time.monotonic() - started, 1)
     # Arm A counts only when its fail-open hook confirmed it emitted this exact brief (SA11-CT-40).
     brief_delivered = None
@@ -530,7 +595,10 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
 
     init = state.init or {}
     invalid = None  # a run the CLI never really executed is not a data point; a killed run is censored, not invalid
-    if not killed:
+    if exit_code is None:
+        # the CLI outlived every kill: it may still be spending or editing, so nothing it left is trusted
+        invalid = "process_not_killed: " + (process_errors[-1] if process_errors else "no exit status")
+    elif not killed:
         if state.result is None:
             invalid = "no_result"
         elif state.result.get("is_error"):
@@ -552,8 +620,8 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         "init_plugins": sorted(str(p.get("source") or p.get("name")) if isinstance(p, dict) else str(p)
                                for p in init.get("plugins") or []),
         "cli_path_sha256": cli_sha, "env_dropped": dropped,
-        "exit_code": proc.returncode, "killed": killed[0] if killed else None, "invalid": invalid,
-        "brief_delivered": brief_delivered,
+        "exit_code": exit_code, "killed": killed[0] if killed else None, "invalid": invalid,
+        "process_errors": process_errors, "brief_delivered": brief_delivered,
         "is_error": (state.result or {}).get("is_error"), "result_subtype": (state.result or {}).get("subtype"),
         "tokens_total": state.tokens(),
         "tokens_result": sum(int(result_usage.get(f) or 0) for f in USAGE_FIELDS),

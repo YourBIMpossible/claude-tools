@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -450,6 +451,96 @@ def _alive(pid: int) -> bool:
     return True
 
 
+LINGER_SRC = '''import os, runpy, sys, time
+sys.argv = [%r] + sys.argv[1:]
+try:
+    runpy.run_path(%r, run_name="__main__")
+except SystemExit:
+    pass
+sys.stdout.flush()
+os.close(1)  # output done, process keeps running: the harness must not wait on it unbounded
+time.sleep(%s)
+'''
+
+
+def test_kill_and_exit_bounds(tmp: Path, tasks: list[dict]) -> None:
+    """SA11-CT-63 / SA11-CT-64: a failed kill is reported, never silently trusted; the wait for a
+    run's process is bounded and its failure recorded; a wall timer that fires as the run ends
+    does not label a finished run as killed."""
+    base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+    plan = twin.plan([base], 1, 3)
+    plan = dict(plan, runs=[r for r in plan["runs"] if r["arm"] == "B"])
+
+    if os.name == "nt":
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        real_run = twin.subprocess.run
+        twin.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 1, b"", b"Access is denied.")
+        try:
+            why = twin.kill_tree(sleeper)
+        finally:
+            twin.subprocess.run = real_run
+        try:
+            sleeper.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            sleeper.kill()
+        check(why is not None and "taskkill rc 1" in why and sleeper.returncode is not None,
+              "a failed taskkill is reported and the process is still killed alone")
+    done = subprocess.Popen([sys.executable, "-c", "pass"])
+    done.wait()
+    check(twin.kill_tree(done) is None, "killing an exited process is not a failure")
+
+    def one(name: str, linger: float) -> tuple[dict, float]:
+        fake = tmp / f"linger-{name}.py"
+        fake.write_text(LINGER_SRC % (FAKE_RAW, FAKE_RAW, linger), encoding="utf-8")
+        kw = dict(archive=tmp / f"kb-{name}", scratch=tmp / f"kb-{name}-scratch", model="m",
+                  ledger=tmp / f"kb-{name}-ledger.json", cap=100_000, ceiling=1_000_000, wall=60,
+                  claude=str(fake), kind=None, limit=None, projects=tmp / f"kb-{name}-projects")
+        t = time.monotonic()
+        twin.run_batch([base], plan, **kw)
+        took = time.monotonic() - t
+        metas = [twin.read_json(m) for m in kw["archive"].rglob("meta.json")]
+        return (metas[0] if metas else {}), took
+
+    saved = twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree
+    twin.EXIT_GRACE, twin.KILL_GRACE = 1.0, 1.0
+    try:
+        meta, took = one("lingers", 60)
+        check(took < 20 and meta.get("invalid") is None and meta.get("exit_code") is not None
+              and any("did not exit" in e for e in meta.get("process_errors") or []),
+              f"a process that outlives its output is killed after a bounded wait and recorded ({took:.1f}s)")
+        twin.kill_tree = lambda proc: "simulated: kill refused"
+        meta, took = one("unkillable", 6)
+        check((meta.get("invalid") or "").startswith("process_not_killed") and meta.get("exit_code") is None
+              and any("simulated: kill refused" in e for e in meta.get("process_errors") or []),
+              f"a process that cannot be killed makes the run invalid instead of hanging it ({took:.1f}s)")
+    finally:
+        twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree = saved
+
+    class CancelFires:
+        """A timer that fires its callback in the instant before cancel() - the race window."""
+        def __init__(self, interval: float, fn: Any, args: tuple = ()) -> None:
+            self.fn, self.args = fn, args
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            self.fn(*self.args)
+
+    real_timer = twin.threading.Timer
+    twin.threading.Timer = CancelFires
+    try:
+        kw = dict(archive=tmp / "kb-race", scratch=tmp / "kb-race-scratch", model="m",
+                  ledger=tmp / "kb-race-ledger.json", cap=100_000, ceiling=1_000_000, wall=60,
+                  claude=FAKE, kind=None, limit=None, projects=tmp / "kb-race-projects")
+        twin.run_batch([base], plan, **kw)
+    finally:
+        twin.threading.Timer = real_timer
+    metas = [twin.read_json(m) for m in kw["archive"].rglob("meta.json")]
+    check(len(metas) == 1 and metas[0]["killed"] is None and metas[0]["invalid"] is None,
+          "a wall timer firing as the finished run is cancelled does not censor it")
+
+
 def test_negative_censored() -> None:
     """A negative control with every run censored is inconclusive, not a pass."""
     def meta(reached: bool, killed: str | None = None) -> dict:
@@ -524,6 +615,7 @@ def main() -> int:
         test_verify_guard(tmp, tasks)
         test_post_run_failure_books_spend(tmp, tasks)
         test_verify_kills_tree(tmp)
+        test_kill_and_exit_bounds(tmp, tasks)
         test_negative_censored()
         test_bench_blind(tmp)
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")
