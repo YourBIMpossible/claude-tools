@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -543,6 +544,78 @@ def test_kill_and_exit_bounds(tmp: Path, tasks: list[dict]) -> None:
           "a wall timer firing as the finished run is cancelled does not censor it")
 
 
+HOLDER_SRC = """import subprocess, sys, time
+import os
+pidfile = %r
+p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(%s)'], stdout=1, cwd=os.path.dirname(pidfile))
+open(pidfile, 'w').write(str(p.pid))
+sys.stdout.flush()
+if %r == 'hang':
+    time.sleep(60)
+"""
+
+
+def _reap(pidfile: Path) -> None:
+    """Kill a test's escaped grandchild so it never outlives the suite."""
+    try:
+        pid = int(pidfile.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def test_held_output_pipe(tmp: Path, tasks: list[dict]) -> None:
+    """SA26-26 residual: a process that escaped the tree kill and still holds the output pipe
+    neither holds the run past its bounds nor leaves a trusted result."""
+    hold = 30
+    # verify: the grandchild escapes the kill and keeps the verify's pipes open
+    pidfile = tmp / "verify-holder.pid"
+    script = tmp / "verify_holds.py"
+    script.write_text(HOLDER_SRC % (pidfile.as_posix(), hold, "hang"), encoding="utf-8")
+    saved = twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree
+
+    def kill_alone(proc: subprocess.Popen) -> None:  # a tree kill that misses the grandchild
+        proc.kill()
+
+    twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree = 1.0, 1.0, kill_alone
+    try:
+        t = time.monotonic()
+        verified, error = twin.run_verify([sys.executable, str(script)], cwd=tmp, env=dict(os.environ), timeout=1.0)
+        took = time.monotonic() - t
+        check(verified is False and (error or "").startswith("timeout") and took < 8,
+              f"a verify whose escaped grandchild holds its pipes still times out on time ({took:.1f}s)")
+        _reap(pidfile)
+
+        base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+        plan = twin.plan([base], 1, 3)
+        plan = dict(plan, runs=[r for r in plan["runs"] if r["arm"] == "B"])
+        for mode, label in (("exit", "a CLI that exits"), ("hang", "a CLI killed at the wall")):
+            pidfile = tmp / f"run-holder-{mode}.pid"
+            fake = tmp / f"holder-{mode}.py"
+            fake.write_text(HOLDER_SRC % (pidfile.as_posix(), hold, mode), encoding="utf-8")
+            kw = dict(archive=tmp / f"hp-{mode}", scratch=tmp / f"hp-{mode}-scratch", model="m",
+                      ledger=tmp / f"hp-{mode}-ledger.json", cap=100_000, ceiling=1_000_000, wall=2,
+                      claude=str(fake), kind=None, limit=None, projects=tmp / f"hp-{mode}-projects")
+            t = time.monotonic()
+            try:
+                twin.run_batch([base], plan, **kw)
+            finally:
+                took = time.monotonic() - t
+                _reap(pidfile)
+            # the held run directory may refuse its rename: its meta is then moved aside in place
+            metas = [twin.read_json(m) for m in kw["archive"].rglob("meta*.json")]
+            meta = metas[0] if metas else {}
+            check(not list(kw["archive"].glob("*/meta.json")), f"{label}: the held attempt is not left as a done run")
+            check(took < 15 and (meta.get("invalid") or "").startswith("output_held")
+                  and any("output pipe" in e for e in meta.get("process_errors") or []),
+                  f"{label} while a grandchild holds its output is bounded and not trusted ({took:.1f}s)")
+    finally:
+        twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree = saved
+
+
 def test_negative_censored() -> None:
     """A negative control with every run censored is inconclusive, not a pass."""
     def meta(reached: bool, killed: str | None = None) -> dict:
@@ -641,6 +714,7 @@ def main() -> int:
         test_post_run_failure_books_spend(tmp, tasks)
         test_verify_kills_tree(tmp)
         test_kill_and_exit_bounds(tmp, tasks)
+        test_held_output_pipe(tmp, tasks)
         test_negative_censored()
         test_bench_blind(tmp)
         test_run_cli_exit(tmp, tasks)

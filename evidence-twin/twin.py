@@ -37,6 +37,7 @@ import json
 import math
 import os
 import random
+import queue
 import re
 import shutil
 import signal
@@ -350,26 +351,26 @@ EXIT_GRACE = 30.0
 def run_verify(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float) -> tuple[bool, str | None]:
     """``(verified, verify_error)`` for one verify command. Past ``timeout`` the command is
     killed with every process it started and the result is ``(False, "timeout after …")``;
-    the whole call is bounded by ``timeout + KILL_GRACE``."""
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            start_new_session=os.name != "nt")
+    the whole call is bounded by ``timeout + 2 * KILL_GRACE``.
+
+    Its output is never read, so it goes to the null device: no pipe exists for a process
+    that escaped the tree kill to hold open. A held pipe used to stall the drain, and on
+    Windows closing it blocks while a reader thread is still inside ``read`` (SA26-26)."""
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=os.name != "nt")
     try:
-        proc.communicate(timeout=timeout)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         why = kill_tree(proc)
         note = f"; kill: {why}" if why else ""
         try:
-            proc.communicate(timeout=KILL_GRACE)
+            proc.wait(timeout=KILL_GRACE)
         except subprocess.TimeoutExpired:
-            for pipe in (proc.stdout, proc.stderr):
-                if pipe is not None:
-                    pipe.close()
             proc.kill()
             try:
                 proc.wait(timeout=KILL_GRACE)
             except subprocess.TimeoutExpired:
                 return False, f"timeout after {timeout:g}s{note}; the verify did not exit after the kill"
-            return False, f"timeout after {timeout:g}s{note}; output pipes still held after the kill"
         return False, f"timeout after {timeout:g}s{note}"
     return proc.returncode == 0, None
 
@@ -486,6 +487,7 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
     state = StreamState()
     killed: list[str] = []
     process_errors: list[str] = []
+    output_held: str | None = None
     started = time.monotonic()
     target_seconds = None
     with (out / "stream.jsonl").open("w", encoding="utf-8", newline="\n") as stream, \
@@ -511,11 +513,42 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
                 if why:
                     process_errors.append(f"{reason} kill: {why}")
 
+        # The output is read on its own thread, so the bounds hold even when the pipe never
+        # closes: a process the CLI started that escaped the kill keeps it open after the CLI
+        # is gone (SA26-26). Past the grace the read is abandoned, never waited out.
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def pump(src: Any) -> None:
+            try:
+                for item in src:
+                    lines.put(item)
+            except (OSError, ValueError) as exc:  # the pipe broke mid-read
+                process_errors.append(f"output read failed: {type(exc).__name__}: {exc}")
+            finally:
+                lines.put(None)
+
+        assert proc.stdout is not None
+        threading.Thread(target=pump, args=(proc.stdout,), daemon=True, name="twin-stdout").start()
         timer = threading.Timer(wall, kill, args=("wall",))
         timer.start()
         try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
+            gone_at: float | None = None  # when the CLI was first seen exited or killed
+            while True:
+                try:
+                    line = lines.get(timeout=0.2)
+                except queue.Empty:
+                    if gone_at is None:
+                        if killed or proc.poll() is not None:
+                            gone_at = time.monotonic()
+                    elif time.monotonic() - gone_at > (KILL_GRACE if killed else EXIT_GRACE):
+                        output_held = (f"output pipe still open {KILL_GRACE if killed else EXIT_GRACE:g}s after "
+                                       f"the CLI {'was killed' if killed else 'exited'}: a process it started holds "
+                                       "it, reading abandoned")
+                        process_errors.append(output_held)
+                        break
+                    continue
+                if line is None:
+                    break
                 stream.write(line if line.endswith("\n") else line + "\n")
                 try:
                     event = json.loads(line)
@@ -601,6 +634,9 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
     if exit_code is None:
         # the CLI outlived every kill: it may still be spending or editing, so nothing it left is trusted
         invalid = "process_not_killed: " + (process_errors[-1] if process_errors else "no exit status")
+    elif output_held is not None:
+        # something the run started outlived it and may still be editing: nothing it left is trusted
+        invalid = "output_held: " + output_held
     elif not killed:
         if state.result is None:
             invalid = "no_result"
@@ -699,8 +735,16 @@ def run_batch(tasks: list[dict], plan_obj: dict, *, archive: Path, scratch: Path
             n = 1
             while (archive / f"{run['run_id']}.invalid-{n}").exists():
                 n += 1
-            (archive / run["run_id"]).rename(archive / f"{run['run_id']}.invalid-{n}")
             stopped = f"invalid run {run['run_id']}: {meta['invalid']}"
+            try:
+                (archive / run["run_id"]).rename(archive / f"{run['run_id']}.invalid-{n}")
+            except OSError as exc:
+                # Windows refuses to rename a directory a surviving process still holds a file in
+                # (output_held). Move the meta aside instead, so neither the report nor a rerun
+                # reads this attempt as a completed run.
+                meta_path = archive / run["run_id"] / "meta.json"
+                meta_path.rename(meta_path.with_name(f"meta.invalid-{n}.json"))
+                stopped += f" (run directory kept in place, rename failed: {type(exc).__name__}: {exc})"
             print(stopped, flush=True)
             break
         print(f"{run['run_id']}: reached={meta['reached']} tokens={spent} killed={meta['killed']} "
