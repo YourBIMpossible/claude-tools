@@ -203,6 +203,8 @@ def run_child(stores: Stores, m: dict[str, Any], env: dict[str, str], timeout_s:
                 return "child_failed", None
         finally:
             tree.kill()
+            if causes is not None:
+                causes.extend(f"process tree: {f}"[:500] for f in tree.failures)
 
 
 _GROUP_KW: dict[str, Any] = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
@@ -218,16 +220,25 @@ class _ProcessTree:
     Windows: a job object with ``KILL_ON_JOB_CLOSE``; a grandchild whose parent already
     exited is still a member, which ``taskkill /T`` (a walk over live parent links) would
     miss. The child is assigned right after it is created, before its interpreter can
-    start anything; a failed assignment falls back to the parent-link walk."""
+    start anything; a failed assignment falls back to the parent-link walk.
+
+    ``kill`` never raises. Every step that failed (no job object, a refused job or group
+    kill, a failed ``taskkill``, a child that would not die) is one line in ``failures``,
+    which ``run_child`` hands on as the episode's child-failure causes."""
 
     def __init__(self, proc: subprocess.Popen) -> None:
         self.proc = proc
         self.job: int | None = None
+        self.failures: list[str] = []
         if os.name == "nt":
             try:
                 self.job = _win_job_for(proc)
-            except Exception:
-                self.job = None  # fall back to the parent-link walk; never leak the child
+            except Exception as exc:  # noqa: BLE001 — fall back to the parent-link walk; never leak the child
+                self.job = None
+                self.failures.append(f"job object: {type(exc).__name__}: {exc}; fell back to taskkill /T")
+            else:
+                if self.job is None:
+                    self.failures.append("job object: refused by the OS; fell back to taskkill /T")
 
     def kill(self) -> None:
         try:
@@ -236,20 +247,25 @@ class _ProcessTree:
                     _win_terminate_job(self.job)
                     self.job = None
                 elif self.proc.poll() is None:
-                    subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, timeout=KILL_WAIT_S)
+                    rc = subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        timeout=KILL_WAIT_S).returncode
+                    if rc != 0 and self.proc.poll() is None:
+                        self.failures.append(f"tree kill: taskkill exit {rc}")
             else:
                 os.killpg(self.proc.pid, signal.SIGKILL)
-        except (OSError, subprocess.SubprocessError):
-            pass
+        except ProcessLookupError:
+            pass  # the whole group has already exited: nothing left to kill
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.failures.append(f"tree kill: {type(exc).__name__}: {exc}")
         try:
             self.proc.kill()
-        except OSError:
-            pass
+        except OSError as exc:
+            self.failures.append(f"kill: {type(exc).__name__}: {exc}")
         try:
             self.proc.wait(timeout=KILL_WAIT_S)
         except subprocess.TimeoutExpired:
-            pass
+            self.failures.append(f"child did not exit within {KILL_WAIT_S}s of the kill")
 
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
@@ -305,9 +321,13 @@ def _win_terminate_job(job: int) -> None:
     from ctypes import wintypes
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.TerminateJobObject.restype = wintypes.BOOL
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
-    k32.TerminateJobObject(job, 1)
+    ok = k32.TerminateJobObject(job, 1)
+    err = ctypes.get_last_error()
     k32.CloseHandle(job)
+    if not ok:
+        raise ctypes.WinError(err)  # an OSError: _ProcessTree.kill records it
 
 
 def _child_main() -> int:

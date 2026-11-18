@@ -132,11 +132,97 @@ def test_reconcile_counts_and_logs_unreadable_packets(root: Path) -> None:
     assert f"packet unreadable: {bad.name}" in log, log
 
 
+class _StubbornProc:
+    """A process that will not die: kill raises, wait times out, poll says still running."""
+
+    pid = 4194300  # no such process: a real tree kill of it fails
+
+    def poll(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        raise PermissionError("access denied")
+
+    def wait(self, timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired("stub", timeout or 0)
+
+
+class _Patched:
+    """Set attributes for the duration of a ``with`` block."""
+
+    def __init__(self, obj: object, **attrs: object) -> None:
+        self.obj, self.attrs, self.saved = obj, attrs, {}
+
+    def __enter__(self) -> None:
+        for k, v in self.attrs.items():
+            self.saved[k] = getattr(self.obj, k)
+            setattr(self.obj, k, v)
+
+    def __exit__(self, *_: object) -> None:
+        for k, v in self.saved.items():
+            setattr(self.obj, k, v)
+
+
+def _raise(exc: BaseException):
+    def f(*_a: object, **_k: object) -> None:
+        raise exc
+    return f
+
+
+def test_process_tree_records_kill_failures(root: Path) -> None:
+    """SA16-CT-11: job-object, tree-kill, kill and wait failures are recorded; kill never raises."""
+    import rescreen
+
+    if os.name == "nt":
+        with _Patched(rescreen, _win_job_for=_raise(RuntimeError("no job for you")), KILL_WAIT_S=0.1):
+            tree = rescreen._ProcessTree(_StubbornProc())  # type: ignore[arg-type]
+            tree.kill()  # taskkill of a pid that does not exist, then kill/wait fail
+        joined = " | ".join(tree.failures)
+        assert "job object" in joined and "no job for you" in joined, tree.failures
+        assert "taskkill" in joined, tree.failures
+        with _Patched(rescreen, _win_job_for=lambda _p: 1,
+                      _win_terminate_job=_raise(OSError("terminate refused"))):
+            tree = rescreen._ProcessTree(_StubbornProc())  # type: ignore[arg-type]
+            tree.kill()
+        joined = " | ".join(tree.failures)
+        assert "terminate refused" in joined, tree.failures
+    else:
+        with _Patched(os, killpg=_raise(PermissionError("group kill refused"))):
+            tree = rescreen._ProcessTree(_StubbornProc())  # type: ignore[arg-type]
+            tree.kill()
+        joined = " | ".join(tree.failures)
+        assert "group kill refused" in joined, tree.failures
+    assert "access denied" in joined, tree.failures
+    assert "did not exit" in joined, tree.failures
+
+
+def test_run_child_surfaces_process_tree_failures(root: Path) -> None:
+    """SA16-CT-11: a tree-kill failure reaches run_child's causes (so rescreen's
+    child_failures); the child's own outcome is kept."""
+    import rescreen
+
+    class FailingTree(rescreen._ProcessTree):
+        def kill(self) -> None:
+            super().kill()
+            self.failures.append("tree kill: OSError: simulated")
+
+    st = _stores(root)
+    reply = 'import json,sys; sys.stdin.read(); print(json.dumps({"outcome": "rescreened", "manifest": {}}))'
+    causes: list[str] = []
+    with _Patched(rescreen, _ProcessTree=FailingTree):
+        outcome, done = rescreen.run_child(st, {"episode_id": "e"}, dict(os.environ), 60,
+                                           (sys.executable, "-c", reply), causes=causes)
+    assert (outcome, done) == ("rescreened", {}), (outcome, done)
+    assert causes == ["process tree: tree kill: OSError: simulated"], causes
+
+
 TESTS = [
     test_start_hook_import_failure_is_logged,
     test_end_hook_import_failure_is_logged,
     test_unreadable_packet_is_counted_by_load_and_link,
     test_reconcile_counts_and_logs_unreadable_packets,
+    test_process_tree_records_kill_failures,
+    test_run_child_surfaces_process_tree_failures,
 ]
 
 
