@@ -24,6 +24,8 @@ HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 sys.path.insert(0, str(PKG))
 import backstop  # noqa: E402
+import causal  # noqa: E402
+import causal_admit  # noqa: E402
 import isolation  # noqa: E402
 import pipeline  # noqa: E402
 import report  # noqa: E402
@@ -231,7 +233,56 @@ def test_isolation_records_partial_resolve_and_sid_failure(root: Path) -> None:
     assert ok["sid"] and ok["sid_error"] is None, ok
 
 
-TESTS = [test_git_version_failure_is_not_cached, test_isolation_records_partial_resolve_and_sid_failure,
+def test_registration_git_calls_use_git_env(root: Path) -> None:
+    """SA11-CT-46: every git call verify_registration makes runs with git_env(), so an
+    inherited GIT_DIR / GIT_INDEX_FILE cannot point it at another repository."""
+    st = plain_stores(root)
+    ep = "cap_sa11_46"
+    p = causal_admit.checks_path(st, ep)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"episode_id": ep, "sha256": "d", "checks": [], "rationale": ""}), encoding="utf-8")
+    real = subprocess.run
+    seen: list[tuple[str, Any]] = []
+
+    def spy(argv: list[str], *a: Any, **k: Any) -> subprocess.CompletedProcess:
+        if argv[:3] == ["git", "-C", str(st.meta)]:
+            seen.append((argv[3], k.get("env")))
+            out = "abc" + chr(10) if "log" in argv else ""
+            return subprocess.CompletedProcess(argv, 0, out if k.get("text") else out.encode(), "")
+        return real(argv, *a, **k)
+
+    with patched(causal_admit, "_digest", lambda c, r: "d"),             patched(causal, "validate_predicate", lambda c: None), patched(subprocess, "run", spy),             patched(os, "environ", {**os.environ, "GIT_DIR": str(root / "elsewhere")}):
+        entry, probs = causal_admit.verify_registration(st, ep)
+    assert probs == [], probs
+    assert [c for c, _ in seen] == ["ls-files", "diff", "log"], seen
+    assert all(env is not None and "GIT_DIR" not in env for _, env in seen), seen
+
+
+def _good_admit_record() -> dict[str, Any]:
+    return {"identity_accepted": True, "start_problems": [], "end_problems": [], "history_problems": [],
+            "start_fidelity": [], "end_fidelity": [], "unsupported": [],
+            "attribution": {"unattributed": [], "other_worktrees_moved": []},
+            "worktrees": {"contaminating": [], "unknown": [], "shared_state_changed": False},
+            "dependency_drift": [], "registration_problems": [], "checks": [{"kind": "file_absent", "path": "x"}],
+            "check_results": [{"passed": True}], "check_results_start": [{"passed": False}]}
+
+
+def test_admit_names_missing_record_keys(root: Path) -> None:
+    """SA11-CT-50: ``unsupported``, ``dependency_drift`` and (with a verified registration)
+    ``checks`` missing from the record are named as reasons, not read as empty lists."""
+    assert causal.admit(_good_admit_record()) == {"eligible": True, "reasons": []}
+    for key in ("unsupported", "dependency_drift", "checks"):
+        rec = _good_admit_record()
+        del rec[key]
+        got = causal.admit(rec)
+        assert not got["eligible"] and f"{key}_missing" in got["reasons"], (key, got)
+    rec = {**_good_admit_record(), "registration_problems": None}
+    del rec["checks"]
+    assert causal.admit(rec)["reasons"] == ["no_outcome_check"], causal.admit(rec)
+
+
+TESTS = [test_registration_git_calls_use_git_env, test_admit_names_missing_record_keys,
+         test_git_version_failure_is_not_cached, test_isolation_records_partial_resolve_and_sid_failure,
          test_repo_relative_shares_classify_normalisation,
          test_checkpoint_names_unreadable_maintenance_and_audits, test_unreadable_backstop_status_is_a_warning,
          test_dead_pipeline_helpers_are_gone, test_failure_records_report_unreadable_manifests,
