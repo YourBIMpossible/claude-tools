@@ -1103,11 +1103,17 @@ def coverage_for(resolved: dict | None, repo: str | None) -> Callable[[str], boo
     return in_scope
 
 
-def repo_identity(path: str, resolver) -> str | None:
-    """Main-checkout root of the git repo holding `path` (a worktree maps to its main checkout)."""
+def repo_identity(path: str, resolver, problems: list[str] | None = None) -> str | None:
+    """Main-checkout root of the git repo holding `path` (a worktree maps to its main checkout).
+
+    None when `path` is in no repo. A path whose repo cannot be read also returns None and, when
+    `problems` is given, is recorded there as "<path>: <error>" so the miss is an input problem.
+    """
     try:
         top = resolver._git_toplevel(Path(path).resolve())
-    except OSError:
+    except OSError as exc:
+        if problems is not None:
+            problems.append(f"{path}: {type(exc).__name__}")
         return None
     if top is None:
         return None
@@ -1115,8 +1121,8 @@ def repo_identity(path: str, resolver) -> str | None:
     return str(main or top)
 
 
-def repo_of(session: Session, resolver) -> str | None:
-    return repo_identity(session.cwd, resolver) if session.cwd else None
+def repo_of(session: Session, resolver, problems: list[str] | None = None) -> str | None:
+    return repo_identity(session.cwd, resolver, problems) if session.cwd else None
 
 
 # --------------------------------------------------------------------------- agent definitions
@@ -1252,6 +1258,8 @@ def input_problems(inputs: dict) -> list[str]:
                                                      "(type unknown, judged shell-capable)"),
                       ("agent_definitions_unreadable", "agent definition file(s) could not be read "
                                                        "(agent judged shell-capable)"),
+                      ("repo_identity_failures", "path(s) whose git repo could not be read "
+                                                 "(treated as outside any repo)"),
                       ("sessions_without_cwd", "session(s) without a cwd (repo and graph unknown)")):
         if inputs[key]:
             out.append(f"{len(inputs[key])} {text}")
@@ -1269,7 +1277,8 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     hint_live = cfg.hint_live_since
     # A target path (repo, else scan) may sit inside a repo or a worktree lane: compare it by
     # the same identity as a session's repo; a path outside any git repo is kept verbatim.
-    targets = {norm(repo_identity(t, resolver) or t) for t in cfg.targets}
+    repo_problems: list[str] = []
+    targets = {norm(repo_identity(t, resolver, repo_problems) or t) for t in cfg.targets}
     # Headless/throwaway runs start in the temp dir; on unless the config turns it off. Both sides
     # are real paths: Windows may spell the temp dir as an 8.3 short name and the session cwd long.
     tmp = norm(os.path.realpath(tempfile.gettempdir())) if cfg.exclude_temp_cwd else None
@@ -1282,7 +1291,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         if s.cwd:
             r = resolver.resolve(s.cwd)
             s.resolved = dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r
-        s.repo = repo_of(s, resolver)
+        s.repo = repo_of(s, resolver, repo_problems)
 
     organic = [s for s in sessions if not s.excluded]
     copied_calls = mark_copied_calls(sessions)
@@ -1357,7 +1366,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             if u.cwd not in graph_cache:
                 r = resolver.resolve(u.cwd)
                 graph_cache[u.cwd] = (dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r,
-                                      repo_identity(u.cwd, resolver))
+                                      repo_identity(u.cwd, resolver, repo_problems))
             u.resolved, u.repo = graph_cache[u.cwd]
     routing_copies = mark_routing_copies([u for s in organic for u in s.units.values()])
     units = [u for s in organic for u in s.units.values() if u.resolved]
@@ -1457,6 +1466,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         "transcript_corrupt_lines": sum(s.corrupt_lines for s in seen),
         "subagent_metadata_problems": meta,
         "agent_definitions_unreadable": sorted(set(agent_def_problems)),
+        "repo_identity_failures": sorted(set(repo_problems)),
         "sessions_without_cwd": no_cwd,
     }
     inputs["problems"] = input_problems(inputs)

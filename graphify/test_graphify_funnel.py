@@ -504,6 +504,23 @@ class GraphUnusable(FunnelCase):
         InputVisibility.assert_problem(self, out, "1 agent definition file(s) could not be read")
         self.assertNotEqual(out["routing"]["verdict"], gf.PASS)
 
+    def test_repo_identity_os_error_is_an_input_problem(self):
+        """SA16-CT-17: a cwd whose git repo cannot be read is recorded, never silently 'no repo'."""
+        real, other = self.resolver, self.other.resolve()
+
+        def toplevel(start):
+            if start == other or other in start.parents:
+                raise PermissionError(13, "Access is denied", str(start))
+            return real._git_toplevel(start)
+        self.resolver = types.SimpleNamespace(_git_toplevel=toplevel, _main_checkout=real._main_checkout,
+                                              resolve=real.resolve)
+        Transcript(self.other).greps(1).write(self.projects, "p", "s-identity")
+        out = self.run_funnel()
+        bad = out["inputs"]["repo_identity_failures"]
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("PermissionError", bad[0])
+        InputVisibility.assert_problem(self, out, "1 path(s) whose git repo could not be read")
+
     def test_builtin_no_shell_agent_is_unusable(self):
         self.session_with("claude-code-guide", "s-guide")
         self.assertEqual(self.run_funnel()["routing"]["graph_unusable_units"], 1)
