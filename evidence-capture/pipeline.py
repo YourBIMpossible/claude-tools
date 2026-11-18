@@ -1174,8 +1174,10 @@ def _read_state(stores: Stores) -> dict[str, Any]:
 def run_maintain(stores: Stores, env: dict[str, str], *, now: str | None = None) -> dict[str, Any]:
     """Everything that may wait for the next start (see the module docstring)."""
     lock = stores.meta / MAINTAIN_LOCK
-    if not stores.meta.is_dir() or not _try_lock(lock):
-        return {"action": "skipped"}
+    if not stores.meta.is_dir():
+        return {"action": "skipped", "reason": "metadata store missing"}
+    if not _try_lock(lock):
+        return {"action": "skipped", "reason": "maintenance running"}
     now = now or iso(now_utc())
     counts: dict[str, Any] = {"action": "maintained", "killed": 0, "rejoined": 0, "rejoin_expired": 0,
                               "relinked": 0, "reviewed": 0, "review_errors": 0, "pending_drained": 0,
@@ -1316,6 +1318,11 @@ def maintain_findings(counts: dict[str, Any]) -> tuple[list[str], list[str]]:
     episodes, pending records, manifests or metadata commit failed as ok."""
     problems: list[str] = []
     warnings: list[str] = []
+    if counts.get("action") == "skipped":
+        # a pass that did not run is never ok: no store is a failure, another holder a warning
+        reason = counts.get("reason") or "unknown"
+        (warnings if reason == "maintenance running" else problems).append(f"maintenance_skipped: {reason}")
+        return problems, warnings
     if counts.get("error"):
         problems.append(f"maintenance_error: {counts['error']}")
     if counts.get("store_problems"):

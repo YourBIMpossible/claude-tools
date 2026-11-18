@@ -519,6 +519,29 @@ def test_maintenance_relinks_through_reconcile(root: Path) -> None:
     assert pipeline.run_maintain(fx.stores, fx.env)["relinked"] == 0, "an unchanged link is not rewritten"
 
 
+def test_skipped_maintain_is_not_ok(root: Path) -> None:
+    """SA11-CT-3 / SA16-CT-4: ``capture.py maintain`` that did not run is never status ok.
+    Another holder of the lock is a warning, a missing metadata store a failure."""
+    fx = Fixture(root)
+    holder = _hold_lock(root, fx.stores.meta / pipeline.MAINTAIN_LOCK)
+    try:
+        res = _run_maintain_cli(fx.env)
+    finally:
+        holder.kill()
+        holder.wait()
+    out = json.loads(res.stdout)
+    assert out["action"] == "skipped" and out["reason"] == "maintenance running", out
+    assert out["status"] == "warn" and res.returncode == backstop.EXIT_WARN, (res.returncode, out)
+    assert any(w.startswith("maintenance_skipped") for w in out["warnings"]), out
+
+    rec = pipeline.run_maintain(store.Stores(content=fx.stores.content, meta=root / "no-meta"), fx.env)
+    assert rec == {"action": "skipped", "reason": "metadata store missing"}, rec
+    found, _ = pipeline.maintain_findings(rec)
+    assert any(p.startswith("maintenance_skipped: metadata store missing") for p in found), found
+    found, warned = pipeline.maintain_findings({"action": "skipped", "reason": "maintenance running"})
+    assert not found and any(w.startswith("maintenance_skipped") for w in warned), (found, warned)
+
+
 TESTS = [test_backstop_expires_without_prompts, test_backstop_reports_failures,
          test_backstop_waits_for_maintenance_child, test_maintenance_due_probes_the_lock_not_the_file,
          test_backstop_warns_on_undated_content,
@@ -527,7 +550,8 @@ TESTS = [test_backstop_expires_without_prompts, test_backstop_reports_failures,
          test_unreadable_manifest_is_counted_everywhere, test_pending_record_kept_until_its_manifest_is_written,
          test_orphaned_draining_file_is_recovered, test_live_claim_is_not_taken_by_another_store,
          test_rejoin_review_error_is_counted,
-         test_failed_metadata_commit_fails_the_pass, test_maintenance_relinks_through_reconcile]
+         test_failed_metadata_commit_fails_the_pass, test_maintenance_relinks_through_reconcile,
+         test_skipped_maintain_is_not_ok]
 
 
 def main() -> int:

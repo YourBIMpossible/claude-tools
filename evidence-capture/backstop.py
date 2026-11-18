@@ -65,10 +65,12 @@ def _evaluate(stores: Stores, env: dict[str, str], now: str, lock_wait_s: float,
             break
         time.sleep(LOCK_POLL_S)
     if counts.get("action") == "skipped":
+        # the backstop waited for the lock, so any skip left is a failure of its own pass
         problems.append("maintenance_lock_held")
-    found, warned = pipeline.maintain_findings(counts)
-    problems.extend(found)
-    warnings.extend(warned)
+    else:
+        found, warned = pipeline.maintain_findings(counts)
+        problems.extend(found)
+        warnings.extend(warned)
     if stores.content.is_dir():
         left = overdue(stores, now=now)
         if left:
