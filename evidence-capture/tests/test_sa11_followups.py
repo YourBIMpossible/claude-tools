@@ -127,6 +127,36 @@ def test_checkpoint_names_unreadable_maintenance_and_audits(root: Path) -> None:
     assert any(n.startswith("maintenance.json unreadable (not an object)") for n in ck["notes"]), ck["notes"]
 
 
+def test_checkpoint_names_unsized_content_and_unknown_meta_head(root: Path) -> None:
+    """SA11-CT-55 residual: a content entry whose size cannot be read is named in the notes
+    (bytes_total says it is left out), and a metadata HEAD that git cannot read is named
+    rather than reading as an empty repository. An unborn HEAD stays a plain null."""
+    st = plain_stores(root)
+    snap = st.snapshots / "s1"
+    snap.mkdir(parents=True)
+    (snap / "ok.bin").write_bytes(b"12345")
+    (snap / "gone.bin").write_bytes(b"x" * 100)
+    real_lstat = report.os.lstat
+
+    def lstat(path: Any, *a: Any, **k: Any) -> Any:
+        if Path(path).name == "gone.bin":
+            raise PermissionError(13, "denied on purpose", str(path))
+        return real_lstat(path, *a, **k)
+    report.os.lstat = lstat
+    try:
+        _, ck = report.write_checkpoint(st, n=1, now="2026-11-17T00:00:00.000000Z", commit=False)
+    finally:
+        report.os.lstat = real_lstat
+    assert ck["content_store"]["bytes_total"] == 5, ck["content_store"]
+    assert any("1 content store entr" in n and "gone.bin" in n and "bytes_total" in n for n in ck["notes"]),         ck["notes"]
+    assert ck["checkpoint"]["metadata_commit"] is None
+    assert any(n.startswith("metadata_commit unknown") for n in ck["notes"]), ck["notes"]  # not a repository
+    subprocess.run(["git", "init", "-q", str(st.meta)], check=True, capture_output=True)
+    _, ck = report.write_checkpoint(st, n=2, now="2026-11-17T00:00:00.000000Z", commit=False)
+    assert ck["checkpoint"]["metadata_commit"] is None
+    assert not any(n.startswith("metadata_commit unknown") for n in ck["notes"]), ck["notes"]  # unborn HEAD
+
+
 def test_unreadable_backstop_status_is_a_warning(root: Path) -> None:
     """SA11-CT-56: an unreadable previous status file no longer silently resets the
     history and the failure streak: the pass warns, and the unreadable file is kept."""
@@ -284,7 +314,8 @@ def test_admit_names_missing_record_keys(root: Path) -> None:
 TESTS = [test_registration_git_calls_use_git_env, test_admit_names_missing_record_keys,
          test_git_version_failure_is_not_cached, test_isolation_records_partial_resolve_and_sid_failure,
          test_repo_relative_shares_classify_normalisation,
-         test_checkpoint_names_unreadable_maintenance_and_audits, test_unreadable_backstop_status_is_a_warning,
+         test_checkpoint_names_unreadable_maintenance_and_audits,
+         test_checkpoint_names_unsized_content_and_unknown_meta_head, test_unreadable_backstop_status_is_a_warning,
          test_dead_pipeline_helpers_are_gone, test_failure_records_report_unreadable_manifests,
          test_spawn_maintenance_failure_is_logged, test_maintain_warns_on_unreadable_seals]
 
