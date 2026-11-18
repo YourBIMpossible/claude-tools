@@ -11,6 +11,7 @@ import math
 import os
 import tempfile
 import textwrap
+import types
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
@@ -491,6 +492,17 @@ class GraphUnusable(FunnelCase):
         self.session_with("runner", "s-shell")
         out = self.run_funnel()["routing"]
         self.assertEqual((out["verdict"], out["graph_unusable_units"]), (gf.FAIL, 0))
+
+    def test_unreadable_agent_definition_is_an_input_problem(self):
+        """SA16-CT-16: an agent file that cannot be read is recorded, never skipped as if absent."""
+        (self.repo / ".claude" / "agents" / "reviewer.md").mkdir(parents=True)   # open() on a dir: OSError
+        self.session_with("reviewer", "s-unreadable-def")
+        out = self.run_funnel()
+        bad = out["inputs"]["agent_definitions_unreadable"]
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("reviewer.md", bad[0])
+        InputVisibility.assert_problem(self, out, "1 agent definition file(s) could not be read")
+        self.assertNotEqual(out["routing"]["verdict"], gf.PASS)
 
     def test_builtin_no_shell_agent_is_unusable(self):
         self.session_with("claude-code-guide", "s-guide")

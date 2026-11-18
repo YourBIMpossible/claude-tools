@@ -1166,11 +1166,13 @@ def _tool_names(value: str | list[str] | None) -> list[str] | None:
     return [t.strip() for t in items if t.strip()]
 
 
-def find_agent_definition(agent_type: str, cwd: str | None,
-                          user_agents: Path | None) -> dict[str, str | list[str]] | None:
+def find_agent_definition(agent_type: str, cwd: str | None, user_agents: Path | None,
+                          problems: list[str] | None = None) -> dict[str, str | list[str]] | None:
     """Frontmatter of the agent file whose `name` (or file stem) is agent_type.
 
-    Searched in .claude/agents from cwd upward (nearest wins), then in user_agents.
+    Searched in .claude/agents from cwd upward (nearest wins), then in user_agents. A folder or
+    file that cannot be read is skipped and, when `problems` is given, recorded there as
+    "<path>: <error>" so the miss is an input problem, not a silent "no definition".
     """
     dirs: list[Path] = []
     if cwd:
@@ -1181,13 +1183,17 @@ def find_agent_definition(agent_type: str, cwd: str | None,
     for d in dirs:
         try:
             paths = sorted(d.glob("*.md")) if d.is_dir() else []
-        except OSError:
+        except OSError as exc:
+            if problems is not None:
+                problems.append(f"{d}: {type(exc).__name__}")
             continue
         for path in paths:
             try:
                 with open(path, "rb") as f:
                     text = f.read(AGENT_DEF_MAX_BYTES).decode("utf-8", errors="replace")
-            except OSError:
+            except OSError as exc:
+                if problems is not None:
+                    problems.append(f"{path}: {type(exc).__name__}")
                 continue
             fm = parse_frontmatter(text)
             if fm is None:
@@ -1198,8 +1204,8 @@ def find_agent_definition(agent_type: str, cwd: str | None,
     return None
 
 
-def agent_has_shell(agent_type: str | None, cwd: str | None,
-                    user_agents: Path | None) -> bool | None:
+def agent_has_shell(agent_type: str | None, cwd: str | None, user_agents: Path | None,
+                    problems: list[str] | None = None) -> bool | None:
     """False when the agent provably has no Bash/PowerShell; None when its definition is unknown.
 
     A `tools` field absent or `*` means every tool; a pattern grant such as Bash(git:*)
@@ -1211,7 +1217,7 @@ def agent_has_shell(agent_type: str | None, cwd: str | None,
         return False
     if ":" in agent_type:
         return None
-    fm = find_agent_definition(agent_type, cwd, user_agents)
+    fm = find_agent_definition(agent_type, cwd, user_agents, problems)
     if fm is None:
         return None
     tools = _tool_names(fm.get("tools"))
@@ -1244,6 +1250,8 @@ def input_problems(inputs: dict) -> list[str]:
                       ("transcripts_undated", "transcript(s) had no timestamped record and were left out"),
                       ("subagent_metadata_problems", "subagent(s) without readable metadata "
                                                      "(type unknown, judged shell-capable)"),
+                      ("agent_definitions_unreadable", "agent definition file(s) could not be read "
+                                                       "(agent judged shell-capable)"),
                       ("sessions_without_cwd", "session(s) without a cwd (repo and graph unknown)")):
         if inputs[key]:
             out.append(f"{len(inputs[key])} {text}")
@@ -1357,8 +1365,9 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     eligible = [u for u in units if u.is_exploration(scope_of[id(u)])]
     # A subagent without a shell cannot run graphify: its lookups show the graph was
     # unusable to it, not that it was bypassed.
+    agent_def_problems: list[str] = []
     unusable = [u for u in eligible if u.unit_id != "main"
-                and agent_has_shell(u.agent_type, u.cwd, user_agents) is False]
+                and agent_has_shell(u.agent_type, u.cwd, user_agents, agent_def_problems) is False]
     exploration = [u for u in eligible if u not in unusable]
     no_path_evidence = [u for u in units if u.enough_lookups() and not (u.files | u.search_paths)]
     used = [u for u in exploration if u.routing_calls()]
@@ -1447,6 +1456,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         "transcripts_undated": [str(s.path) for s in scan.undated],
         "transcript_corrupt_lines": sum(s.corrupt_lines for s in seen),
         "subagent_metadata_problems": meta,
+        "agent_definitions_unreadable": sorted(set(agent_def_problems)),
         "sessions_without_cwd": no_cwd,
     }
     inputs["problems"] = input_problems(inputs)
