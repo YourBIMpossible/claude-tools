@@ -238,6 +238,9 @@ def test_snapshot_stability_and_index_untouched(root: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v2"], check=True, capture_output=True, env=env)
     control_changed = (index.read_bytes(), index.stat().st_mtime_ns) != after
     REPORT["index_refresh_without_optional_locks_off"] = control_changed
+    # SA11-CT-58: without the control the "index untouched" check above is vacuous: a stat cache
+    # git never refreshes proves nothing about GIT_OPTIONAL_LOCKS=0
+    assert control_changed, "control: plain git status did not refresh the stale index, so the fixture cannot detect a refresh"
 
 
 BRACKET_BUDGET_S = 60.0  # the bracket is under test, not the budget (timeout: test_snapshot_failed_is_final)
