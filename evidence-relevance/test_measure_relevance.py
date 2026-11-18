@@ -106,11 +106,44 @@ def test_load_packet_json_present_and_absent(tmp_path: Path) -> None:
     check(absent is None, "load_packet_json returns None (never raises) for an absent packet")
 
 
+def test_inventory_nonzero_exit_warns_and_counts(tmp_path: Path) -> None:
+    """SA11-CT-38: a non-zero `evidence review inventory` exit is a WARN and a counted issue, not empty classes."""
+    import contextlib
+    import io
+    import subprocess
+
+    store = tmp_path / "repo" / ".evidence-compiler"
+    (store / "packets").mkdir(parents=True)
+    (store / "packets" / "20260921-000000_ep_test0000000003.json").write_text(
+        json.dumps({"packet_id": "ep_test0000000003", "identity": {}}), encoding="utf-8")
+
+    def fake_run(cmd, **_kw):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="evidence: store locked\n")
+
+    orig_run, orig_globs = mr.subprocess.run, mr.STORE_GLOBS
+    mr.subprocess.run, mr.STORE_GLOBS = fake_run, (str(store),)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            classes = mr.traffic_classes(str(tmp_path / "repo"))
+            packets, issues = mr.load_packets()
+    finally:
+        mr.subprocess.run, mr.STORE_GLOBS = orig_run, orig_globs
+
+    check(classes is None, "traffic_classes returns None (not empty classes) on a non-zero exit")
+    check("WARN inventory exited 1" in err.getvalue() and "store locked" in err.getvalue(),
+          "non-zero inventory exit WARNs with the exit code and stderr")
+    check(issues["inventory_failed"] == 1 and len(packets) == 1,
+          "load_packets counts inventory_failed and still loads the packet")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         test_build_turns_counts_malformed_line_and_keeps_valid_data(Path(td))
     with tempfile.TemporaryDirectory() as td:
         test_load_packet_json_present_and_absent(Path(td))
+    with tempfile.TemporaryDirectory() as td:
+        test_inventory_nonzero_exit_warns_and_counts(Path(td))
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     if FAILURES:

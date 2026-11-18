@@ -98,8 +98,12 @@ def cited_files(packet: dict) -> set[str]:
     return out
 
 
-def traffic_classes(store_root: str) -> dict[str, tuple[str, str]]:
-    """prefix -> (traffic, rg) from `evidence review inventory --all` (ids are truncated there)."""
+def traffic_classes(store_root: str) -> dict[str, tuple[str, str]] | None:
+    """prefix -> (traffic, rg) from `evidence review inventory --all` (ids are truncated there).
+
+    None (with a WARN) when the inventory could not be read: the CLI failed to start, timed out, or
+    exited non-zero. An empty dict means the inventory ran and listed nothing.
+    """
     try:
         res = subprocess.run(
             ["evidence", "review", "--repo", store_root, "inventory", "--all"],
@@ -107,7 +111,11 @@ def traffic_classes(store_root: str) -> dict[str, tuple[str, str]]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"WARN inventory failed for {store_root}: {exc}", file=sys.stderr)
-        return {}
+        return None
+    if res.returncode != 0:
+        detail = (res.stderr or "").strip().splitlines()[-1:] or ["no stderr"]
+        print(f"WARN inventory exited {res.returncode} for {store_root}: {detail[0]}", file=sys.stderr)
+        return None
     out: dict[str, tuple[str, str]] = {}
     for line in res.stdout.splitlines():
         parts = line.split()
@@ -130,6 +138,9 @@ def load_packets() -> tuple[list[Packet], Counter]:
     for store in sorted({p for g in STORE_GLOBS for p in glob.glob(g)}):
         store_root = str(Path(store).parent).replace("\\", "/")
         classes = traffic_classes(store_root)
+        if classes is None:
+            issues["inventory_failed"] += 1
+            classes = {}
         for f in sorted(Path(store, "packets").glob("*.json")):
             try:
                 d = json.loads(f.read_text(encoding="utf-8"))
