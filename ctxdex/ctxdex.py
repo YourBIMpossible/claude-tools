@@ -204,6 +204,7 @@ def cmd_index(args) -> int:
     total_chunks = 0
     total_files = 0
     rejected = 0
+    unreadable = 0
 
     if args.target.startswith(("http://", "https://")):
         text = fetch_url(args.target)
@@ -230,7 +231,9 @@ def cmd_index(args) -> int:
         for fp in iter_source_files(target_path):
             try:
                 text = fp.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            except OSError as exc:
+                print(f"unreadable: {fp} ({exc.__class__.__name__}: {exc}) - not indexed", file=sys.stderr)
+                unreadable += 1
                 continue
             reason = sensitive_reason(fp.name, text)
             if reason:
@@ -250,10 +253,14 @@ def cmd_index(args) -> int:
     conn.commit()
     conn.close()
     print(f"indexed {total_files} file(s), {total_chunks} chunk(s) -> project '{args.project}', source '{args.source or ('web' if args.target.startswith('http') else 'local')}'")
+    status = 0
     if rejected:
         print(f"refused {rejected} file(s) by the secret gate - see reasons above", file=sys.stderr)
-        return 2
-    return 0
+        status = 2
+    if unreadable:
+        print(f"skipped {unreadable} unreadable file(s) - see reasons above", file=sys.stderr)
+        status = 2
+    return status
 
 
 def _rrf_merge(porter_hits: list[tuple[int, float]], trigram_hits: list[tuple[int, float]], k: int = 60) -> list[int]:
@@ -268,15 +275,18 @@ def _rrf_merge(porter_hits: list[tuple[int, float]], trigram_hits: list[tuple[in
 def _fts_query_escape(query: str) -> str:
     """OR-join terms: an all-terms-required AND makes multi-word queries miss constantly."""
     terms = re.findall(r"\w+", query)
-    return " OR ".join(f'"{t}"' for t in terms) if terms else f'"{query}"'
+    if terms:
+        return " OR ".join(f'"{t}"' for t in terms)
+    return '"' + query.replace('"', '""') + '"'  # an FTS5 string: embedded quotes doubled
 
 
-def cmd_search(args):
+def cmd_search(args) -> int:
     conn = connect(args.project)
     q = _fts_query_escape(args.query)
 
     where_source = "AND d.source = ?" if args.source else ""
     params_extra = (args.source,) if args.source else ()
+    errors: list[str] = []
 
     try:
         porter_rows = conn.execute(
@@ -288,7 +298,10 @@ def cmd_search(args):
             """,
             (q, *params_extra),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        # Every term is quoted (_fts_query_escape), so a query cannot be an FTS5 syntax error:
+        # an OperationalError here is an index fault (locked, corrupt, missing table), not a miss.
+        errors.append(f"porter index: {exc}")
         porter_rows = []
 
     # Trigram catches partial/misspelled tokens the porter index misses; needs >=3 chars.
@@ -304,15 +317,22 @@ def cmd_search(args):
                 """,
                 (f'"{term}"', *params_extra),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            errors.append(f"trigram index ({term}): {exc}")
             continue
 
     candidates = _rrf_merge(porter_rows, trigram_rows)[:20]
 
+    for err in errors:
+        print(f"search error: {err}", file=sys.stderr)
     if not candidates:
-        print("no results")
         conn.close()
-        return
+        if errors:
+            # A fault is not a miss: say so and fail, never print "no results" over it.
+            print(f"search failed: {len(errors)} index query error(s) - see above", file=sys.stderr)
+            return 1
+        print("no results")
+        return 0
 
     # Chunks containing every query term outrank partial matches — OR semantics alone
     # ranks a chunk matching one common term above one matching all of them.
@@ -335,6 +355,7 @@ def cmd_search(args):
         print()
 
     conn.close()
+    return 0
 
 
 def cmd_stats(args):

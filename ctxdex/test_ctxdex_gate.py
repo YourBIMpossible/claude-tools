@@ -44,6 +44,36 @@ def reset():
     run(["purge", "--all"])
 
 
+def index_with_unreadable(target: Path, bad: Path) -> tuple[int, str]:
+    """cmd_index in-process with reads of `bad` failing as an ACL denial would. A real
+    unreadable file cannot be made portably (Windows ACLs, root on Linux), so read_text is
+    patched for that one path."""
+    import argparse
+    import contextlib
+    import importlib.util
+    import io
+
+    spec = importlib.util.spec_from_file_location("ctxdex_under_test", CTXDEX)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    real = Path.read_text
+
+    def read_text(self, *a, **kw):
+        if self == bad:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *a, **kw)
+
+    err = io.StringIO()
+    Path.read_text = read_text
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = mod.cmd_index(argparse.Namespace(
+                target=str(target), source="t", project=PROJECT, path=None))
+    finally:
+        Path.read_text = real
+    return rc, err.getvalue()
+
+
 SECRET_VECTORS = {
     "aws-access-key": "config dump\nAWS_KEY=AKIAIOSFODNN7EXAMPLE\nend",
     "github-pat-classic": "auth: ghp_" + "a1B2" * 9 + "\ndone",
@@ -115,6 +145,43 @@ def main():
         p = run(["index", str(d2), "--source", "t"])
         check("5 clean dir: exit 0", p.returncode == 0, f"rc={p.returncode}")
         check("5 clean dir: both persisted", db_count() >= 2)
+        reset()
+
+        # 6) an unreadable file is reported and makes the run non-zero (SA11-CT-5), never
+        #    silently left out of the "indexed N file(s)" count
+        d3 = tmp / "unreadable"
+        d3.mkdir()
+        (d3 / "ok.md").write_text("# ok\n\ngamma content\n", encoding="utf-8")
+        bad = d3 / "locked.md"
+        bad.write_text("# locked\n\ndelta content\n", encoding="utf-8")
+        rc, err = index_with_unreadable(d3, bad)
+        check("6 unreadable: non-zero exit", rc != 0, f"rc={rc}")
+        check("6 unreadable: path named on stderr", "locked.md" in err and "unreadable" in err, err)
+        check("6 unreadable: readable file still persisted", db_count("gamma content") > 0)
+        reset()
+
+        # 7) an index fault is not a miss (SA11-CT-6): with both FTS tables broken, search
+        #    exits non-zero with the error instead of printing "no results"
+        p = run(["index", str(d2 if d2.exists() else d3), "--source", "t"])
+        conn = sqlite3.connect(DB)
+        conn.executescript(
+            "DROP TABLE docs_fts; DROP TABLE docs_trigram;"
+            "CREATE TABLE docs_fts(title, content); CREATE TABLE docs_trigram(content);"
+        )
+        conn.close()
+        p = run(["search", "alpha content"])
+        check("7 broken index: non-zero exit", p.returncode != 0, f"rc={p.returncode}")
+        check("7 broken index: not reported as 'no results'", "no results" not in p.stdout, p.stdout)
+        check("7 broken index: error on stderr", "search failed" in p.stderr, p.stderr)
+        DB.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm"):
+            Path(str(DB) + suffix).unlink(missing_ok=True)
+
+        # 8) a true miss on a healthy index still prints "no results" and exits 0
+        p = run(["index", str(d2), "--source", "t"])
+        p = run(["search", "zzzyyyxxx"])
+        check("8 true miss: exit 0", p.returncode == 0, f"rc={p.returncode} {p.stderr}")
+        check("8 true miss: 'no results'", "no results" in p.stdout, p.stdout)
         reset()
 
     finally:
