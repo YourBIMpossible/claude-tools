@@ -75,7 +75,10 @@ def run_prepass(repo: Path, since: str | None) -> list[dict]:
     out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if out.returncode != 0:
         sys.exit(f"pre-pass failed:\n{out.stderr.strip()}")
-    return json.loads(out.stdout)["candidates"]
+    data = json.loads(out.stdout)
+    for s in data.get("skipped", []):
+        print(f"pre-pass skipped {s['file']}: {s['reason']} (not audited)", file=sys.stderr)
+    return data["candidates"]
 
 
 def dedupe_rows(rows: list[dict]) -> list[dict]:
