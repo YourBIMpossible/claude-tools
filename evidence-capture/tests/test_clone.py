@@ -112,8 +112,13 @@ def test_clone_proofs_P1_P10(root: Path) -> None:
     assert rec["proofs"]["P6"]["sentinels"] == 6
     assert source_state(src) == before, "the source must only be read"
     assert not (root / "replay" / "repo.objects.tmp").exists()
+    # SA11-CT-60: "missing" is cat-file -e rc 1 with no stderr; rc 128 (no repo, bad name) is a
+    # broken probe, not a proof. The start commit itself is the positive control.
+    replay = root / "replay" / "repo"
+    assert cb._run(replay, "cat-file", "-e", start, check=False).returncode == 0, "start commit missing"
     for c in git(src, "rev-list", f"{start}..main").split()[:5]:
-        assert not cb._run(root / "replay" / "repo", "cat-file", "-e", c, check=False).returncode == 0
+        probe = cb._run(replay, "cat-file", "-e", c, check=False)
+        assert (probe.returncode, probe.stderr) == (1, b""), (c, probe.returncode, probe.stderr[:200])
     REPORT["P7_machine_level_recorded"] = len(rec["proofs"]["P7"]["machine_level_recorded"])
 
 
