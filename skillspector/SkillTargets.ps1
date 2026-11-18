@@ -23,17 +23,27 @@
 #>
 
 function Get-SkillTargets {
+    <#
+        A folder under either root that cannot be enumerated (access denied, a
+        broken link) would shrink the target set without a trace, and a smaller
+        set scans CLEAN. Each such failure is written as a warning and, when the
+        caller passes -Shortfall, appended there so the caller can refuse to
+        report clean. A root that does not exist is not a shortfall: there is
+        nothing under it to miss.
+    #>
     [CmdletBinding()]
     param(
         [string]$SkillsRoot  = (Join-Path $env:USERPROFILE '.claude\skills'),
-        [string]$PluginCache = (Join-Path $env:USERPROFILE '.claude\plugins\cache')
+        [string]$PluginCache = (Join-Path $env:USERPROFILE '.claude\plugins\cache'),
+        [System.Collections.Generic.List[string]]$Shortfall
     )
 
-    $targets = @()
+    $targets   = @()
+    $enumError = @()
 
     # Personal skills: <USERPROFILE>/.claude/skills/<skill>/SKILL.md
     if (Test-Path $SkillsRoot) {
-        Get-ChildItem $SkillsRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ChildItem $SkillsRoot -Directory -ErrorAction SilentlyContinue -ErrorVariable +enumError | ForEach-Object {
             if (Test-Path (Join-Path $_.FullName 'SKILL.md')) {
                 $targets += [pscustomobject]@{
                     Scope = 'skills'
@@ -49,7 +59,7 @@ function Get-SkillTargets {
     # rather than hardcoded, and the baseline is keyed on <plugin>/<skill> so a
     # version bump does not orphan it.
     if (Test-Path $PluginCache) {
-        Get-ChildItem $PluginCache -Recurse -Filter 'SKILL.md' -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ChildItem $PluginCache -Recurse -Filter 'SKILL.md' -ErrorAction SilentlyContinue -ErrorVariable +enumError | ForEach-Object {
             # <marketplace>\<plugin>\<version>\skills\<skill>\SKILL.md
             $skillDir   = Split-Path $_.FullName -Parent   # ...\skills\<skill>
             $skillsDir  = Split-Path $skillDir   -Parent   # ...\<version>\skills
@@ -66,6 +76,13 @@ function Get-SkillTargets {
                 }
             }
         }
+    }
+
+    foreach ($e in $enumError) {
+        $what = if ($e.TargetObject) { "$($e.TargetObject)" } else { $e.Exception.Message }
+        $line = "could not enumerate $what ($($e.CategoryInfo.Category))"
+        Write-Warning "SkillTargets: $line"
+        if ($null -ne $Shortfall) { $Shortfall.Add($line) }
     }
 
     $targets | Sort-Object Scope, Name

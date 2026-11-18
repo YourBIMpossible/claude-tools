@@ -35,12 +35,14 @@ $baselineDir = Join-Path $scriptRoot 'baselines'
 
 if (-not (Test-Path $ss)) { Write-Host "Scanner not found at $ss" -ForegroundColor Red; exit 2 }
 
-$targets = Get-SkillTargets
+$shortfall = [System.Collections.Generic.List[string]]::new()
+$targets = @(Get-SkillTargets -Shortfall $shortfall)
 Write-Host "Generating baselines for $($targets.Count) skill(s)..."
 Write-Host ''
 
 $total = 0
-$failed = 0
+# A skill folder that could not be enumerated gets no baseline: count it as a failure.
+$failed = $shortfall.Count
 foreach ($t in $targets) {
     $scopeDir = Join-Path $baselineDir $t.Scope
     if (-not (Test-Path $scopeDir)) { New-Item -ItemType Directory -Force -Path $scopeDir | Out-Null }

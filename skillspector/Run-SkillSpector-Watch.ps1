@@ -65,7 +65,8 @@ if (-not (Test-Path $ss)) {
     exit 2
 }
 
-$targets = Get-SkillTargets
+$shortfall = [System.Collections.Generic.List[string]]::new()
+$targets = @(Get-SkillTargets -Shortfall $shortfall)
 if ($targets.Count -eq 0) {
     Write-Host "INCONCLUSIVE: no skills found to scan." -ForegroundColor Red
     exit 2
@@ -77,6 +78,8 @@ $unreviewed   = @()
 $inconclusive = @()
 $upgrades     = @()
 $cleanCount   = 0
+# A skill folder that could not be enumerated was never scanned: the run cannot be clean.
+foreach ($gap in $shortfall) { $inconclusive += "target discovery: $gap" }
 
 # --- Plugin upgrade detection ----------------------------------------------
 # Baselines deliberately survive a plugin version bump, which means an upgrade
