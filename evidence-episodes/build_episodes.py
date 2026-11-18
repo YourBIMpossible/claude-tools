@@ -167,7 +167,9 @@ class Transcript:
     sha256: str
     events: list[Event]
     parse_errors: int
-    sidechain_entries: int
+    # entries dropped before they became events, by reason (sidechain, compact_summary,
+    # no_message:<type>); emitted per row and summed in the summary (SA11-CT-66)
+    skipped_entries: dict[str, int]
 
 
 SLASH_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.S)
@@ -215,7 +217,7 @@ def _prompt_text(content: Any) -> str | None:
 def parse_transcript(root_name: str, root: Path, path: Path) -> Transcript:
     events: list[Event] = []
     errors = 0
-    sidechain = 0
+    skipped: Counter[str] = Counter()
     with path.open(encoding="utf-8", errors="surrogateescape") as fh:
         for idx, line in enumerate(fh):
             line = line.strip()
@@ -230,7 +232,7 @@ def parse_transcript(root_name: str, root: Path, path: Path) -> Transcript:
                 errors += 1
                 continue
             if entry.get("isSidechain"):
-                sidechain += 1
+                skipped["sidechain"] += 1
                 continue
             ts = entry.get("timestamp")
             etype = entry.get("type")
@@ -262,6 +264,7 @@ def parse_transcript(root_name: str, root: Path, path: Path) -> Transcript:
                 continue
             msg = entry.get("message")
             if not isinstance(msg, dict):
+                skipped[f"no_message:{etype}"] += 1
                 continue
             if etype == "user":
                 content = msg.get("content")
@@ -273,6 +276,7 @@ def parse_transcript(root_name: str, root: Path, path: Path) -> Transcript:
                                 "is_error": bool(block.get("is_error")),
                             }))
                 if entry.get("isCompactSummary"):
+                    skipped["compact_summary"] += 1
                     continue
                 # Meta entries are mostly harness text (skill bodies, reminders): they
                 # end a turn only when they carry an ``origin`` (a peer session or the
@@ -300,7 +304,7 @@ def parse_transcript(root_name: str, root: Path, path: Path) -> Transcript:
                     "tools": tools,
                 }))
     return Transcript(root_name, path.relative_to(root).as_posix(), path.stem,
-                      sha256_file(path), events, errors, sidechain)
+                      sha256_file(path), events, errors, dict(sorted(skipped.items())))
 
 
 def discover_transcripts(roots: list[tuple[str, Path]]) -> list[Transcript]:
@@ -595,7 +599,7 @@ def build_row(pid: str, copies: list[PacketCopy], cohorts: list[Cohort],
                                 "found": False, "text": None, "matches_render": None}
     if tr is not None:
         row["transcript"] = {"source": tr.root, "path": tr.rel, "sha256": tr.sha256,
-                             "parse_errors": tr.parse_errors}
+                             "parse_errors": tr.parse_errors, "skipped_entries": tr.skipped_entries}
         if brief_pos is not None:
             text = tr.events[brief_pos].data["text"]
             injected.update(found=True, text=text,
@@ -695,7 +699,9 @@ def summarize(rows: list[dict[str, Any]], cohorts: list[Cohort], issues: Counter
         "sha_conflicts": sorted(r["packet_id"] for r in rows if r["join_reason"] == "sha_conflict"),
         "discovery_issues": dict(sorted(issues.items())),
         "transcripts": {"files": len(transcripts),
-                        "parse_errors": sum(t.parse_errors for t in transcripts)},
+                        "parse_errors": sum(t.parse_errors for t in transcripts),
+                        "skipped_entries": dict(sorted(sum((Counter(t.skipped_entries) for t in transcripts),
+                                                             Counter()).items()))},
         "by_source": {}, "cohorts": {},
     }
     sources = sorted({s["source"] for r in rows for s in r["sources"]})

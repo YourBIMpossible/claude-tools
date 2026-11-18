@@ -160,6 +160,10 @@ def fixture(tmp: Path) -> tuple[list, list, list]:
         tool_result("2026-09-21T00:00:03.000Z", "tu_1", False),
         tool_result("2026-09-21T00:00:03.100Z", "tu_2", True),
         "{not json",
+        # SA11-CT-66: skipped entries, each counted by reason
+        {**assistant("2026-09-21T00:00:04.000Z", "msg_side", [("tu_s", "Read")]), "isSidechain": True},
+        user("2026-09-21T00:00:04.100Z", "summary of earlier work", isCompactSummary=True),
+        {"type": "system", "timestamp": "2026-09-21T00:00:04.200Z", "content": "x"},
         user("2026-09-21T00:01:00.000Z", slash),
         brief("2026-09-21T00:01:01.500Z", SESSION_A, brief_text(p2)),
         assistant("2026-09-21T00:01:02.000Z", "msg_2", []),
@@ -256,6 +260,10 @@ def test_build(tmp: Path) -> None:
     check(r["cohort"] == "c" and r["cohort_status"] == "member" and r["compiler_commit"] == "abc1234",
           "cohort membership and commit from manifest")
     check(r["transcript"]["parse_errors"] == 1, "malformed transcript line counted, not fatal")
+    check(r["transcript"].get("skipped_entries") == {"compact_summary": 1, "no_message:system": 1, "sidechain": 1},
+          f"skipped transcript entries counted by reason: {r['transcript'].get('skipped_entries')}")
+    check(s["transcripts"].get("skipped_entries") == {"compact_summary": 1, "no_message:system": 1, "sidechain": 1},
+          f"summary totals skipped entries: {s['transcripts']}")
     check(r["observed"]["ended_by"] == "prompt", "turn ends at the next prompt")
 
     r = rows["ep_00000000000000a2"]
