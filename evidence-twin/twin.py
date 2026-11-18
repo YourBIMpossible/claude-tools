@@ -469,22 +469,44 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
             timer.cancel()
     seconds = round(time.monotonic() - started, 1)
 
-    git(repo, "add", "-A")
-    diff = git(repo, "diff", "--cached", "--binary", head)
-    (out / "diff.patch").write_text(diff, encoding="utf-8", newline="\n")
+    # The tokens are spent: from here on nothing may leave run_one before meta.json is written,
+    # or the spend never reaches the ledger (SA26-26). A step that fails is recorded instead.
+    post_errors: list[str] = []
+    diff = ""
+    try:
+        git(repo, "add", "-A")
+        diff = git(repo, "diff", "--cached", "--binary", head)
+        (out / "diff.patch").write_text(diff, encoding="utf-8", newline="\n")
+    except (RuntimeError, OSError) as exc:
+        post_errors.append(f"diff: {type(exc).__name__}: {exc}")
     verified = None
     verify_error = None
     if task.get("verify"):
         # verify.py imports the run's edited code: it gets the run's environment, not the harness's.
-        verified, verify_error = run_verify([sys.executable, task["verify"], str(repo)], cwd=repo, env=env,
-                                            timeout=VERIFY_TIMEOUT)
-    scored = score_run(state, repo, task)
+        try:
+            verified, verify_error = run_verify([sys.executable, task["verify"], str(repo)], cwd=repo, env=env,
+                                                timeout=VERIFY_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as exc:
+            verified, verify_error = None, f"verify could not run: {type(exc).__name__}: {exc}"
+    try:
+        scored = score_run(state, repo, task)
+    except (OSError, ValueError, KeyError) as exc:
+        post_errors.append(f"score: {type(exc).__name__}: {exc}")
+        scored = {"calls": len(state.calls), "reached": False, "calls_to_target": None, "tokens_to_target": None,
+                  "edited": [], "touched": [], "planted_touched": []}
     trace = [] if rmtree(work, tries=30) else [f"scratch not deleted: {work}"]
-    trace += clear_project_trace(projects, repo)
+    try:
+        trace += clear_project_trace(projects, repo)
+    except OSError as exc:
+        trace.append(f"projects trace not checked: {type(exc).__name__}: {exc}")
     if source_status is not None:
-        after = sha256_bytes(git(Path(task["prepare"]["source"]), "status", "--porcelain").encode())
-        if after != source_status:
-            trace.append("source checkout status changed")
+        try:
+            after = sha256_bytes(git(Path(task["prepare"]["source"]), "status", "--porcelain").encode())
+        except (RuntimeError, OSError) as exc:
+            trace.append(f"source checkout status unreadable: {type(exc).__name__}: {exc}")
+        else:
+            if after != source_status:
+                trace.append("source checkout status changed")
 
     init = state.init or {}
     invalid = None  # a run the CLI never really executed is not a data point; a killed run is censored, not invalid
@@ -495,6 +517,9 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
             r = state.result
             invalid = ("cli_error: " + (f"api {r['api_error_status']}" if r.get("api_error_status")
                                         else str(r.get("terminal_reason") or r.get("subtype"))))
+    if post_errors and invalid is None:
+        # no trustworthy diff or score: keep the attempt and its spend, but it is not a data point
+        invalid = "post_run_error: " + post_errors[0]
     result_usage = (state.result or {}).get("usage") or {}
     meta = {
         **run, "family": task.get("family"), "model": model, "head": head,
@@ -509,7 +534,7 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         "tokens_total": state.tokens(),
         "tokens_result": sum(int(result_usage.get(f) or 0) for f in USAGE_FIELDS),
         "wall_seconds": seconds, "seconds_to_target": target_seconds, "verified": verified,
-        "verify_error": verify_error,
+        "verify_error": verify_error, "post_run_errors": post_errors,
         "trace_left": trace,
         "stream_sha256": sha256_bytes((out / "stream.jsonl").read_bytes()),
         "diff_sha256": sha256_bytes(diff.encode("utf-8")),

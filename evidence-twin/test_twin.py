@@ -312,6 +312,48 @@ def test_verify_guard(tmp: Path, tasks: list[dict]) -> None:
           "a timed-out verify is counted apart from a checked one (SA26-24)")
 
 
+def test_post_run_failure_books_spend(tmp: Path, tasks: list[dict]) -> None:
+    """SA26-26 / SA11-CT-36 / SA16-CT-3: a git or verify failure after the paid run never leaves
+    run_one before meta.json is written, so the spend always reaches the ledger."""
+    base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+    real_git, real_verify = twin.git, twin.run_verify
+
+    def git_add_fails(repo: Path, *args: str, check: bool = True) -> str:
+        if args[:2] == ("diff", "--cached"):
+            raise RuntimeError("git diff --cached failed: simulated")
+        return real_git(repo, *args, check=check)
+
+    def verify_cannot_start(*a: object, **k: object) -> tuple[bool, str | None]:
+        raise OSError("simulated: verify interpreter missing")
+
+    for name, patch in (("git", git_add_fails), ("run_verify", verify_cannot_start)):
+        plan = twin.plan([base], 1, 3)
+        plan["runs"] = plan["runs"][:1]
+        ledger = tmp / f"pr-{name}-ledger.json"
+        kw = dict(archive=tmp / f"pr-{name}-archive", scratch=tmp / f"pr-{name}-scratch", model="m", ledger=ledger,
+                  cap=100_000, ceiling=1_000_000, wall=60, claude=FAKE, kind=None, limit=None,
+                  projects=tmp / f"pr-{name}-projects")
+        setattr(twin, name, patch)
+        error: Exception | None = None
+        try:
+            res = twin.run_batch([base], plan, **kw)
+        except Exception as exc:  # noqa: BLE001 - the check is that nothing escapes
+            error, res = exc, {}
+        finally:
+            twin.git, twin.run_verify = real_git, real_verify
+        metas = [twin.read_json(m) for m in kw["archive"].rglob("meta.json")]
+        check(error is None and len(metas) == 1, f"a post-run {name} failure still writes meta ({error!r})")
+        check(ledger.is_file() and twin.read_json(ledger)["total"] == 3390 and res.get("ran") == 1,
+              f"a post-run {name} failure still books the spend")
+        m = metas[0] if metas else {}
+        if name == "git":
+            check((m.get("invalid") or "").startswith("post_run_error: diff") and "invalid run" in (res.get("stopped") or ""),
+                  "a run whose diff could not be taken is invalid and stops the batch")
+        else:
+            check(m.get("verified") is None and "verify could not run" in (m.get("verify_error") or "")
+                  and m.get("invalid") is None, "a verify that cannot start is unverified, not a lost run")
+
+
 def test_verify_kills_tree(tmp: Path) -> None:
     """SA26-26: a verify past its limit is killed with every process it started; a grandchild
     holding the output pipes neither outlives it nor holds the run past the limit."""
@@ -418,6 +460,7 @@ def main() -> int:
         test_batch(tmp, tasks)
         test_real(tmp)
         test_verify_guard(tmp, tasks)
+        test_post_run_failure_books_spend(tmp, tasks)
         test_verify_kills_tree(tmp)
         test_negative_censored()
         test_bench_blind(tmp)
