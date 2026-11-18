@@ -52,6 +52,8 @@ sys.path.insert(0, str(HERE.parent / "evidence-capture"))
 import clone_builder  # noqa: E402
 import store as capture_store  # noqa: E402
 import footprints as fpm  # noqa: E402
+sys.path.insert(0, str(HERE))
+from replay_hook import DELIVERED_SUFFIX  # noqa: E402
 
 ARMS = ("A", "B")
 DEFAULT_CAP = 4_000_000
@@ -408,8 +410,15 @@ def clear_project_trace(projects: Path, repo: Path) -> list[str]:
     return left
 
 
+def blank_brief(task: dict) -> bool:
+    """A brief with nothing in it: arm A would inject nothing and equal arm B (SA11-CT-64)."""
+    return not (task.get("brief") or "").strip()
+
+
 def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, cap: int, wall: int,
             claude: str, projects: Path, cli_sha: str | None = None) -> dict:
+    if run["arm"] == "A" and blank_brief(task):
+        raise ValueError(f"{run['run_id']}: arm A with an empty brief would equal arm B")
     out = archive / run["run_id"]
     out.mkdir(parents=True, exist_ok=True)
     work = scratch / run["run_id"].replace(".", "_")
@@ -427,10 +436,13 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
             write_json(out / "clone_proofs.json", proofs)
 
     brief_arg = "-"
-    if run["arm"] == "A" and task["brief"]:
+    brief_sha = None
+    if run["arm"] == "A":
         brief_file = work / "brief.md"
-        brief_file.write_text(task["brief"].replace("{head}", head), encoding="utf-8")
+        brief_text = task["brief"].replace("{head}", head)
+        brief_file.write_text(brief_text, encoding="utf-8")
         brief_arg = brief_file.as_posix()
+        brief_sha = sha256_bytes(brief_text.encode("utf-8"))
     settings = work / "settings.json"
     write_json(settings, settings_for(brief_arg, sys.executable))
     env, dropped = child_env()
@@ -468,6 +480,14 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         finally:
             timer.cancel()
     seconds = round(time.monotonic() - started, 1)
+    # Arm A counts only when its fail-open hook confirmed it emitted this exact brief (SA11-CT-40).
+    brief_delivered = None
+    if brief_sha is not None:
+        try:
+            marker = Path(brief_arg + DELIVERED_SUFFIX).read_text(encoding="utf-8").strip()
+        except OSError:
+            marker = None
+        brief_delivered = marker == brief_sha
 
     # The tokens are spent: from here on nothing may leave run_one before meta.json is written,
     # or the spend never reaches the ledger (SA26-26). A step that fails is recorded instead.
@@ -520,6 +540,9 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
     if post_errors and invalid is None:
         # no trustworthy diff or score: keep the attempt and its spend, but it is not a data point
         invalid = "post_run_error: " + post_errors[0]
+    if brief_delivered is False and invalid is None:
+        # the hook fails open: without its confirmation arm A may have run as arm B
+        invalid = "brief_not_delivered"
     result_usage = (state.result or {}).get("usage") or {}
     meta = {
         **run, "family": task.get("family"), "model": model, "head": head,
@@ -530,6 +553,7 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
                                for p in init.get("plugins") or []),
         "cli_path_sha256": cli_sha, "env_dropped": dropped,
         "exit_code": proc.returncode, "killed": killed[0] if killed else None, "invalid": invalid,
+        "brief_delivered": brief_delivered,
         "is_error": (state.result or {}).get("is_error"), "result_subtype": (state.result or {}).get("subtype"),
         "tokens_total": state.tokens(),
         "tokens_result": sum(int(result_usage.get(f) or 0) for f in USAGE_FIELDS),
@@ -574,6 +598,13 @@ def run_batch(tasks: list[dict], plan_obj: dict, *, archive: Path, scratch: Path
     done = started = 0
     stopped = None
     claude, cli_sha = resolve_cli(claude)
+    blank = sorted({run["task_id"] for run in plan_obj["runs"] if run["arm"] == "A"
+                    and not (kind and run["kind"] != kind) and blank_brief(by_id[run["task_id"]])})
+    if blank:
+        # arm A would inject nothing and equal arm B: refuse the batch before anything is spent
+        stopped = "empty brief: " + ", ".join(blank)
+        print(stopped, flush=True)
+        return {"already_done": 0, "ran": 0, "ledger_total": book["total"], "stopped": stopped}
     for run in plan_obj["runs"]:
         if kind and run["kind"] != kind:
             continue

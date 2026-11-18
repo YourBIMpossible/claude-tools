@@ -30,7 +30,27 @@ EPISODE = "cap_0123456789abcdef"
 
 PASSED: list[str] = []
 FAILED: list[str] = []
-FAKE = str(HERE / "fake_claude.py")
+FAKE_RAW = str(HERE / "fake_claude.py")
+FAKE = FAKE_RAW  # replaced in main() by a wrapper that also runs the settings' replay hook, as the CLI does
+
+# The real CLI runs the UserPromptSubmit hooks named in --settings before the turn; fake_claude.py
+# does not. This wrapper runs them (argv split as the CLI would, no shell) and then fake_claude.py.
+HOOKED_FAKE_SRC = '''import json, runpy, shlex, subprocess, sys
+argv = sys.argv[1:]
+with open(argv[argv.index("--settings") + 1], encoding="utf-8") as fh:
+    settings = json.load(fh)
+for group in settings.get("hooks", {}).get("UserPromptSubmit", []):
+    for hook in group["hooks"]:
+        subprocess.run(shlex.split(hook["command"]), input=b"{}", capture_output=True)
+sys.argv = [%r] + argv
+runpy.run_path(%r, run_name="__main__")
+'''
+
+
+def make_hooked_fake(tmp: Path) -> str:
+    path = tmp / "fake_claude_hooked.py"
+    path.write_text(HOOKED_FAKE_SRC % (FAKE_RAW, FAKE_RAW), encoding="utf-8")
+    return str(path)
 GOLDEN = {
     "README.md": "# Golden fixture\n",
     "src/alpha.py": ('class AlphaService:\n    def __init__(self, factor: int = 2) -> None:\n'
@@ -140,6 +160,12 @@ def test_hook(tmp: Path) -> None:
     c = subprocess.run([sys.executable, hook, str(tmp / "missing.md")], input=b"{}", capture_output=True)
     check(b.stdout == b"" and b.returncode == 0, "arm B hook emits nothing")
     check(c.stdout == b"" and c.returncode == 0, "hook is fail-open on a missing brief")
+    marker = Path(str(brief) + twin.DELIVERED_SUFFIX)
+    check(marker.is_file() and marker.read_text(encoding="utf-8").strip()
+          == twin.sha256_bytes("<context_brief>é</context_brief>".encode("utf-8")),
+          "SA11-CT-40: the hook confirms delivery with the brief's sha256 next to the brief")
+    check(not Path(str(tmp / "missing.md") + twin.DELIVERED_SUFFIX).exists(),
+          "SA11-CT-40: a brief the hook could not emit leaves no delivery marker")
     s = twin.settings_for("-", sys.executable)
     check("WebFetch" in s["permissions"]["deny"] and "Bash(git push:*)" in s["permissions"]["deny"],
           "settings deny network and push")
@@ -169,6 +195,8 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
     a = metas["A"]
     check(a["reached"] and a["tokens_to_target"] == 2260 and a["tokens_total"] == 3390, "fake run is scored")
     check(a["cli_version"] == "fake-0" and a["verified"] is False, "meta records CLI version and verify")
+    check(a.get("brief_delivered") is True and metas["B"].get("brief_delivered") is None,
+          "meta records that arm A's brief was delivered")
     check(all((archive / r["run_id"] / f).is_file() for r in plan["runs"]
               for f in ("stream.jsonl", "diff.patch", "stderr.txt", "meta.json")), "archive is complete")
     check("# fake edit" in (archive / plan["runs"][0]["run_id"] / "diff.patch").read_text(encoding="utf-8"),
@@ -210,6 +238,37 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
           and any(k.endswith(".invalid-1") for k in book["runs"]), "the ledger rebuilds from every kept attempt")
     check(sorted(drift) == sorted(r["run_id"] for r in plan["runs"]) and "agents-md@builtin" in drift[plan["runs"][1]["run_id"]],
           "a batch that loaded different plugins is reported")
+
+
+def test_brief_delivery(tmp: Path, tasks: list[dict]) -> None:
+    """SA11-CT-40 / SA16-CT-15 / SA11-CT-64: arm A counts only when its hook confirmed the brief
+    was emitted, and a blank brief (arm A identical to arm B) is refused before any spend."""
+    base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+    plan = twin.plan([base], 1, 3)
+    by_arm = {r["arm"]: r for r in plan["runs"]}
+
+    def one(name: str, arm: str, claude: str, task: dict = base) -> tuple[dict, dict]:
+        p = dict(plan, runs=[by_arm[arm]])
+        kw = dict(archive=tmp / f"bd-{name}", scratch=tmp / f"bd-{name}-scratch", model="m",
+                  ledger=tmp / f"bd-{name}-ledger.json", cap=100_000, ceiling=1_000_000, wall=60,
+                  claude=claude, kind=None, limit=None, projects=tmp / f"bd-{name}-projects")
+        res = twin.run_batch([task], p, **kw)
+        metas = [twin.read_json(m) for m in kw["archive"].rglob("meta.json")] if kw["archive"].is_dir() else []
+        return res, (metas[0] if metas else {})
+
+    res, meta = one("silent", "A", FAKE_RAW)
+    check(meta.get("brief_delivered") is False and meta.get("invalid") == "brief_not_delivered"
+          and "invalid run" in (res.get("stopped") or ""),
+          "an arm A run whose hook never confirmed the brief is invalid and stops the batch")
+    res, meta = one("hooked", "A", FAKE)
+    check(meta.get("brief_delivered") is True and meta.get("invalid") is None and res["stopped"] is None,
+          "an arm A run whose hook confirmed the brief is valid")
+    res, meta = one("arm-b", "B", FAKE_RAW)
+    check(meta.get("brief_delivered") is None and meta.get("invalid") is None, "arm B carries no delivery check")
+    res, meta = one("blank", "A", FAKE, dict(base, brief="  \n"))
+    check(res["ran"] == 0 and "empty brief" in (res.get("stopped") or "") and not meta
+          and not (tmp / "bd-blank-ledger.json").exists(),
+          "a blank brief is refused before any run starts (arm A would equal arm B)")
 
 
 def test_real(tmp: Path) -> None:
@@ -451,13 +510,16 @@ def test_bench_blind(tmp: Path) -> None:
 
 
 def main() -> int:
+    global FAKE
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
+        FAKE = make_hooked_fake(tmp)
         tasks = test_lab(tmp)
         test_plan(tasks)
         test_stream()
         test_hook(tmp)
         test_batch(tmp, tasks)
+        test_brief_delivery(tmp, tasks)
         test_real(tmp)
         test_verify_guard(tmp, tasks)
         test_post_run_failure_books_spend(tmp, tasks)
