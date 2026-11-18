@@ -216,6 +216,55 @@ def test_run_child_surfaces_process_tree_failures(root: Path) -> None:
     assert causes == ["process tree: tree kill: OSError: simulated"], causes
 
 
+def _content_store(root: Path):
+    import store
+
+    st = store.Stores(meta=root / "meta", content=root / "content")
+    store.init_stores(st)
+    return st
+
+
+def _run_stub(real, prog: str, fake):
+    """``subprocess.run`` with ``fake(argv)`` standing in for program ``prog`` only."""
+    def run(argv, *a, **k):
+        if argv and argv[0] == prog:
+            return fake(argv)
+        return real(argv, *a, **k)
+    return run
+
+
+def test_unevaluable_cloud_attribute_guard_is_a_problem(root: Path) -> None:
+    """SA16-CT-13 / SA11-CT-25: attrib raising, timing out, printing nothing or printing
+    something unparseable is a content-store problem, never a silent pass."""
+    import store
+
+    st = _content_store(root)
+    real = subprocess.run
+    if os.name != "nt":
+        assert not any("cloud-attribute" in p for p in store.check_content_store(st))
+        return  # the guard does not apply off Windows
+    assert not any("cloud-attribute" in p for p in store.check_content_store(st)), store.check_content_store(st)
+
+    def timeout(argv):
+        raise subprocess.TimeoutExpired(argv, 5)
+
+    def oserror(argv):
+        raise OSError("attrib missing")
+
+    def silent(argv):
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def nonsense(argv):
+        return subprocess.CompletedProcess(argv, 0, stdout="Parameter format not correct -\n", stderr="")
+
+    for fake, why in ((timeout, "timed out"), (oserror, "attrib missing"), (silent, "printed nothing"),
+                      (nonsense, "not understood")):
+        with _Patched(store.subprocess, run=_run_stub(real, "attrib", fake)):
+            problems = store.check_content_store(st)
+        hits = [p for p in problems if "cloud-attribute guard could not be evaluated" in p]
+        assert len(hits) == 1 and why in hits[0], (fake.__name__, problems)
+
+
 TESTS = [
     test_start_hook_import_failure_is_logged,
     test_end_hook_import_failure_is_logged,
@@ -223,6 +272,7 @@ TESTS = [
     test_reconcile_counts_and_logs_unreadable_packets,
     test_process_tree_records_kill_failures,
     test_run_child_surfaces_process_tree_failures,
+    test_unevaluable_cloud_attribute_guard_is_a_problem,
 ]
 
 

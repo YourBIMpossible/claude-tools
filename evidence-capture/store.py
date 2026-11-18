@@ -144,15 +144,29 @@ def parse_attrib_flags(line: str) -> str | None:
     return m.group("flags").replace(" ", "") if m else None
 
 
-def _windows_attrib_flags(path: Path) -> str | None:
+def _attrib_probe(path: Path) -> tuple[str | None, str | None]:
+    """(``attrib`` flag letters of ``path``, why they could not be read). Off Windows the
+    guard does not apply: (None, None)."""
     if os.name != "nt":
-        return None
+        return None, None
     try:
-        out = subprocess.run(["attrib", str(path)], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    line = out.strip().splitlines()[-1] if out.strip() else ""
-    return parse_attrib_flags(line)
+        proc = subprocess.run(["attrib", str(path)], capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return None, "attrib timed out"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"attrib failed: {type(exc).__name__}: {exc}"
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None, f"attrib printed nothing (exit {proc.returncode})"
+    line = out.splitlines()[-1]
+    flags = parse_attrib_flags(line)
+    if flags is None:
+        return None, f"attrib output not understood: {line[:120]}"
+    return flags, None
+
+
+def _windows_attrib_flags(path: Path) -> str | None:
+    return _attrib_probe(path)[0]
 
 
 def check_content_store(stores: Stores) -> list[str]:
@@ -169,8 +183,10 @@ def check_content_store(stores: Stores) -> list[str]:
     sync = _under_sync_root(c)
     if sync:
         problems.append(f"content store under a sync root: {sync}")
-    flags = _windows_attrib_flags(c)
-    if flags and any(f in flags for f in ("P", "U", "O")):
+    flags, unknown = _attrib_probe(c)
+    if unknown:
+        problems.append(f"cloud-attribute guard could not be evaluated: {unknown}")
+    elif flags and any(f in flags for f in ("P", "U", "O")):
         problems.append(f"content store has cloud attributes: {flags}")
     for d in CONTENT_DIRS:
         if not (c / d).is_dir():
