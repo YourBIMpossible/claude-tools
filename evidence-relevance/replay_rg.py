@@ -59,8 +59,13 @@ def main() -> int:
     packets, load_issues = mr.load_packets()
     rows = []
     issues: Counter = Counter()
+    skipped: Counter = Counter()  # packets left out by design, by reason (not data loss)
     for p in packets:
-        if p.traffic != "candidate" or not Path(p.repo_root).is_dir():
+        if p.traffic != "candidate":
+            skipped["not_candidate"] += 1
+            continue
+        if not Path(p.repo_root).is_dir():
+            skipped["repo_root_missing"] += 1
             continue
         raw = mr.load_packet_json(p.store_root, f"*{p.packet_id}*.json")
         if raw is None:
@@ -68,6 +73,7 @@ def main() -> int:
             continue
         symbols = raw.get("task", {}).get("extracted_symbols") or []
         if not symbols:
+            skipped["no_symbols"] += 1
             continue
 
         def run(mod):
@@ -113,6 +119,7 @@ def main() -> int:
         "symbols_matched_new": sum(r["new_matched"] for r in rows),
         "file_sets_equal_old_vs_old": sum(r["old_vs_old_same_files"] for r in rows),
         "file_sets_equal_old_vs_new": sum(r["old_vs_new_same_files"] for r in rows),
+        "skipped": dict(skipped),
         **mr.replay_completeness(issues, load_issues),
     }
     out = Path(args.out)

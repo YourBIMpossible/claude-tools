@@ -48,7 +48,7 @@ def _flips(base: dict, cfg: dict, min_stable: int) -> dict:
     lost, gained = [], []
     for key, br in b.items():
         cr = c.get(key)
-        if cr is None:
+        if cr is None:  # counted below: a row only one replay has cannot flip
             continue
         bn, cn = sum(br["in_brief"]), sum(cr["in_brief"])
         row = {"packet_id": key[0], "file": key[1], "base": f"{bn}/{len(br['in_brief'])}", "config": f"{cn}/{len(cr['in_brief'])}",
@@ -57,7 +57,8 @@ def _flips(base: dict, cfg: dict, min_stable: int) -> dict:
             lost.append(row)
         elif cn >= min_stable and bn == 0:
             gained.append(row)
-    return {"regressions": lost, "gains": gained}
+    return {"regressions": lost, "gains": gained,
+            "unmatched": {"base_only": len(b.keys() - c.keys()), "config_only": len(c.keys() - b.keys())}}
 
 
 def main() -> int:

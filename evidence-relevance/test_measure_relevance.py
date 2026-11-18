@@ -149,7 +149,7 @@ def _stub_compiler(root: Path) -> Path:
     return root / "src"
 
 
-def _run_replay(module_name: str, argv: list[str], load_issues: Counter) -> dict:
+def _run_replay(module_name: str, argv: list[str], load_issues: Counter, packets: list | None = None) -> dict:
     import contextlib
     import importlib
     import io
@@ -158,7 +158,7 @@ def _run_replay(module_name: str, argv: list[str], load_issues: Counter) -> dict
         del sys.modules[name]
     mod = importlib.import_module(module_name)
     orig = (mr.load_packets, mr.build_turns, sys.argv, list(sys.path))
-    mr.load_packets = lambda: ([], Counter(load_issues))
+    mr.load_packets = lambda: (list(packets or []), Counter(load_issues))
     mr.build_turns = lambda _pool: ({}, Counter({"unreadable_subagent": 1}))
     sys.argv = [module_name, *argv]
     try:
@@ -197,6 +197,86 @@ def test_replays_surface_join_issues(tmp_path: Path) -> None:
           "a coverage-only join issue is surfaced but does not mark data lost")
 
 
+def _packet(packet_id: str, root: Path, traffic: str = "candidate", symbols: list[str] | None = None) -> "mr.Packet":
+    """A packet whose repo and store are ``root`` (absent unless created); a packet JSON with
+    ``symbols`` is written when ``symbols`` is given."""
+    if symbols is not None:
+        d = root / ".evidence-compiler" / "packets"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{packet_id}.json").write_text(json.dumps({"task": {"extracted_symbols": symbols}}), encoding="utf-8")
+    return mr.Packet(packet_id=packet_id, store_root=str(root), repo_root=str(root), created_at="2026-09-21T00:00:00Z",
+                     session_id=None, source_kind="user", traffic=traffic, rg_outcome="ok", cited=set())
+
+
+def test_replays_count_every_skip(tmp_path: Path) -> None:
+    """SA11-CT-66 residual: a packet a replay leaves out is counted under ``skipped`` with its
+    reason (not a candidate, repository gone, no opened files, no symbols), never dropped silently;
+    a filter skip is not data loss, so ``complete`` stays true."""
+    src = _stub_compiler(tmp_path)
+    old = tmp_path / "old_ripgrep.py"
+    old.write_text("", encoding="utf-8")
+    out = tmp_path / "out"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    pkts = [_packet("ep_a", repo, traffic="no_brief"), _packet("ep_b", tmp_path / "gone"),
+            _packet("ep_c", repo, symbols=[])]
+
+    _run_replay("replay_rg", ["--old", str(old), "--new-src", str(src), "--out", str(out), "--label", "s"],
+                Counter(), pkts)
+    rg = json.loads((out / "replay_rg_s.json").read_text(encoding="utf-8"))["summary"]
+    check(rg.get("skipped") == {"not_candidate": 1, "repo_root_missing": 1, "no_symbols": 1}
+          and rg["complete"] is True, f"replay_rg counts each skipped packet by reason: {rg.get('skipped')}")
+
+    _run_replay("replay_relevance", ["--src", str(src), "--label", "s", "--out", str(out)], Counter(), pkts)
+    rel = json.loads((out / "replay_relevance_s.json").read_text(encoding="utf-8"))["summary"]
+    check(rel.get("skipped") == {"not_candidate": 1, "repo_root_missing": 1, "no_opened_files": 1},
+          f"replay_relevance counts pool exclusions and packets with nothing opened: {rel.get('skipped')}")
+    _run_replay("replay_relevance", ["--src", str(src), "--label", "t", "--out", str(out),
+                                     "--target", "ep_c=lib/x.py"], Counter(), pkts)
+    rel = json.loads((out / "replay_relevance_t.json").read_text(encoding="utf-8"))["summary"]
+    check(rel.get("skipped") == {"not_candidate": 1, "repo_root_missing": 1, "no_symbols": 1},
+          f"replay_relevance counts a packet with no extracted symbols: {rel.get('skipped')}")
+
+
+def test_compare_counts_unmatched_rows() -> None:
+    """SA11-CT-66 residual: compare_replays counts the rows present in only one of the two
+    replays instead of skipping them without a trace."""
+    import compare_replays as cr
+
+    def row(pid: str, f: str) -> dict:
+        return {"packet_id": pid, "opened_file": f, "in_brief": [1, 1, 1], "in_filename_evidence": [0, 0, 0]}
+    base = {"files": [row("p", "a.py"), row("p", "b.py")]}
+    cfg = {"files": [row("p", "a.py"), row("q", "c.py"), row("q", "d.py")]}
+    got = cr._flips(base, cfg, 3)
+    check(got.get("unmatched") == {"base_only": 1, "config_only": 2}, f"rows in one replay only are counted: {got}")
+
+
+def test_build_turns_counts_unattributed_subagents(tmp_path: Path) -> None:
+    """SA11-CT-66 residual: a subagent transcript with no timestamp, or one that starts outside
+    every packet window, is counted instead of skipped without a trace."""
+    sid, pid = "test-session-0002", "ep_test0000000002"
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    tr = project / f"{sid}.jsonl"
+    tr.write_text(json.dumps({"type": "user", "timestamp": "2026-09-21T01:00:00Z",
+                              "note": f"context_brief {pid}"}) + "\n", encoding="utf-8")
+    subs = project / sid / "subagents"
+    subs.mkdir(parents=True)
+    (subs / "a.jsonl").write_text(json.dumps({"type": "assistant"}) + "\n", encoding="utf-8")
+    (subs / "b.jsonl").write_text(json.dumps({"type": "assistant", "timestamp": "2026-09-21T00:00:00Z"}) + "\n",
+                                  encoding="utf-8")
+    packet = mr.Packet(packet_id=pid, store_root="/srv/r", repo_root="/srv/r", created_at="2026-09-21T01:00:00Z",
+                       session_id=sid, source_kind="user", traffic="candidate", rg_outcome="ok", cited=set())
+    saved = mr.PROJECTS_DIR
+    mr.PROJECTS_DIR = tmp_path / "projects"
+    try:
+        _, issues = mr.build_turns([packet])
+    finally:
+        mr.PROJECTS_DIR = saved
+    check(issues["subagent_without_timestamp"] == 1 and issues["subagent_outside_packet_window"] == 1,
+          f"unattributed subagent transcripts are counted: {dict(issues)}")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         test_build_turns_counts_malformed_line_and_keeps_valid_data(Path(td))
@@ -206,6 +286,11 @@ def main() -> int:
         test_inventory_nonzero_exit_warns_and_counts(Path(td))
     with tempfile.TemporaryDirectory() as td:
         test_replays_surface_join_issues(Path(td))
+    with tempfile.TemporaryDirectory() as td:
+        test_replays_count_every_skip(Path(td))
+    test_compare_counts_unmatched_rows()
+    with tempfile.TemporaryDirectory() as td:
+        test_build_turns_counts_unattributed_subagents(Path(td))
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     if FAILURES:

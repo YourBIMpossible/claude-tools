@@ -263,9 +263,11 @@ def build_turns(packets: list[Packet]) -> tuple[dict[str, Turn], Counter]:
                 continue
             first = next((t for t in map(_ts, entries) if t), None)
             if first is None:
+                issues["subagent_without_timestamp"] += 1
                 continue
             owner = next((p for p, s, e in windows if s and s <= first and (e is None or first < e)), None)
             if owner is None:
+                issues["subagent_outside_packet_window"] += 1
                 continue
             for entry in entries:
                 for name, inp in _tool_uses(entry):
