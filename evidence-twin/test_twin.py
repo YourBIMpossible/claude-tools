@@ -9,6 +9,8 @@ Synthetic example — contains no private repository data or production findings
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -567,7 +569,7 @@ def test_bench_blind(tmp: Path) -> None:
     twin.write_json(tasks_f, tasks)
     twin.write_json(plan_f, plan)
 
-    def run_report(name: str, reached_a: bool, only: set[str] | None = None) -> dict:
+    def run_report(name: str, reached_a: bool, only: set[str] | None = None, want_rc: int = 0) -> dict:
         archive = tmp / f"bb-{name}"
         archive.mkdir()
         for r in plan["runs"]:
@@ -580,7 +582,7 @@ def test_bench_blind(tmp: Path) -> None:
         out = tmp / f"bb-{name}.json"
         rc = twin.main(["report", "--tasks", str(tasks_f), "--plan", str(plan_f), "--archive", str(archive),
                         "--cap", "100000", "--seed", "3", "--out", str(out)])
-        check(rc == 0, f"report CLI exits 0 ({name})")
+        check(rc == want_rc, f"SA11-CT-65: report CLI exits {want_rc} ({name}, got {rc})")
         return twin.read_json(out)
 
     empty = run_report("empty", True, only=set())
@@ -593,11 +595,34 @@ def test_bench_blind(tmp: Path) -> None:
     good = run_report("pass", True)
     check(good["bench_blind"] is False and good["positive_controls_incomplete"] == [],
           "a complete passing positive control gives bench_blind false")
-    bad = run_report("fail", False)
+    bad = run_report("fail", False, want_rc=1)
     check(bad["bench_blind"] is True, "a failing positive control gives bench_blind true")
     no_pos = [t for t in tasks if t["family"] != "positive"]
     check(twin.bench_blind(no_pos, twin.plan(no_pos, 1, 5), {}, [])[1] is None,
           "no planned positive control leaves bench_blind unknown")
+
+
+def test_run_cli_exit(tmp: Path, tasks: list[dict]) -> None:
+    """SA11-CT-65: the run CLI exits 0 only when the batch was not stopped."""
+    base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+    tasks_f, plan_f = tmp / "rc-tasks.json", tmp / "rc-plan.json"
+    twin.write_json(tasks_f, [base])
+    twin.write_json(plan_f, twin.plan([base], 1, 3))
+
+    def run(name: str) -> int:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return twin.main(["run", "--tasks", str(tasks_f), "--plan", str(plan_f),
+                              "--archive", str(tmp / f"rc-{name}"), "--scratch", str(tmp / f"rc-{name}-scratch"),
+                              "--model", "m", "--ledger", str(tmp / f"rc-{name}-ledger.json"), "--cap", "100000",
+                              "--claude", FAKE, "--projects", str(tmp / f"rc-{name}-projects")])
+
+    check(run("ok") == 0, "a completed batch exits 0")
+    os.environ["FAKE_CLAUDE_ERROR"] = "1"
+    try:
+        rc = run("bad")
+    finally:
+        del os.environ["FAKE_CLAUDE_ERROR"]
+    check(rc == 1, f"a batch stopped by an invalid run exits 1 (got {rc})")
 
 
 def main() -> int:
@@ -618,6 +643,7 @@ def main() -> int:
         test_kill_and_exit_bounds(tmp, tasks)
         test_negative_censored()
         test_bench_blind(tmp)
+        test_run_cli_exit(tmp, tasks)
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")
     return 1 if FAILED else 0
 

@@ -24,6 +24,9 @@ the same Footprint extractor as natural episodes.
     python twin.py report     --tasks tasks.json --plan plan.json --archive <dir> --cap 4000000
                               --seed <int> --out report.json
 
+Exit codes: 0 done; 1 when ``run`` stopped before the plan completed (an invalid run,
+the ceiling, a blank brief) or ``report`` found the bench blind (a failed positive control).
+
 Standard library, ``git`` and the ``claude`` CLI only.
 """
 from __future__ import annotations
@@ -867,10 +870,13 @@ def main(argv: list[str] | None = None) -> int:
                         model=args.model, ledger=args.ledger, cap=args.cap, ceiling=args.ceiling, wall=args.wall,
                         claude=args.claude, kind=args.kind, limit=args.limit, projects=args.projects)
         print(json.dumps(res, indent=1))
+        return 1 if res["stopped"] else 0  # invalid run, ceiling or blank brief: the plan did not complete
     elif args.cmd == "ledger":
         write_json(args.out, ledger_from_archives(args.archive))
     elif args.cmd == "report":
-        write_json(args.out, report(read_json(args.tasks), read_json(args.plan), args.archive, args.cap, args.seed))
+        summary = report(read_json(args.tasks), read_json(args.plan), args.archive, args.cap, args.seed)
+        write_json(args.out, summary)
+        return 1 if summary["bench_blind"] is True else 0  # a failed positive control: no result is interpretable
     return 0
 
 
