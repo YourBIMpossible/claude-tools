@@ -187,6 +187,14 @@ def test_verify_pass_and_tamper() -> None:
         (archive / "packets" / f"{PA}.json").unlink()
         code, out = run_cli("verify", r.receipt)
         check(code == 1 and "missing" in out, "verify catches a missing archive copy")
+        # SA11-CT-68: a receipt with no files list proves nothing; "checked 0" is not a pass
+        doc = json.loads(Path(r.receipt).read_text(encoding="utf-8"))
+        for label, bad in (("no files key", {k: v for k, v in doc.items() if k != "files"}),
+                           ("files not a list", {**doc, "files": {"x": 1}})):
+            stripped = tmp / f"receipt-{label.replace(' ', '-')}.json"
+            stripped.write_text(json.dumps(bad), encoding="utf-8")
+            code, out = run_cli("verify", str(stripped))
+            check(code == 1 and "no files list" in out, f"verify fails a receipt with {label}")
 
 
 def test_failure_paths_block() -> None:

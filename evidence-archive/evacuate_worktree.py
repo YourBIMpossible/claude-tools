@@ -334,7 +334,11 @@ def verify_receipt(receipt: Path) -> tuple[bool, list[str]]:
     doc = json.loads(receipt.read_text(encoding="utf-8"))
     problems: list[str] = []
     checked = 0
-    for f in doc.get("files", []):
+    files = doc.get("files")
+    if not isinstance(files, list):  # SA11-CT-68: a receipt that lists nothing verifies nothing
+        problems.append("receipt has no files list")
+        files = []
+    for f in files:
         if f["action"] in BLOCKING or not f.get("archive_path"):
             continue
         checked += 1
