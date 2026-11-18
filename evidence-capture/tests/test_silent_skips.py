@@ -301,6 +301,29 @@ def test_git_failure_is_not_read_as_not_a_repository(root: Path) -> None:
         assert "content store is inside a git repository" not in content, content
 
 
+def test_failed_remote_listing_is_not_no_remote(root: Path) -> None:
+    """SA11-CT-26: a ``git remote`` that fails is a metadata-store problem, not "no remote"."""
+    import store
+
+    st = _content_store(root)
+    subprocess.run(["git", "init", "-q", str(st.meta)], check=True, capture_output=True)
+    real = subprocess.run
+    listed = "remotes could not be listed"
+    assert not any(listed in p for p in store.check_meta_store(st)), store.check_meta_store(st)
+
+    def failing(argv):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="fatal: bad config line 3")
+
+    def oserror(argv):
+        raise OSError("git vanished")
+
+    for fake, why in ((failing, "bad config line 3"), (oserror, "git vanished")):
+        with _Patched(store.subprocess, run=_git_stub(real, "remote", fake)):
+            meta = store.check_meta_store(st)
+        hits = [p for p in meta if listed in p]
+        assert len(hits) == 1 and why in hits[0], meta
+
+
 TESTS = [
     test_start_hook_import_failure_is_logged,
     test_end_hook_import_failure_is_logged,
@@ -310,6 +333,7 @@ TESTS = [
     test_run_child_surfaces_process_tree_failures,
     test_unevaluable_cloud_attribute_guard_is_a_problem,
     test_git_failure_is_not_read_as_not_a_repository,
+    test_failed_remote_listing_is_not_no_remote,
 ]
 
 

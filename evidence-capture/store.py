@@ -224,9 +224,17 @@ def check_meta_store(stores: Stores) -> list[str]:
     elif not in_git:
         problems.append("metadata store is not a git repository")
     else:
-        remotes = subprocess.run(["git", "-C", str(m), "remote"], capture_output=True, text=True).stdout
-        if remotes.strip():
-            problems.append("metadata store has a remote")
+        try:
+            proc = subprocess.run(["git", "-C", str(m), "remote"], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            problems.append(f"metadata store remotes could not be listed: {type(exc).__name__}: {exc}")
+        else:
+            if proc.returncode != 0:
+                problems.append(f"metadata store remotes could not be listed: git remote exit {proc.returncode}: "
+                                f"{(proc.stderr or '').strip()[:200]}")
+            elif (proc.stdout or "").strip():
+                problems.append("metadata store has a remote")
     gi = m / ".gitignore"
     if not gi.is_file() or "*.patch" not in gi.read_text(encoding="utf-8"):
         problems.append("metadata .gitignore lacks the content exclusions")
