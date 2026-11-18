@@ -1386,8 +1386,6 @@ def test_sa11_ct15_fn_audit_commit_failure_propagates(root: Path) -> None:
     and admission never rests on an uncommitted audit result."""
     import audit
     st = make_stores(root)
-    git(st.meta, "config", "user.name", "t")
-    git(st.meta, "config", "user.email", "t@example.invalid")
     m = base_manifest("audited")
     store.write_manifest(st, m)
     ep = m["episode_id"]
