@@ -655,12 +655,6 @@ def screen_root(m: dict[str, Any], cwds: list[str]) -> tuple[Path | None, str | 
     return (cands[0], "capture_hash") if cands else (None, None)
 
 
-def captured_root_gone(m: dict[str, Any], cwds: list[str]) -> bool:
-    """True when the captured root is identified among the cwd ancestors but no longer
-    exists as a checkout (a removed worktree)."""
-    return any(not (d / ".git").exists() for d in _root_candidates(m["repo"].get("root_sha256"), cwds))
-
-
 def _root_candidates(want: str | None, cwds: list[str]) -> list[Path]:
     out: list[Path] = []
     if not want:
@@ -1351,8 +1345,3 @@ def maintain_findings(counts: dict[str, Any]) -> tuple[list[str], list[str]]:
     if any(stuck.values()):
         warnings.append("open_pointers_stuck: " + ", ".join(f"{k} {v}" for k, v in stuck.items() if v))
     return problems, warnings
-
-
-def rejoin_deadline(started_at: str) -> str | None:
-    dt = parse_iso(started_at)
-    return iso(dt + timedelta(hours=REJOIN_WINDOW_H)) if dt else None

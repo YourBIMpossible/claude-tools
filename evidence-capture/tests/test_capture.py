@@ -1097,20 +1097,17 @@ def test_short_name_path_normalizes_to_long_form(root: Path) -> None:
 
 def test_root_resolution_without_marker_and_gone(root: Path) -> None:
     """The captured root resolves by path hash even when the checkout no longer carries
-    the config marker; a removed worktree is reported as gone, not unresolved."""
+    the config marker; a removed worktree does not resolve as a live checkout."""
     live = root / "repo" / ".claude" / "worktrees" / "lane"
     (live / "sub").mkdir(parents=True)
     (live / ".git").write_text("gitdir: elsewhere", encoding="utf-8")
     m = {"repo": {"root_sha256": pipeline.root_sha256(live)}}
     assert pipeline.resolve_repo_root(m, [str(live / "sub")]) == live
-    assert not pipeline.captured_root_gone(m, [str(live / "sub")])
     gone = root / "repo" / ".claude" / "worktrees" / "removed"
     m = {"repo": {"root_sha256": pipeline.root_sha256(gone)}}
     assert pipeline.resolve_repo_root(m, [str(gone / "x")]) is None
-    assert pipeline.captured_root_gone(m, [str(gone / "x")])
     m = {"repo": {"root_sha256": "0" * 64}}
     assert pipeline.resolve_repo_root(m, [str(live)]) is None
-    assert not pipeline.captured_root_gone(m, [str(live)])
 
 
 def test_invalidate_replaces_prior_rescreen_cause(root: Path) -> None:
