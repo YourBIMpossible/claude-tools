@@ -119,9 +119,25 @@ def init_stores(stores: Stores) -> None:
         sentinel.write_text("capture-content-sentinel " + os.urandom(8).hex() + "\n", encoding="utf-8")
 
 
-def _under_git(path: Path) -> bool:
-    proc = subprocess.run(["git", "-C", str(path), "rev-parse", "--git-dir"], capture_output=True)
-    return proc.returncode == 0
+# git's own messages in English, so "not a git repository" can be told from other failures
+_GIT_C_ENV = {"LC_ALL": "C", "LANGUAGE": "C"}
+
+
+def _git_dir_state(path: Path) -> tuple[bool | None, str | None]:
+    """(whether ``path`` is inside a git repository, why git could not say). Only git's own
+    "not a git repository" answer is False; a git that cannot start or refuses the
+    directory (dubious ownership, say) is (None, why)."""
+    try:
+        proc = subprocess.run(["git", "-C", str(path), "rev-parse", "--git-dir"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env={**os.environ, **_GIT_C_ENV}, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"git failed: {type(exc).__name__}: {exc}"
+    if proc.returncode == 0:
+        return True, None
+    err = (proc.stderr or "").strip()
+    if "not a git repository" in err.lower():
+        return False, None
+    return None, f"git rev-parse exit {proc.returncode}: {err[:200]}"
 
 
 def _under_sync_root(path: Path) -> str | None:
@@ -178,7 +194,10 @@ def check_content_store(stores: Stores) -> list[str]:
     for name in CONTENT_MARKERS:
         if not (c / name).is_file():
             problems.append(f"marker missing: {name}")
-    if _under_git(c):
+    in_git, why = _git_dir_state(c)
+    if in_git is None:
+        problems.append(f"could not tell whether the content store is inside a git repository: {why}")
+    elif in_git:
         problems.append("content store is inside a git repository")
     sync = _under_sync_root(c)
     if sync:
@@ -199,7 +218,10 @@ def check_meta_store(stores: Stores) -> list[str]:
     problems: list[str] = []
     if not m.is_dir():
         return ["metadata store missing"]
-    if not _under_git(m):
+    in_git, why = _git_dir_state(m)
+    if in_git is None:
+        problems.append(f"could not tell whether the metadata store is a git repository: {why}")
+    elif not in_git:
         problems.append("metadata store is not a git repository")
     else:
         remotes = subprocess.run(["git", "-C", str(m), "remote"], capture_output=True, text=True).stdout

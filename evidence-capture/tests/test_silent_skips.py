@@ -265,6 +265,42 @@ def test_unevaluable_cloud_attribute_guard_is_a_problem(root: Path) -> None:
         assert len(hits) == 1 and why in hits[0], (fake.__name__, problems)
 
 
+def _git_stub(real, sub: str, fake):
+    """``subprocess.run`` with ``fake(argv)`` standing in for ``git ... <sub> ...`` only."""
+    def run(argv, *a, **k):
+        if argv and argv[0] == "git" and sub in argv:
+            return fake(argv)
+        return real(argv, *a, **k)
+    return run
+
+
+def test_git_failure_is_not_read_as_not_a_repository(root: Path) -> None:
+    """SA11-CT-24: a git that fails (cannot start, refuses the directory) is "could not
+    tell", a problem for both stores; only git's own not-a-repository answer passes."""
+    import store
+
+    st = _content_store(root)
+    real = subprocess.run
+    tell = "could not tell whether"
+    assert not any(tell in p for p in store.check_content_store(st) + store.check_meta_store(st))
+
+    def oserror(argv):
+        raise OSError("git missing")
+
+    def dubious(argv):
+        return subprocess.CompletedProcess(argv, 128, stdout="", stderr="fatal: detected dubious ownership\n")
+
+    for fake, why in ((oserror, "git missing"), (dubious, "dubious ownership")):
+        with _Patched(store.subprocess, run=_git_stub(real, "--git-dir", fake)):
+            content, meta = store.check_content_store(st), store.check_meta_store(st)
+        c = [p for p in content if tell in p]
+        m = [p for p in meta if tell in p]
+        assert len(c) == 1 and why in c[0] and "content store" in c[0], content
+        assert len(m) == 1 and why in m[0] and "metadata store" in m[0], meta
+        assert "metadata store is not a git repository" not in meta, meta
+        assert "content store is inside a git repository" not in content, content
+
+
 TESTS = [
     test_start_hook_import_failure_is_logged,
     test_end_hook_import_failure_is_logged,
@@ -273,6 +309,7 @@ TESTS = [
     test_process_tree_records_kill_failures,
     test_run_child_surfaces_process_tree_failures,
     test_unevaluable_cloud_attribute_guard_is_a_problem,
+    test_git_failure_is_not_read_as_not_a_repository,
 ]
 
 
