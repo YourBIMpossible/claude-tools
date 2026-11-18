@@ -36,9 +36,11 @@ Config (graphify.local.json beside this script, or --config), validated before a
 Relative config paths resolve against the config file's folder, as in GraphifyConfig.ps1.
 
 Input problems (missing/unreadable/corrupt query log, unreadable or undated transcripts,
-missing subagent metadata) are counted in the JSON "inputs" block and listed in the report;
+unreadable git repos) are counted in the JSON "inputs" block and listed in the report;
 they are never read as low volume, and while any is present no stage can PASS (a PASS is
-capped to INSUFFICIENT EVIDENCE; a FAIL stands).
+capped to INSUFFICIENT EVIDENCE; a FAIL stands). Agents of unknown type (missing subagent
+metadata, unreadable agent definitions) are judged shell-capable, the worst case for routing,
+so they are listed as notes ("inputs.notes") and cap no verdict.
 
 Run: python graphify_funnel.py [--days 7] [--out report.md] [--json summary.json]
 """
@@ -1254,10 +1256,6 @@ def input_problems(inputs: dict) -> list[str]:
     for key, text in (("transcripts_unstatable", "transcript(s) could not be stat'ed"),
                       ("transcripts_unreadable", "transcript file(s) could not be read"),
                       ("transcripts_undated", "transcript(s) had no timestamped record and were left out"),
-                      ("subagent_metadata_problems", "subagent(s) without readable metadata "
-                                                     "(type unknown, judged shell-capable)"),
-                      ("agent_definitions_unreadable", "agent definition file(s) could not be read "
-                                                       "(agent judged shell-capable)"),
                       ("repo_identity_failures", "path(s) whose git repo could not be read "
                                                  "(treated as outside any repo)"),
                       ("sessions_without_cwd", "session(s) without a cwd (repo and graph unknown)")):
@@ -1266,6 +1264,21 @@ def input_problems(inputs: dict) -> list[str]:
     if inputs["transcript_corrupt_lines"]:
         out.append(f"{inputs['transcript_corrupt_lines']} corrupt transcript line(s), skipped")
     return out
+
+
+# An agent whose type or definition is unknown is judged shell-capable, so it stays a routing
+# exploration unit; its transcript is still read and no other stage looks at agent types. That
+# is the worst case for routing: a PASS reached this way holds for any true type (an agent that
+# called graphify had a shell), so these gaps are reported but cap no verdict.
+TYPE_UNKNOWN_INPUTS = (
+    ("subagent_metadata_problems", "subagent(s) without readable metadata (type unknown, judged shell-capable)"),
+    ("agent_definitions_unreadable", "agent definition file(s) could not be read (agent judged shell-capable)"),
+)
+
+
+def input_notes(inputs: dict) -> list[str]:
+    """One line per kind of type-unknown agent; reported, never a cap on a verdict."""
+    return [f"{len(inputs[key])} {text}" for key, text in TYPE_UNKNOWN_INPUTS if inputs[key]]
 
 
 def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
@@ -1470,6 +1483,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         "sessions_without_cwd": no_cwd,
     }
     inputs["problems"] = input_problems(inputs)
+    inputs["notes"] = input_notes(inputs)
     # A PASS is a claim about all the evidence; with inputs unread it is at most INSUFFICIENT.
     # A FAIL found in what was read stands.
     if inputs["problems"]:
@@ -1554,6 +1568,9 @@ def render(summary: dict) -> str:
     if inp["problems"]:
         L += ["**Input problems (verdicts below are missing this evidence, so none can PASS; this is not low volume):**",
               *[f"- {x}" for x in inp["problems"]], ""]
+    if inp["notes"]:
+        L += ["**Agents of unknown type (judged shell-capable, so a PASS still holds; a routing FAIL may "
+              "include them):**", *[f"- {x}" for x in inp["notes"]], ""]
     L += ["| Stage | Verdict | Evidence |", "|---|---|---|",
          f"| 1a Graph resolution | {a['graph_resolution']} | {a['graph_backed']}/{s['organic']} organic sessions "
          f"resolved a graph; {len(a['expected_graph_missing'])} in graph-expected repos without one |",

@@ -225,7 +225,7 @@ class AnyAgentType(FunnelCase):
         Transcript(self.repo).subagent("u1", "", sub).write(self.projects, "p", "s-untyped")
         out = self.run_funnel()
         self.assertEqual(out["routing"]["verdict"], gf.FAIL)
-        self.assertIn("judged shell-capable", " ".join(out["inputs"]["problems"]))
+        self.assertIn("judged shell-capable", " ".join(out["inputs"]["notes"]))
 
 
 class ShellLookups(FunnelCase):
@@ -493,16 +493,19 @@ class GraphUnusable(FunnelCase):
         out = self.run_funnel()["routing"]
         self.assertEqual((out["verdict"], out["graph_unusable_units"]), (gf.FAIL, 0))
 
-    def test_unreadable_agent_definition_is_an_input_problem(self):
-        """SA16-CT-16: an agent file that cannot be read is recorded, never skipped as if absent."""
+    def test_unreadable_agent_definition_is_recorded(self):
+        """SA16-CT-16: an agent file that cannot be read is recorded, never skipped as if absent.
+
+        The agent is then judged shell-capable (A18: a note, not a PASS cap), so this bypass FAILs."""
         (self.repo / ".claude" / "agents" / "reviewer.md").mkdir(parents=True)   # open() on a dir: OSError
         self.session_with("reviewer", "s-unreadable-def")
         out = self.run_funnel()
         bad = out["inputs"]["agent_definitions_unreadable"]
         self.assertEqual(len(bad), 1, bad)
         self.assertIn("reviewer.md", bad[0])
-        InputVisibility.assert_problem(self, out, "1 agent definition file(s) could not be read")
-        self.assertNotEqual(out["routing"]["verdict"], gf.PASS)
+        self.assertTrue(any("1 agent definition file(s) could not be read" in n for n in out["inputs"]["notes"]))
+        self.assertIn("1 agent definition file(s) could not be read", gf.render(out))
+        self.assertEqual(out["routing"]["verdict"], gf.FAIL)
 
     def test_repo_identity_os_error_is_an_input_problem(self):
         """SA16-CT-17: a cwd whose git repo cannot be read is recorded, never silently 'no repo'."""
@@ -1344,6 +1347,24 @@ class InputVisibility(FunnelCase):
         self.assertEqual(len(out["inputs"]["transcripts_unstatable"]), 1)
         self.assert_problem(out, "1 transcript(s) could not be stat'ed")
 
+    def test_type_unknown_subagent_is_a_note_not_a_pass_cap(self):
+        """A18: a subagent whose type is unknown is judged shell-capable, the worst case for routing,
+        and its transcript is still read. A PASS reached that way holds for any true type, so the
+        gap is reported as a note and caps no verdict; the subagent still counts as exploration."""
+        sub = Transcript(self.repo, T0 + timedelta(minutes=1)).query("who calls sync").greps(2)             .reads(self.backend_files(2))
+        Transcript(self.repo).hint().subagent("a2", "Explore", sub).write(self.projects, "p", "s-legacy")
+        (self.projects / "p" / "s-legacy" / "subagents" / "agent-a2.meta.json").unlink()
+        self.log_record("who calls sync", T0 + timedelta(minutes=1, seconds=2))
+        out = self.run_funnel()
+        self.assertEqual(out["inputs"]["problems"], [])
+        self.assertTrue(any("1 subagent(s) without readable metadata" in n for n in out["inputs"]["notes"]))
+        self.assertEqual((out["availability"]["graph_resolution"], out["routing"]["verdict"],
+                          out["execution"]["verdict"]), (gf.PASS, gf.PASS, gf.PASS))
+        self.assertEqual(out["routing"]["exploration_units"], 1)
+        report = gf.render(out)
+        self.assertNotIn("Input problems", report)
+        self.assertIn("1 subagent(s) without readable metadata", report)
+
     def test_subagent_metadata_problems(self):
         t = Transcript(self.repo)
         for agent in ("missing", "badjson", "notype", "fine"):
@@ -1360,7 +1381,8 @@ class InputVisibility(FunnelCase):
                        "agent-notype.jsonl: metadata has no agentType"):
             self.assertIn(needle, meta)
         self.assertEqual(len(out["inputs"]["subagent_metadata_problems"]), 3)
-        self.assert_problem(out, "3 subagent(s) without readable metadata")
+        self.assertIn("3 subagent(s) without readable metadata", " ".join(out["inputs"]["notes"]))
+        self.assertIn("3 subagent(s) without readable metadata", gf.render(out))
 
 
 if __name__ == "__main__":
