@@ -44,7 +44,13 @@ function Get-SkillTargets {
     # Personal skills: <USERPROFILE>/.claude/skills/<skill>/SKILL.md
     if (Test-Path $SkillsRoot) {
         Get-ChildItem $SkillsRoot -Directory -ErrorAction SilentlyContinue -ErrorVariable +enumError | ForEach-Object {
-            if (Test-Path (Join-Path $_.FullName 'SKILL.md')) {
+            # Not Test-Path: on a folder it cannot read it returns $false (or throws under Stop),
+            # dropping the skill without a shortfall. A listing records the denial instead; no
+            # -Filter, because pwsh 7 reports a filtered listing of a denied folder as empty.
+            $manifest = Get-ChildItem -LiteralPath $_.FullName -File -Force `
+                -ErrorAction SilentlyContinue -ErrorVariable +enumError |
+                Where-Object { $_.Name -eq 'SKILL.md' }
+            if ($manifest) {
                 $targets += [pscustomobject]@{
                     Scope = 'skills'
                     Name  = $_.Name

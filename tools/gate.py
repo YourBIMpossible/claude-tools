@@ -65,6 +65,7 @@ TEST_SUITES = (
     ("graphify/test_refresh_graphs.py", "powershell"),
     ("graphify/test_health_check.py", "powershell"),
     ("graphify/test_graphify_funnel.py", "any"),
+    ("skillspector/test_skill_targets.py", "powershell"),
     ("evidence-relevance/test_measure_relevance.py", "any"),
     ("evidence-archive/test_evacuate_worktree.py", "any"),
     ("evidence-capture/tests/test_capture.py", "any"),
