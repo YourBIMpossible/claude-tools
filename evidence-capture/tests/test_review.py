@@ -981,6 +981,10 @@ TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 def main() -> int:
     only = sys.argv[1:]
+    unknown = sorted(set(only) - {fn.__name__ for fn in TESTS})
+    if unknown:  # SA11-CT-35: a filter that matches nothing is a usage error, not "0 passed"
+        print(f"unknown test name(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
     os.environ.update({k: v for k, v in tc.GIT_ENV.items() if k.startswith("GIT_")})
     with tempfile.TemporaryDirectory(prefix="ec-review-test-") as tmp:
         for fn in TESTS:
