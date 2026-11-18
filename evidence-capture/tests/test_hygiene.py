@@ -349,13 +349,8 @@ def test_sa26_14_spawn_error_is_not_absent(root: Path) -> None:
     assert got["gone"] == "absent", got
     if store.os.name != "nt":  # Windows has no execute bit: the file is a bad image, still not absent
         assert got["blocked"] == "unrecorded:PermissionError", got
-    assert causal._tool_version([missing]) == "absent"
-
-    def timeout(*a: Any, **k: Any) -> Any:
-        raise subprocess.TimeoutExpired(a[0], 20)
-
-    with patched(causal.subprocess, "run", timeout):
-        assert causal._tool_version(["git", "--version"]) == "unrecorded:timeout"
+    slow = causal.tool_versions_async({"slow": [sys.executable, "-c", "import time; time.sleep(30)"]})
+    assert causal.collect_tool_versions(slow, 0.2)["slow"] == "unrecorded:timeout"
 
 
 def test_sa26_15_sole_screen_blocker_names_its_cause(root: Path) -> None:

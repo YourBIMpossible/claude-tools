@@ -5,27 +5,30 @@ The start snapshot (``snapshot.py``) records how a turn began. Attributing an ou
 to the brief also needs how it ended, a store that replays without the source
 repository, and proof that nothing else moved. This module adds those pieces:
 
-* ``capture_state``      immutable, verified worktree state (start or end): every
-                         tracked and untracked unignored path as raw bytes, read twice
-                         (any difference is ``concurrent_change``), content-addressed by
-                         SHA-256, sealed with ``SHA256SUMS`` and made read-only
-* ``capture_overlay``    the hook-time form: HEAD plus the exact bytes of every path git
-                         reports as differing from it, sealed the same way;
-                         ``effective_oids`` compares two of them, ``materialize_overlay``
-                         rebuilds one from frozen history
+* ``capture_overlay``    immutable, verified worktree state (start or end), cheap enough
+                         for the prompt hook: HEAD plus the exact bytes of every path git
+                         reports as differing from it (untracked-unignored included) and the
+                         raw-byte manifest of the whole worktree; read twice (any difference
+                         is ``concurrent_change``), content-addressed by SHA-256, sealed with
+                         ``SHA256SUMS`` and made read-only. ``verify_state`` / ``read_state``
+                         check and load one
+* ``effective_oids``     start and end in git's terms, over every path either overlay or a
+                         HEAD move touches: what ``attribute`` and ``changed_paths`` compare
 * ``freeze_history``     a self-contained pack of every object reachable from HEAD,
                          verified by indexing it into an empty repository (no
                          alternates, no reference to the source)
-* ``materialize``        raw-byte restore of a state; ``neutralize_attributes`` and
-                         ``RAW_GIT_ARGS`` keep git's eol/filter/textconv machinery off
-                         any replay clone
+* ``materialize_overlay`` restore of a state from frozen history plus its overlay bytes;
+                         ``verify_fidelity`` proves the result byte-exact
 * ``unsupported_state``  submodules, LFS, sparse checkout, shallow history and
                          in-progress operations: the episode is ineligible, with reasons
 * ``attribute``          every start->end change must be one the agent wrote; other
                          worktrees of the same repository must not move during the turn
-* ``dependency_fingerprint`` / ``dependency_drift``  lockfile hashes and tool versions
-* ``load_registry`` / ``run_checks``  per-task outcome checks, run against a
-                         materialized end state, never against the live checkout
+                         (``worktree_records`` / ``classify_worktrees`` / ``shared_git_state``)
+* ``lockfile_oids`` / ``dependency_drift``  lockfile changes the agent did not write;
+                         ``tool_versions_async`` / ``collect_tool_versions`` / ``tool_drift``
+                         tool-version changes
+* ``validate_predicate`` / ``run_checks``  per-task outcome checks, run against a
+                         materialized state, never against the live checkout
 * ``admit``              the gate combining all of the above
 
 Nothing here writes to the source repository: reads use ``GIT_OPTIONAL_LOCKS=0`` and
@@ -47,7 +50,6 @@ from typing import Any
 from common import git_bytes, git_env, sha256_bytes
 from store import verify_sums, write_sums
 
-STATE_VERSION = 1
 STATE_FILES = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
                "rebase-merge", "rebase-apply")
 LFS_POINTER = b"version https://git-lfs.github.com/spec/v1"
@@ -57,15 +59,6 @@ LOCKFILES = frozenset({
     "Gemfile.lock", "composer.lock", "packages.lock.json", "Directory.Packages.props",
     "global.json", ".python-version", ".nvmrc", ".tool-versions",
 })
-DEFAULT_TOOLS: dict[str, list[str]] = {
-    "python": [sys.executable, "--version"],
-    "git": ["git", "--version"],
-    "node": ["node", "--version"],
-    "dotnet": ["dotnet", "--version"],
-}
-RAW_GIT_ARGS = ("-c", "core.autocrlf=false", "-c", "core.eol=lf", "-c", "core.safecrlf=false",
-                "-c", f"core.attributesFile={os.devnull}", "-c", "diff.noprefix=false")
-NEUTRAL_ATTRIBUTES = b"* -text !eol -filter -ident -diff -merge -working-tree-encoding -export-subst\n"
 CHECK_KINDS = ("file_sha256", "file_absent", "file_contains", "command")
 
 
@@ -108,18 +101,6 @@ def _read_entry(top: Path, rel: str) -> tuple[dict[str, Any], bytes] | None:
     else:
         return None  # a directory reported by ls-files is a nested repository (gitlink)
     return {"sha256": sha256_bytes(data), "size": len(data), "mode": mode}, data
-
-
-def _scan(top: Path) -> tuple[dict[str, dict[str, Any]], dict[str, bytes]]:
-    files: dict[str, dict[str, Any]] = {}
-    blobs: dict[str, bytes] = {}
-    for rel in list_paths(top):
-        got = _read_entry(top, rel)
-        if got is None:
-            continue
-        files[rel] = got[0]
-        blobs[got[0]["sha256"]] = got[1]
-    return files, blobs
 
 
 def mixed_eol(data: bytes) -> bool:
@@ -190,34 +171,6 @@ def _make_read_only(directory: Path) -> None:
             os.chmod(path, stat.S_IREAD)
 
 
-def capture_state(repo: Path, dest: Path, *, label: str) -> dict[str, Any]:
-    """Write a sealed, read-only state of ``repo`` to ``dest`` (which must not exist)."""
-    if dest.exists():
-        raise CausalError("state exists; never overwritten")
-    top = Path(_git(repo, "rev-parse", "--show-toplevel").decode().strip())
-    head_before = _git(top, "rev-parse", "HEAD").decode().strip()
-    files, blobs = _scan(top)
-    again, _ = _scan(top)
-    head_after = _git(top, "rev-parse", "HEAD").decode().strip()
-    if again != files or head_after != head_before:
-        raise CausalError("concurrent_change")
-    tmp = dest.with_name(dest.name + ".tmp")
-    if tmp.exists():
-        raise CausalError("stale temporary state present")
-    (tmp / "objects").mkdir(parents=True)
-    for digest, data in blobs.items():
-        (tmp / "objects" / digest).write_bytes(data)
-    record = {"version": STATE_VERSION, "label": label, "head": head_before, "files": files}
-    (tmp / "state.json").write_bytes(json.dumps(record, sort_keys=True, indent=1).encode("utf-8"))
-    write_sums(tmp)
-    problems = verify_state(tmp)
-    if problems:
-        raise CausalError("verify failed: " + "; ".join(problems[:3]))
-    os.replace(tmp, dest)
-    _make_read_only(dest)
-    return record
-
-
 def verify_state(dest: Path) -> list[str]:
     """Problems with a stored state; empty means intact."""
     if not (dest / "state.json").is_file():
@@ -238,38 +191,9 @@ def read_state(dest: Path) -> dict[str, Any]:
     return json.loads((dest / "state.json").read_bytes())
 
 
-def materialize(dest: Path, out: Path) -> None:
-    """Restore a state's exact bytes into an empty ``out``. Symlinks fail closed."""
-    problems = verify_state(dest)
-    if problems:
-        raise CausalError("state not intact: " + "; ".join(problems[:3]))
-    if out.exists() and any(out.iterdir()):
-        raise CausalError("materialize target not empty")
-    for rel, entry in read_state(dest)["files"].items():
-        target = out / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        data = (dest / "objects" / entry["sha256"]).read_bytes()
-        if entry["mode"] == "120000":
-            try:
-                os.symlink(data.decode("utf-8", "surrogateescape"), target)
-            except OSError as exc:
-                raise CausalError(f"symlink not creatable: {rel}") from exc
-        else:
-            target.write_bytes(data)
-            if entry["mode"] == "100755":
-                os.chmod(target, os.stat(target).st_mode | stat.S_IXUSR)
-
-
-def neutralize_attributes(gitdir: Path) -> None:
-    """Make a replay clone's git ops byte-exact: ``info/attributes`` outranks .gitattributes."""
-    info = gitdir / "info"
-    info.mkdir(parents=True, exist_ok=True)
-    (info / "attributes").write_bytes(NEUTRAL_ATTRIBUTES)
-
-
 # ------------------------------------------------------------------ hook-time overlay states
 #
-# A full ``capture_state`` reads every file twice: seconds on a large checkout, too slow for
+# Reading every file of a large checkout twice takes seconds, too slow for
 # the prompt hook. The hooks instead seal an *overlay*: HEAD plus the bytes of every path
 # git reports as differing from it (tracked diffs, staged or not, and untracked-unignored
 # files), plus the tracked paths that are gone. Overlay bytes are raw and exact. Paths
@@ -977,25 +901,6 @@ def attribute(start: dict[str, Any], end: dict[str, Any], agent_writes: list[str
 # ------------------------------------------------------------------ dependencies
 
 
-def _tool_version(argv: list[str]) -> str:
-    """The tool's first version line; ``absent`` only when the executable is missing."""
-    try:
-        proc = subprocess.run(argv, capture_output=True, timeout=20)
-    except FileNotFoundError:
-        return "absent"
-    except subprocess.TimeoutExpired:
-        return "unrecorded:timeout"
-    except OSError as exc:
-        return f"unrecorded:{type(exc).__name__}"
-    text = (proc.stdout or proc.stderr).decode("utf-8", "replace").strip()
-    return text.splitlines()[0] if proc.returncode == 0 and text else f"error:{proc.returncode}"
-
-
-def dependency_fingerprint(state: dict[str, Any], tools: dict[str, list[str]] | None = None) -> dict[str, Any]:
-    locks = {rel: e["sha256"] for rel, e in state["files"].items() if rel.rsplit("/", 1)[-1] in LOCKFILES}
-    versions = {name: _tool_version(argv) for name, argv in sorted((tools or DEFAULT_TOOLS).items())}
-    return {"lockfiles": dict(sorted(locks.items())), "tools": versions}
-
 
 def dependency_drift(start: dict[str, Any], end: dict[str, Any], agent_writes: list[str], *,
                      top: str | None = None) -> list[str]:
@@ -1012,11 +917,6 @@ def dependency_drift(start: dict[str, Any], end: dict[str, Any], agent_writes: l
 
 
 # ------------------------------------------------------------------ outcome checks
-
-
-def load_registry(path: Path) -> dict[str, list[dict[str, Any]]]:
-    """``{"tasks": {task_id: {"checks": [...]}}}``; malformed entries raise."""
-    return validate_tasks(json.loads(path.read_bytes()))
 
 
 def validate_tasks(raw: Any) -> dict[str, list[dict[str, Any]]]:
