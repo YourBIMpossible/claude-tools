@@ -353,6 +353,33 @@ def test_corrupt_store_config_is_logged_not_unconfigured(root: Path) -> None:
     assert "store config unreadable" in lines[1] and "list.json" in lines[1] and "not an object" in lines[1], lines
 
 
+def test_tmp_orphan_stat_and_remove_failures_are_logged(root: Path) -> None:
+    """SA11-CT-28: an orphan whose age cannot be read, or that rmtree could not remove, is
+    one line in the capture log rather than skipped without a trace."""
+    import pathlib
+
+    import store
+
+    st = _content_store(root)
+    old = 1_000_000_000
+    for name in ("ep_stuck.1", "ep_statfail.2"):
+        (st.tmp / name).mkdir(parents=True)
+        os.utime(st.tmp / name, (old, old))
+    real_stat = pathlib.Path.stat
+
+    def stat(self, *a, **k):
+        if "statfail" in self.name:
+            raise PermissionError("stat refused")
+        return real_stat(self, *a, **k)
+
+    with _Patched(pathlib.Path, stat=stat), _Patched(store, rmtree=lambda _p, *a, **k: False):
+        gone = store.clean_tmp_orphans(st)
+    assert gone == [], gone
+    log = (st.meta / "capture.log").read_text(encoding="utf-8")
+    assert "tmp orphan age unreadable: ep_statfail.2" in log and "stat refused" in log, log
+    assert "tmp orphan could not be removed: ep_stuck.1" in log, log
+
+
 TESTS = [
     test_start_hook_import_failure_is_logged,
     test_end_hook_import_failure_is_logged,
@@ -364,6 +391,7 @@ TESTS = [
     test_git_failure_is_not_read_as_not_a_repository,
     test_failed_remote_listing_is_not_no_remote,
     test_corrupt_store_config_is_logged_not_unconfigured,
+    test_tmp_orphan_stat_and_remove_failures_are_logged,
 ]
 
 

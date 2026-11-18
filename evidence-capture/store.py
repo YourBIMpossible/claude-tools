@@ -388,7 +388,8 @@ def new_tmp_dir(stores: Stores, episode: str) -> Path:
 
 
 def clean_tmp_orphans(stores: Stores, max_age_s: int = TMP_MAX_AGE_S) -> list[str]:
-    """Delete ``tmp/`` entries older than ``max_age_s``; return their names."""
+    """Delete ``tmp/`` entries older than ``max_age_s``; return their names. An entry whose
+    age cannot be read, or that could not be removed, is kept and logged."""
     gone: list[str] = []
     if not stores.tmp.is_dir():
         return gone
@@ -398,7 +399,8 @@ def clean_tmp_orphans(stores: Stores, max_age_s: int = TMP_MAX_AGE_S) -> list[st
         episode = entry.name.split(".", 1)[0]
         try:
             old = entry.stat().st_mtime < cutoff
-        except OSError:
+        except OSError as exc:
+            log_line(stores, f"tmp orphan age unreadable: {entry.name}: {type(exc).__name__}: {exc}")
             continue
         if old and staged.is_dir() and not (stores.snapshots / episode).exists() \
                 and not (stores.payloads / episode).exists():
@@ -412,8 +414,11 @@ def clean_tmp_orphans(stores: Stores, max_age_s: int = TMP_MAX_AGE_S) -> list[st
                 log_line(stores, f"staging interrupted; snapshot restore failed: {episode}: {exc}")
                 continue
         # ``old`` was taken before any restore (which touches the entry's mtime).
-        if old and rmtree(entry):
-            gone.append(entry.name)
+        if old:
+            if rmtree(entry):
+                gone.append(entry.name)
+            else:
+                log_line(stores, f"tmp orphan could not be removed: {entry.name}")
     if gone:
         log_line(stores, f"tmp orphans removed: {','.join(gone)}")
     return gone
