@@ -1034,7 +1034,12 @@ def admit(record: dict[str, Any]) -> dict[str, Any]:
             reasons.append(f"{key}_missing")
         elif probs:
             reasons.append(f"{key}_unverified")
-    reasons += [f"unsupported:{r}" for r in record.get("unsupported") or []]
+    # SA11-CT-50: a missing list is unknown, not empty; name it instead of admitting past it
+    unsupported = record.get("unsupported")
+    if unsupported is None:
+        reasons.append("unsupported_missing")
+    else:
+        reasons += [f"unsupported:{r}" for r in unsupported]
     for key in ("start", "end"):
         fid = record.get(f"{key}_fidelity")
         if fid is None:
@@ -1056,13 +1061,18 @@ def admit(record: dict[str, Any]) -> dict[str, Any]:
             reasons.append("other_worktree_contaminating")
         if wt["unknown"]:
             reasons.append("other_worktree_unknown")
-    reasons += [f"dependency_drift:{d}" for d in record.get("dependency_drift") or []]
+    drift = record.get("dependency_drift")
+    if drift is None:
+        reasons.append("dependency_drift_missing")
+    else:
+        reasons += [f"dependency_drift:{d}" for d in drift]
     if record.get("registration_problems") is None:
         reasons.append("no_outcome_check")
     elif record["registration_problems"]:
         reasons.append("outcome_check_registration_unverified")
+    elif (checks := record.get("checks")) is None:
+        reasons.append("checks_missing")
     else:
-        checks = record.get("checks") or []
         end_r, start_r = record.get("check_results"), record.get("check_results_start")
         if not end_r or len(end_r) != len(checks) or not start_r or len(start_r) != len(checks):
             reasons.append("outcome_checks_not_run")
