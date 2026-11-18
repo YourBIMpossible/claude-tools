@@ -582,6 +582,7 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
     exit_code = proc.returncode  # None: the CLI was still running when the harness stopped waiting
     seconds = round(time.monotonic() - started, 1)
     # Arm A counts only when its fail-open hook confirmed it emitted this exact brief (SA11-CT-40).
+    # "delivered" = emitted by the hook: the marker cannot show the model received the brief.
     brief_delivered = None
     if brief_sha is not None:
         try:

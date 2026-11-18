@@ -167,7 +167,7 @@ def test_hook(tmp: Path) -> None:
     marker = Path(str(brief) + twin.DELIVERED_SUFFIX)
     check(marker.is_file() and marker.read_text(encoding="utf-8").strip()
           == twin.sha256_bytes("<context_brief>é</context_brief>".encode("utf-8")),
-          "SA11-CT-40: the hook confirms delivery with the brief's sha256 next to the brief")
+          "SA11-CT-40: the hook confirms emission with the brief's sha256 next to the brief")
     check(not Path(str(tmp / "missing.md") + twin.DELIVERED_SUFFIX).exists(),
           "SA11-CT-40: a brief the hook could not emit leaves no delivery marker")
     s = twin.settings_for("-", sys.executable)
@@ -200,7 +200,7 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
     check(a["reached"] and a["tokens_to_target"] == 2260 and a["tokens_total"] == 3390, "fake run is scored")
     check(a["cli_version"] == "fake-0" and a["verified"] is False, "meta records CLI version and verify")
     check(a.get("brief_delivered") is True and metas["B"].get("brief_delivered") is None,
-          "meta records that arm A's brief was delivered")
+          "meta records that arm A's hook emitted the brief")
     check(all((archive / r["run_id"] / f).is_file() for r in plan["runs"]
               for f in ("stream.jsonl", "diff.patch", "stderr.txt", "meta.json")), "archive is complete")
     check("# fake edit" in (archive / plan["runs"][0]["run_id"] / "diff.patch").read_text(encoding="utf-8"),

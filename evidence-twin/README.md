@@ -15,9 +15,13 @@ with:
 - `--setting-sources project` (the clone has no project settings) plus a generated
   `--settings` file: local tools allowed; web tools, network commands, `git push`,
   `git remote`, `git fetch`/`pull`/`clone` and package installs denied;
-- the same `UserPromptSubmit` hook in both arms (`replay_hook.py`), which injects the
+- the same `UserPromptSubmit` hook in both arms (`replay_hook.py`), which emits the
   archived brief through `additionalContext` in arm A — the production adapter's exact
-  output — and nothing in arm B;
+  output — and nothing in arm B. After emitting it the hook writes
+  `<brief>.delivered` with the brief's sha256; an arm A run without a matching marker is
+  invalid (`brief_not_delivered`). `brief_delivered: true` in `meta.json` means the hook
+  emitted the brief, not that the model received it: nothing checks that the CLI kept
+  the hook output;
 - `EVIDENCE_HOOK=0`, `--no-session-persistence`, `--strict-mcp-config`, stdin closed.
 - an environment without any `CLAUDE*` or `ANTHROPIC*` variable. A harness started
   from inside a Claude Code session would otherwise hand the run that session's IDs,
@@ -43,7 +47,11 @@ censored at the cap.
 A ledger keeps the total across batches. A run does not start when the total plus
 one cap could cross the ceiling (default 150M). A run whose CLI never really
 executed — no result event, or an errored result such as an expired login — is
-kept as `<run_id>.invalid-N`, frees its run ID for a rerun, and stops the batch.
+kept as `<run_id>.invalid-N`, frees its run ID for a rerun, and stops the batch. So is
+a run something it started outlived: one whose output pipe stays open past the grace
+after the CLI exits or is killed (`output_held`) is read no further and not trusted.
+If a survivor still holds the run directory, its `meta.json` is moved aside to
+`meta.invalid-N.json` in place instead.
 
 ## Usage
 

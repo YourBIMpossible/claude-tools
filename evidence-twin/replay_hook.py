@@ -10,9 +10,14 @@ Reads and discards the hook's stdin. Fail-open: any error emits nothing and
 exits 0, like the production adapter.
 
 Once the brief is written to stdout the hook leaves ``<brief-file>.delivered``
-holding the sha256 of the emitted brief, so the harness can confirm arm A really
-carried it (SA11-CT-40): a fail-open hook that emitted nothing leaves no marker,
-and twin marks that run invalid. A marker that cannot be written is fail-open too.
+holding the sha256 of the emitted brief (SA11-CT-40): a fail-open hook that
+emitted nothing leaves no marker, and twin marks that run invalid. A marker that
+cannot be written is fail-open too.
+
+"Delivered" means *emitted by the hook*, nothing more. The marker proves this
+process wrote that exact brief to its stdout; it does not prove the CLI accepted
+the hook output or that the brief reached the model's context. It catches a hook
+that silently did nothing, not a CLI that dropped what the hook gave it.
 """
 from __future__ import annotations
 
