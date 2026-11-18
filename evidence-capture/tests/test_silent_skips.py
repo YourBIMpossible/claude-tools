@@ -324,6 +324,35 @@ def test_failed_remote_listing_is_not_no_remote(root: Path) -> None:
         assert len(hits) == 1 and why in hits[0], meta
 
 
+def test_corrupt_store_config_is_logged_not_unconfigured(root: Path) -> None:
+    """SA11-CT-27: a corrupt or non-object evidence-capture.json still resolves to no stores
+    (paths cannot be guessed) but leaves one line naming the file, instead of reading as
+    an unconfigured machine."""
+    import store
+
+    tmp = root / "tmp"
+    tmp.mkdir()
+    saved = {k: os.environ.get(k) for k in ("TEMP", "TMP", "TMPDIR")}
+    os.environ.update(TEMP=str(tmp), TMP=str(tmp), TMPDIR=str(tmp))
+    try:
+        for name, body in (("corrupt.json", '{"meta": "x", '), ("list.json", "[1, 2]")):
+            cfg = root / name
+            cfg.write_text(body, encoding="utf-8")
+            assert store.resolve_stores({}, cfg) is None
+        assert store.resolve_stores({}, root / "absent.json") is None  # truly unconfigured: no line
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    log = tmp / "ec-capture-failures.log"
+    lines = log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+    assert len(lines) == 2, lines
+    assert "store config unreadable" in lines[0] and "corrupt.json" in lines[0], lines
+    assert "store config unreadable" in lines[1] and "list.json" in lines[1] and "not an object" in lines[1], lines
+
+
 TESTS = [
     test_start_hook_import_failure_is_logged,
     test_end_hook_import_failure_is_logged,
@@ -334,6 +363,7 @@ TESTS = [
     test_unevaluable_cloud_attribute_guard_is_a_problem,
     test_git_failure_is_not_read_as_not_a_repository,
     test_failed_remote_listing_is_not_no_remote,
+    test_corrupt_store_config_is_logged_not_unconfigured,
 ]
 
 

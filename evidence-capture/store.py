@@ -75,14 +75,21 @@ class Stores:
 
 
 def resolve_stores(env: dict[str, str] | None = None, config: Path = USER_CONFIG) -> Stores | None:
-    """Store paths from the environment, else the user config; None when neither says."""
+    """Store paths from the environment, else the user config; None when neither says.
+    A config file that exists but cannot be read or is not a JSON object says nothing
+    either, but it is not an unconfigured machine: it leaves one line in the temp
+    fallback log (there is no store to log to) naming the file and why."""
     env = os.environ if env is None else env
     meta, content = env.get(ENV_META), env.get(ENV_CONTENT)
     packets, seals = env.get(ENV_PACKET_DIRS), env.get(ENV_SEALS)
     if not (meta and content) and config.is_file():
         try:
             cfg = read_json(config)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log_line(None, f"store config unreadable: {config}: {type(exc).__name__}: {exc}")
+            cfg = {}
+        if not isinstance(cfg, dict):
+            log_line(None, f"store config unreadable: {config}: not an object ({type(cfg).__name__})")
             cfg = {}
         meta = meta or cfg.get("meta")
         content = content or cfg.get("content")
