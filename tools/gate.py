@@ -79,6 +79,7 @@ TEST_SUITES = (
     ("evidence-capture/tests/test_clone.py", "any"),
     ("evidence-capture/tests/test_hooks.py", "any"),
     ("evidence-capture/tests/test_hygiene.py", "any"),
+    ("evidence-capture/tests/test_silent_skips.py", "any"),
     ("evidence-episodes/test_build_episodes.py", "evidence_compiler"),
     ("evidence-footprints/test_footprints.py", "any"),
     ("evidence-footprints/test_blind_sheets.py", "any"),
