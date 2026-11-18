@@ -56,7 +56,7 @@ def main() -> int:
     # The old module uses relative imports; load it inside the same package.
     old_rg = _load_module("evidence_compiler.collectors._ripgrep_old", args.old)
 
-    packets, _ = mr.load_packets()
+    packets, load_issues = mr.load_packets()
     rows = []
     issues: Counter = Counter()
     for p in packets:
@@ -113,8 +113,7 @@ def main() -> int:
         "symbols_matched_new": sum(r["new_matched"] for r in rows),
         "file_sets_equal_old_vs_old": sum(r["old_vs_old_same_files"] for r in rows),
         "file_sets_equal_old_vs_new": sum(r["old_vs_new_same_files"] for r in rows),
-        "issues": dict(issues),
-        "complete": not issues,
+        **mr.replay_completeness(issues, load_issues),
     }
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

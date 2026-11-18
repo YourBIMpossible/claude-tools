@@ -145,10 +145,10 @@ def main() -> int:
     args.packet += [pid for pid in targets if pid not in args.packet]
 
     compiler, ranking, scoping, ripgrep, loaded = _import_compiler(args.src)
-    packets, _ = mr.load_packets()
+    packets, load_issues = mr.load_packets()
     pool = [p for p in packets if p.traffic == "candidate" and Path(p.repo_root).is_dir()
             and (not args.packet or any(p.packet_id.startswith(x) for x in args.packet))]
-    turns, _ = mr.build_turns(pool)
+    turns, turn_issues = mr.build_turns(pool)
 
     uncapped_cache: dict = {}
     rows, packet_rows = [], []
@@ -212,8 +212,7 @@ def main() -> int:
         "packets_repeat_same_raw_path_set": sum(r["repeat_same_raw_path_set"] for r in packet_rows),
         "packets_repeat_same_brief": sum(r["repeat_same_brief"] for r in packet_rows),
         "files_brief_membership_unstable": sum(1 for r in rows if len(set(r["in_brief"])) > 1),
-        "issues": dict(issues),
-        "complete": not issues,
+        **mr.replay_completeness(issues, load_issues, turn_issues),
     }
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / f"replay_relevance_{args.label}.json").write_text(

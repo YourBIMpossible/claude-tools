@@ -124,6 +124,20 @@ def traffic_classes(store_root: str) -> dict[str, tuple[str, str]] | None:
     return out
 
 
+# Join issues that mean input was lost (a file could not be read), as opposed to coverage facts such as
+# a packet with no session or no traffic class. Any of these makes a replay's output incomplete.
+DATA_LOSS_ISSUES = ("unreadable_packet", "unreadable_transcript_line", "unreadable_subagent", "inventory_failed")
+
+
+def replay_completeness(local: Counter, *joins: Counter) -> dict:
+    """Summary fields for a replay: its own issues, every join issue, and whether nothing was lost."""
+    join: Counter = Counter()
+    for c in joins:
+        join.update(c)
+    return {"issues": dict(local), "join_issues": dict(join),
+            "complete": not local and not any(join[k] for k in DATA_LOSS_ISSUES)}
+
+
 def load_packet_json(store_root: str, glob_pattern: str) -> dict | None:
     """Read a packet's raw JSON by glob under store_root; None (never raises) when absent."""
     matches = list(Path(store_root, ".evidence-compiler", "packets").glob(glob_pattern))

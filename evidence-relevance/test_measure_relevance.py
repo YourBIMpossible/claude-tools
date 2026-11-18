@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -137,6 +138,65 @@ def test_inventory_nonzero_exit_warns_and_counts(tmp_path: Path) -> None:
           "load_packets counts inventory_failed and still loads the packet")
 
 
+def _stub_compiler(root: Path) -> Path:
+    """A throwaway evidence_compiler package with just enough surface for the replay CLIs to import."""
+    pkg = root / "src" / "evidence_compiler"
+    (pkg / "collectors").mkdir(parents=True)
+    for rel in ("__init__.py", "collectors/__init__.py", "compiler.py", "ranking.py", "scoping.py"):
+        (pkg / rel).write_text("", encoding="utf-8")
+    (pkg / "collectors" / "base.py").write_text("class CollectorContext:\n    pass\n", encoding="utf-8")
+    (pkg / "collectors" / "ripgrep.py").write_text("_MAX_MATCHES_PER_SYMBOL = 1\n", encoding="utf-8")
+    return root / "src"
+
+
+def _run_replay(module_name: str, argv: list[str], load_issues: Counter) -> dict:
+    import contextlib
+    import importlib
+    import io
+
+    for name in [m for m in sys.modules if m == "evidence_compiler" or m.startswith("evidence_compiler.")]:
+        del sys.modules[name]
+    mod = importlib.import_module(module_name)
+    orig = (mr.load_packets, mr.build_turns, sys.argv, list(sys.path))
+    mr.load_packets = lambda: ([], Counter(load_issues))
+    mr.build_turns = lambda _pool: ({}, Counter({"unreadable_subagent": 1}))
+    sys.argv = [module_name, *argv]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.main()
+    finally:
+        mr.load_packets, mr.build_turns, sys.argv = orig[0], orig[1], orig[2]
+        sys.path[:] = orig[3]
+        for name in [m for m in sys.modules if m == "evidence_compiler" or m.startswith("evidence_compiler.")]:
+            del sys.modules[name]
+    return mod
+
+
+def test_replays_surface_join_issues(tmp_path: Path) -> None:
+    """SA11-CT-37: a corrupt packet or transcript dropped by the join makes a replay incomplete, never complete:true."""
+    src = _stub_compiler(tmp_path)
+    old = tmp_path / "old_ripgrep.py"
+    old.write_text("", encoding="utf-8")
+    out = tmp_path / "out"
+
+    _run_replay("replay_rg", ["--old", str(old), "--new-src", str(src), "--out", str(out), "--label", "t"],
+                Counter({"unreadable_packet": 1}))
+    rg = json.loads((out / "replay_rg_t.json").read_text(encoding="utf-8"))["summary"]
+    check(rg.get("join_issues") == {"unreadable_packet": 1}, "replay_rg surfaces load_packets issues")
+    check(rg["complete"] is False, "replay_rg is incomplete when a packet was unreadable")
+
+    _run_replay("replay_relevance", ["--src", str(src), "--label", "t", "--out", str(out)], Counter())
+    rel = json.loads((out / "replay_relevance_t.json").read_text(encoding="utf-8"))["summary"]
+    check(rel.get("join_issues") == {"unreadable_subagent": 1}, "replay_relevance surfaces build_turns issues")
+    check(rel["complete"] is False, "replay_relevance is incomplete when a subagent transcript was unreadable")
+
+    _run_replay("replay_rg", ["--old", str(old), "--new-src", str(src), "--out", str(out), "--label", "c"],
+                Counter({"no_traffic_class": 2}))
+    clean = json.loads((out / "replay_rg_c.json").read_text(encoding="utf-8"))["summary"]
+    check(clean.get("join_issues") == {"no_traffic_class": 2} and clean["complete"] is True,
+          "a coverage-only join issue is surfaced but does not mark data lost")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         test_build_turns_counts_malformed_line_and_keeps_valid_data(Path(td))
@@ -144,6 +204,8 @@ def main() -> int:
         test_load_packet_json_present_and_absent(Path(td))
     with tempfile.TemporaryDirectory() as td:
         test_inventory_nonzero_exit_warns_and_counts(Path(td))
+    with tempfile.TemporaryDirectory() as td:
+        test_replays_surface_join_issues(Path(td))
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     if FAILURES:
