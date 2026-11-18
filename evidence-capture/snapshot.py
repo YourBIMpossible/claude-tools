@@ -120,11 +120,14 @@ def run_git_parallel(repo: Path, calls: dict[str, tuple[str, ...]], timeout: flo
 
 
 def git_version() -> str:
-    """``git --version``, once per process."""
+    """``git --version``, once per process. A failed run is reported as unknown (with its
+    exit code) and not cached, so a later call can still learn the real version."""
     global _GIT_VERSION
     if _GIT_VERSION is None:
-        _GIT_VERSION = subprocess.run(["git", "--version"], capture_output=True, text=True,
-                                      timeout=10).stdout.strip()
+        proc = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            return f"unknown: git --version rc={proc.returncode}: {proc.stderr.strip()[:200]}"
+        _GIT_VERSION = proc.stdout.strip()
     return _GIT_VERSION
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -23,9 +24,11 @@ HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 sys.path.insert(0, str(PKG))
 import backstop  # noqa: E402
+import isolation  # noqa: E402
 import pipeline  # noqa: E402
 import report  # noqa: E402
 import screen  # noqa: E402
+import snapshot  # noqa: E402
 import store  # noqa: E402
 
 PASSED: list[str] = []
@@ -163,7 +166,73 @@ def test_repo_relative_shares_classify_normalisation(root: Path) -> None:
     assert idx.relative("") is None
 
 
-TESTS = [test_repo_relative_shares_classify_normalisation,
+def test_git_version_failure_is_not_cached(root: Path) -> None:
+    """SA11-CT-49: a failed ``git --version`` is reported as unknown and not cached as
+    the version for the rest of the process."""
+    real = subprocess.run
+
+    def failing(argv: list[str], *a: Any, **k: Any) -> subprocess.CompletedProcess:
+        if argv[:2] == ["git", "--version"]:
+            return subprocess.CompletedProcess(argv, 1, "", "boom")
+        return real(argv, *a, **k)
+
+    with patched(snapshot, "_GIT_VERSION", None):
+        with patched(subprocess, "run", failing):
+            got = snapshot.git_version()
+        assert got.startswith("unknown: git --version rc=1"), got
+        assert snapshot._GIT_VERSION is None
+        assert snapshot.git_version().startswith("git version")
+        assert snapshot._GIT_VERSION is not None
+
+
+def test_isolation_records_partial_resolve_and_sid_failure(root: Path) -> None:
+    """SA11-CT-48: a resolve whose stat succeeded but whose listing was denied is recorded
+    as such (still a denial for the verdict), and a failed SID lookup is recorded instead
+    of leaving the SID silently empty."""
+    target = root / "sibling"
+    target.mkdir()
+
+    def deny(p: Any) -> list[str]:
+        raise PermissionError(13, "denied")
+
+    with patched(os, "listdir", deny):
+        outcome = isolation._attempt("resolve", target)
+    assert outcome == "denied:listdir (stat succeeded)", outcome
+    assert isolation.is_denied(outcome) and isolation.is_denied("denied")
+    assert not isolation.is_denied("succeeded") and not isolation.is_denied("missing")
+
+    def stat_deny(p: Any, *a: Any, **k: Any) -> Any:
+        raise PermissionError(13, "denied")
+
+    with patched(os, "stat", stat_deny):
+        assert isolation._attempt("resolve", target) == "denied"
+    if os.name != "nt":
+        return
+    real = subprocess.run
+
+    def whoami_fails(argv: list[str], *a: Any, **k: Any) -> subprocess.CompletedProcess:
+        if argv and argv[0] == "whoami.exe":
+            return subprocess.CompletedProcess(argv, 1, "", "no")
+        return real(argv, *a, **k)
+
+    with patched(subprocess, "run", whoami_fails):
+        ident = isolation.identity()
+    assert ident["sid"] is None and ident["sid_error"] == "whoami rc=1", ident
+
+    def whoami_missing(argv: list[str], *a: Any, **k: Any) -> subprocess.CompletedProcess:
+        if argv and argv[0] == "whoami.exe":
+            raise FileNotFoundError(2, "whoami.exe")
+        return real(argv, *a, **k)
+
+    with patched(subprocess, "run", whoami_missing):
+        ident = isolation.identity()
+    assert ident["sid"] is None and ident["sid_error"].startswith("FileNotFoundError"), ident
+    ok = isolation.identity()
+    assert ok["sid"] and ok["sid_error"] is None, ok
+
+
+TESTS = [test_git_version_failure_is_not_cached, test_isolation_records_partial_resolve_and_sid_failure,
+         test_repo_relative_shares_classify_normalisation,
          test_checkpoint_names_unreadable_maintenance_and_audits, test_unreadable_backstop_status_is_a_warning,
          test_dead_pipeline_helpers_are_gone, test_failure_records_report_unreadable_manifests,
          test_spawn_maintenance_failure_is_logged, test_maintain_warns_on_unreadable_seals]
