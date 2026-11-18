@@ -25,6 +25,7 @@ sys.path.insert(0, str(PKG))
 import backstop  # noqa: E402
 import pipeline  # noqa: E402
 import report  # noqa: E402
+import screen  # noqa: E402
 import store  # noqa: E402
 
 PASSED: list[str] = []
@@ -142,7 +143,28 @@ def test_unreadable_backstop_status_is_a_warning(root: Path) -> None:
     assert rec["warnings"] == [] and json.loads(status.read_text(encoding="utf-8"))["consecutive_failures"] == 1
 
 
-TESTS = [test_checkpoint_names_unreadable_maintenance_and_audits, test_unreadable_backstop_status_is_a_warning,
+def test_repo_relative_shares_classify_normalisation(root: Path) -> None:
+    """SA11-CT-53: RepoIndex.relative normalises a path exactly as classify_path does
+    (Git-Bash drive form, ``.``/``..`` segments, cwd-relative), so an in-repository Edit
+    classify_path calls inside is never dropped from the edited list."""
+    repo = root / "Repo"
+    (repo / "src").mkdir(parents=True)
+    idx = screen.RepoIndex(repo)
+    win = str(repo).replace("\\", "/")
+    uses = [f"{win}/sub/../src/Alpha.py", f"{win}/./src/Alpha.py", f"'{win}/src/Alpha.py'"]
+    if len(win) > 1 and win[1] == ":":
+        uses.append(f"/{win[0].lower()}{win[2:]}/src/Alpha.py")  # Git-Bash /c/... form
+    for use in uses:
+        assert screen.classify_path(use, idx, None, []) is None, use
+        assert idx.relative(use) == "src/Alpha.py", (use, idx.relative(use))
+    assert idx.relative("Alpha.py", f"{win}/src") == "src/Alpha.py"
+    assert idx.relative("src/../src/Alpha.py") == "src/Alpha.py"
+    assert idx.relative(f"{win}/../elsewhere/x.py") is None
+    assert idx.relative("") is None
+
+
+TESTS = [test_repo_relative_shares_classify_normalisation,
+         test_checkpoint_names_unreadable_maintenance_and_audits, test_unreadable_backstop_status_is_a_warning,
          test_dead_pipeline_helpers_are_gone, test_failure_records_report_unreadable_manifests,
          test_spawn_maintenance_failure_is_logged, test_maintain_warns_on_unreadable_seals]
 

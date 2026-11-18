@@ -91,10 +91,11 @@ class RepoIndex:
         p = norm_path(path).lower()
         return p == self.root or p.startswith(self.root + "/")
 
-    def relative(self, path: str) -> str | None:
-        p = norm_path(path)
-        low = p.lower()
-        if low.startswith(self.root + "/"):
+    def relative(self, path: str, cwd: str | None = None) -> str | None:
+        """``path`` relative to the repository root (case kept), normalised as
+        ``classify_path`` normalises it; None when it is outside the root or unplaceable."""
+        p = resolve_use_path(path, msys_to_windows(cwd) if cwd else self.root)
+        if p is not None and p.lower().startswith(self.root + "/"):
             return p[len(self.root) + 1:]
         return None
 
@@ -135,8 +136,13 @@ def msys_to_windows(path: str) -> str:
     return MSYS_PATH_RE.sub(lambda mt: f"{mt.group(1).upper()}:", path.replace("\\", "/"), count=1)
 
 
-def classify_path(path: str, idx: RepoIndex, cwd: str | None, markers: list[str]) -> str | None:
-    """Category of one path use, or None when it is inside the repository."""
+def resolve_use_path(path: str, base: str) -> str | None:
+    """One path use as an absolute, normalised path (case kept): quotes stripped, ``~``
+    expanded, Git-Bash drive and extended-length prefixes mapped, a relative path joined to
+    ``base`` and ``.``/``..`` collapsed. None when it is empty or is drive-relative on a
+    drive other than ``base``'s (that drive's cwd is unknown). ``classify_path`` and
+    ``RepoIndex.relative`` share it, so a path one places inside the repository the other
+    does too."""
     raw = path.strip().strip("'\"")
     if not raw:
         return None
@@ -146,16 +152,24 @@ def classify_path(path: str, idx: RepoIndex, cwd: str | None, markers: list[str]
     ext = re.match(r"^//[?.]/(unc/)?", raw, re.IGNORECASE)  # Win32 extended-length / device prefixes, UNC form included
     if ext:
         raw = ("//" if ext.group(1) else "") + raw[ext.end():]
-    base = msys_to_windows(cwd) if cwd else idx.root
     rel_drive = re.match(r"^([A-Za-z]):(?!/)", raw)  # C:x is relative to that drive's own cwd
     if rel_drive:
         if base[:2].lower() != rel_drive.group(1).lower() + ":":
-            return "external_path"  # another drive's cwd is unknown, and the repo is not on it
+            return None
         raw = f"{base}/{raw[2:]}"
     elif not re.match(r"^(?:[A-Za-z]:/|/)", raw):
         raw = f"{base}/{raw}"
-    p = norm_path(raw).lower()
-    p = _resolve_dots(p)
+    return _resolve_dots(norm_path(raw))
+
+
+def classify_path(path: str, idx: RepoIndex, cwd: str | None, markers: list[str]) -> str | None:
+    """Category of one path use, or None when it is inside the repository."""
+    if not path.strip().strip("'\""):
+        return None
+    resolved = resolve_use_path(path, msys_to_windows(cwd) if cwd else idx.root)
+    if resolved is None:
+        return "external_path"  # another drive's cwd is unknown, and the repo is not on it
+    p = resolved.lower()
     if any(p == m or p.startswith(m + "/") for m in markers):
         return "memory_or_scratch"
     # A lane's worktree lives inside the main checkout; it is another session's, not this repo's.
@@ -432,12 +446,12 @@ def screen(m: dict[str, Any], obs: dict[str, Any], repo_root: Path, cwd: str | N
                     observed[cat].append(f"{name}:{p[:80]}")
                     cats_here.append(cat)
                 elif name in EDIT_TOOLS:
-                    rel = idx.relative(p) or idx.relative(f"{call_cwd or idx.root}/{p}")
+                    rel = idx.relative(p, call_cwd)
                     if rel and rel not in edited:
                         edited.append(rel)
                     first_edit_seen = True
                 elif name in READ_TOOLS and not first_edit_seen:
-                    rel = idx.relative(p)
+                    rel = idx.relative(p, call_cwd)
                     if rel and rel.lower() in untracked:
                         observed["untracked_input"].append(f"{name}:{rel[:80]}")
                         cats_here.append("untracked_input")
