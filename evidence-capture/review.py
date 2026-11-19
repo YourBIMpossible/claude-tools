@@ -208,10 +208,12 @@ def escaping_citations(brief: str) -> list[str]:
 # and bitmaps of the TREE, REUC and UNTR extensions and the bodies of EOIE and IEOT; names
 # and text are scanned as stored, and so is any other extension, link included.
 #
-# What a blanked field can hold: counts, flags, offsets, hashes and bitmaps are checked
-# against the rest of the copy (EOIE whole, IEOT against the entries, EWAH bitmaps against
-# their size, UNTR dir_flags against git's flags), so text cannot hide in them. Object ids
-# and stat data are arbitrary bytes by nature and cannot be checked without the object store
+# What a blanked field can hold: counts, flags, offsets and hashes are checked against the
+# rest of the copy (EOIE whole, IEOT against the entries, UNTR dir_flags against git's
+# flags), so text cannot hide in them. An EWAH bitmap is checked against its size, which
+# bounds it but does not empty it: a literal word is 8 bytes the size allows, so an UNTR
+# bitmap over 64 directory blocks can carry 8 bytes of text and one over 127 can carry 16
+# (measured on the `valid` bitmap). Object ids and stat data are arbitrary bytes by nature and cannot be checked without the object store
 # and the original files, so a crafted index can carry text in them, as it can in an entry:
 # they are blanked unbounded, in TREE, REUC and UNTR as in the entries, each a fixed width
 # at a position the parse fixes. A link body (the shared index id and two bitmaps over the
