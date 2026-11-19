@@ -157,8 +157,24 @@ class Fixture:
 
 
 def _git_status(repo: Path) -> str:
-    return subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1"], capture_output=True, text=True,
-                          env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}).stdout
+    """``git status --porcelain`` of ``repo``. A failed ``git status`` raises: its empty stdout
+    would otherwise read as a clean checkout (SA16-CT-24)."""
+    p = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1"], capture_output=True, text=True,
+                       env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if p.returncode != 0:
+        raise AssertionError(f"git status failed in {repo} (rc {p.returncode}): {p.stderr.strip()}")
+    return p.stdout
+
+
+def test_git_status_helper_raises_on_failure(root: Path) -> None:
+    """SA16-CT-24: a path git cannot read is an error, never an empty (clean) status."""
+    missing = root / "not-a-repo"
+    try:
+        _git_status(missing)
+    except AssertionError as exc:
+        assert "git status failed" in str(exc), exc
+    else:
+        raise AssertionError("_git_status returned for a path that is not a repository")
 
 
 # --------------------------------------------------------------------------- tests

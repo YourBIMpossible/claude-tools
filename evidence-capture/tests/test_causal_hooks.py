@@ -44,8 +44,23 @@ def git(repo: Path, *args: str) -> str:
 
 
 def status(repo: Path) -> str:
-    return subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"],
-                          capture_output=True, text=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}).stdout
+    """``git status --porcelain`` of ``repo``. A failed ``git status`` raises: its empty stdout
+    would otherwise read as a clean, unchanged checkout (SA16-CT-23)."""
+    p = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"],
+                       capture_output=True, text=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if p.returncode != 0:
+        raise AssertionError(f"git status failed in {repo} (rc {p.returncode}): {p.stderr.strip()}")
+    return p.stdout
+
+
+def test_status_helper_raises_on_failure(case: Path) -> None:
+    """SA16-CT-23: a path git cannot read is an error, never an empty (clean) status."""
+    try:
+        status(case / "not-a-repo")
+    except AssertionError as exc:
+        assert "git status failed" in str(exc), exc
+    else:
+        raise AssertionError("status returned for a path that is not a repository")
 
 
 def git_state(repo: Path) -> dict[str, bytes]:
@@ -485,7 +500,7 @@ def test_other_worktree_classification(root: Path) -> None:
     assert "other_worktree_unknown" in v["reasons"] and "other_worktree_moved" not in v["reasons"], v
 
 
-TESTS = [test_freeze_register_admit, test_start_end_preserved_and_attributed, test_unattributed_change_and_other_worktree,
+TESTS = [test_status_helper_raises_on_failure, test_freeze_register_admit, test_start_end_preserved_and_attributed, test_unattributed_change_and_other_worktree,
          test_sibling_branch_config_is_not_shared_state, test_start_budget_rule_snapshot_first,
          test_unsupported_reason_explicit, test_failures_are_explicit_and_fail_open,
          test_end_never_recorded_by_maintenance_or_twice, test_overlay_materializes_from_frozen_history,
