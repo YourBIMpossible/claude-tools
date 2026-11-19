@@ -177,20 +177,11 @@ def main() -> int:
     check("no pwsh: the PowerShell suites are left out with a line naming why",
           sum("no pwsh" in ln for ln in bare_skipped) == sum(n == "powershell" for _, n in gate.TEST_SUITES),
           str(bare_skipped))
-    no_pkg, no_pkg_skipped = gate.default_steps(REPO, "python", windows=True,
-                                                which=which_only("pwsh", "powershell.exe"),
-                                                has_module=lambda module: module != "evidence_compiler")
-    check("evidence_compiler missing: only its suite is left out, with the pinned install to run",
-          no_pkg_skipped == ["not run here (evidence_compiler not installed; pip install "
-                             f"\"{gate.EVIDENCE_COMPILER_SOURCE}\"): evidence-episodes/test_build_episodes.py"]
-          and "evidence-episodes/test_build_episodes.py" not in [s.label for s in no_pkg], str(no_pkg_skipped))
 
     print("CI runs this gate")
     workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     check("both CI jobs run `python tools/gate.py --verbose`", workflow.count("python tools/gate.py --verbose") == 2)
     check("CI runs on Linux and Windows", "ubuntu-latest" in workflow and "windows-latest" in workflow)
-    check("both CI jobs install evidence-compiler at the gate's pin, so its suite runs in CI",
-          workflow.count(f'python -m pip install "{gate.EVIDENCE_COMPILER_SOURCE}"') == 2)
 
     print("CI cost posture")
     workflows = REPO / ".github" / "workflows"

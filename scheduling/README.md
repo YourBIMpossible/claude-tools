@@ -38,9 +38,6 @@ Limits, both of Windows Script Host and not of the launcher:
 
 ## The tasks of this repository
 
-- **Evidence capture backstop:** `python capture.py backstop --task-xml PATH` writes a ready definition (review only,
-  nothing registers it). The action is `wscript.exe //B //Nologo <run-hidden.js> python.exe capture.py backstop`.
-  Use `python.exe`, not `pythonw.exe`: the `git` and `attrib` children then share the one hidden console.
 - **Graphify weekly refresh and health check:** action `wscript.exe`, arguments
   `//B //Nologo "<claude-tools>\scheduling\run-hidden.js" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<claude-tools>\graphify\Refresh-Graphs.ps1"`
   (and `Check-GraphifyHealth.ps1` for the health check). Keep each task in the signed-in user's session: the health

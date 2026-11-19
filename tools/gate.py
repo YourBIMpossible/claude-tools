@@ -54,7 +54,6 @@ DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 GITLEAKS_PIN = "8.18.4"  # the version ci.yml installs and bin/README.md pins
 # (suite, what it needs). "any": every machine. "windows": Windows only (it drives wscript.exe).
 # "powershell": a PowerShell host, set through GRAPHIFY_TEST_SHELL (pwsh 7 by default).
-# "evidence_compiler": that package importable (ci.yml installs it at EVIDENCE_COMPILER_PIN).
 TEST_SUITES = (
     ("tools/test_pre_publish_check.py", "any"),
     ("tools/test_pre_push_hook.py", "any"),
@@ -66,33 +65,11 @@ TEST_SUITES = (
     ("graphify/test_health_check.py", "powershell"),
     ("graphify/test_graphify_funnel.py", "any"),
     ("skillspector/test_skill_targets.py", "powershell"),
-    ("evidence-relevance/test_measure_relevance.py", "any"),
-    ("evidence-archive/test_evacuate_worktree.py", "any"),
-    ("evidence-capture/tests/test_capture.py", "any"),
-    ("evidence-capture/tests/test_locks.py", "any"),
-    ("evidence-capture/tests/test_identity.py", "any"),
-    ("evidence-capture/tests/test_review.py", "any"),
-    ("evidence-capture/tests/test_snapshot.py", "any"),
-    ("evidence-capture/tests/test_causal.py", "any"),
-    ("evidence-capture/tests/test_host_probe.py", "any"),
-    ("evidence-capture/tests/test_backstop.py", "any"),
-    ("evidence-capture/tests/test_causal_hooks.py", "any"),
-    ("evidence-capture/tests/test_clone.py", "any"),
-    ("evidence-capture/tests/test_hooks.py", "any"),
-    ("evidence-capture/tests/test_hygiene.py", "any"),
-    ("evidence-capture/tests/test_silent_skips.py", "any"),
-    ("evidence-capture/tests/test_sa11_followups.py", "any"),
-    ("evidence-episodes/test_build_episodes.py", "evidence_compiler"),
-    ("evidence-footprints/test_footprints.py", "any"),
-    ("evidence-footprints/test_blind_sheets.py", "any"),
-    ("evidence-twin/test_twin.py", "any"),
     ("scheduling/test_run_hidden.py", "windows"),
 )
 GUARD = ".github/scripts/check_machine_paths.py"
 MACHINE_PATHS_ALLOW = ".machine-paths-allow.json"
 GITLEAKS_CONFIG = ".gitleaks.toml"
-EVIDENCE_COMPILER_PIN = "1cdc625c4c18ea95994eaf424b039b06e9387d6c"  # the commit ci.yml installs
-EVIDENCE_COMPILER_SOURCE = "git+https://github.com/YourBIMpossible/evidence-compiler@" + EVIDENCE_COMPILER_PIN
 
 
 @dataclass
@@ -141,9 +118,6 @@ def default_steps(root: Path, python: str = sys.executable, windows: bool = os.n
                 skipped.append(f"not run here (no pwsh on PATH): {suite}")
             for name, shell in hosts:
                 steps.append(Step(f"{suite} ({name})", [python, suite], (("GRAPHIFY_TEST_SHELL", shell),)))
-        elif needs == "evidence_compiler" and not has_module(needs):
-            skipped.append(f"not run here (evidence_compiler not installed; pip install \"{EVIDENCE_COMPILER_SOURCE}\"):"
-                           f" {suite}")
         else:
             steps.append(Step(suite, [python, suite]))
     steps.append(Step("gitleaks secret scan", [python, "tools/gate.py", "--secret-scan", "--root", str(root)]))
