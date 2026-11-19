@@ -8,7 +8,10 @@
                        exit 0 committed, 2 written but the metadata commit failed
   rescreen             re-join and re-screen every joined episode; commit a corrections record;
                        exit 0 complete, 1 skipped, 2 commit failed, 3 incomplete (an episode
-                       unread, malformed, failed or deferred; the gaps go to standard error)
+                       unread, malformed, failed or deferred; the gaps go to standard error).
+                       3 is degraded, not failure: the corrections record is committed. It
+                       includes a child that ran without its job object (the OS refused it
+                       and the taskkill fallback contained the tree instead)
   fn-audit sheet       write the next blind FN-audit sheet (plan §5.3)
   fn-audit score K     score sealed sheet K
   fn-audit amended K --note TEXT --tool-commit SHA

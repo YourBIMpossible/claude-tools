@@ -227,6 +227,35 @@ def test_run_child_surfaces_process_tree_failures(root: Path) -> None:
     assert causes == ["process tree: tree kill: OSError: simulated"], causes
 
 
+def test_refused_job_object_is_degraded_exit_3(root: Path) -> None:
+    """SA16-CT-11: when the OS refuses the job object the child still runs under the taskkill
+    fallback and its result is kept, but the weaker containment is a child-failure cause, and
+    one such cause makes ``capture rescreen`` exit 3: degraded, not failed."""
+    import contextlib
+    import io
+
+    import capture
+    import rescreen
+
+    st = _stores(root)
+    cause = "process tree: job object: refused by the OS; fell back to taskkill /T"
+    if os.name == "nt":
+        reply = 'import json,sys; sys.stdin.read(); print(json.dumps({"outcome": "rescreened", "manifest": {}}))'
+        causes: list[str] = []
+        with _Patched(rescreen, _win_job_for=lambda proc: None):
+            outcome, done = rescreen.run_child(st, {"episode_id": "e"}, dict(os.environ), 60,
+                                               (sys.executable, "-c", reply), causes=causes)
+        assert (outcome, done) == ("rescreened", {}), (outcome, done)
+        assert causes == [cause], causes
+    res = {"action": "rescreened", "changed": [], "committed": True, "deferred": [], "manifests_malformed": [],
+           "manifests_unreadable": 0, "child_failures": [{"episode_id": "e", "cause": cause}]}
+    err = io.StringIO()
+    with _Patched(capture, _stores=lambda env: st), _Patched(rescreen, run_rescreen=lambda s, e: res),             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        got = capture.main(["rescreen"])
+    assert got == 3, got
+    assert "rescreen: incomplete: child_failures 1" in err.getvalue(), err.getvalue()
+
+
 def _content_store(root: Path):
     import store
 
@@ -426,6 +455,7 @@ TESTS = [
     test_reconcile_counts_and_logs_unreadable_packets,
     test_process_tree_records_kill_failures,
     test_run_child_surfaces_process_tree_failures,
+    test_refused_job_object_is_degraded_exit_3,
     test_unevaluable_cloud_attribute_guard_is_a_problem,
     test_git_failure_is_not_read_as_not_a_repository,
     test_failed_remote_listing_is_not_no_remote,
