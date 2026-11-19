@@ -325,13 +325,6 @@ def test_freeze_register_admit(root: Path) -> None:
     causal.validate_predicate([{"kind": "command", "argv": ["python", "-m", "pytest", "tests/test_alpha.py::k"],
                                 "target": "tests/test_alpha.py::k", "asserts": "alpha returns 3x+2"},
                                {"kind": "command", "argv": ["python", "-m", "pytest"], "asserts": "no regressions"}])
-    calls: list[str] = []
-    try:
-        causal_admit.launch(fx.stores, ep, lambda a: calls.append("ran"))
-        raise AssertionError("launch without a registration must refuse")
-    except causal_admit.RunRefused:
-        pass
-    assert calls == [], "the model launcher was called before authorization"
     probe = "import sys; sys.exit(0 if b'x * 3 + 2' in open('src/alpha.py','rb').read() else 1)"
     checks = [{"kind": "file_contains", "path": "src/alpha.py", "text": "x * 3 + 2"},
               {"kind": "command", "argv": ["python", "-c", probe], "target": "src/alpha.py",
@@ -352,19 +345,13 @@ def test_freeze_register_admit(root: Path) -> None:
     assert not bad & set(res["causal_reasons"]), res
     assert not any("fidelity" in r for r in res["causal_reasons"]), res
     assert "registered" in git(fx.stores.meta, "log", "-1", "--format=%s")
-    # tampering after registration: the guard refuses before any launch
+    # tampering after registration: verification fails and admission names it
     p = causal_admit.checks_path(fx.stores, ep)
     os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
     original = p.read_bytes()
     p.write_bytes(original.replace(b"x * 3 + 2", b"x * 3 + 9"))
     assert causal_admit.verify_registration(fx.stores, ep)[1], "tampered registration verified"
     assert "outcome_check_registration_unverified" in causal_admit.admit(fx.stores, ep)["causal_reasons"]
-    try:
-        causal_admit.launch(fx.stores, ep, lambda a: calls.append("ran"))
-        raise AssertionError("tampered registration must refuse")
-    except causal_admit.RunRefused:
-        pass
-    assert calls == []
     p.write_bytes(original)
     # a predicate already true at start does not measure the task
     sid2 = str(uuid.uuid4())

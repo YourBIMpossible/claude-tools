@@ -1,5 +1,5 @@
 """Commissioning admission for a captured episode: lazy history freeze, correctness-predicate
-registration, the full eligibility verdict and the run guard.
+registration and the full eligibility verdict.
 
 - ``freeze``: packs the repository history at the episode's end HEAD (which must contain
   the start HEAD) into ``content/causal/<ep>/history``. Lazy, so it runs only for
@@ -16,9 +16,9 @@ registration, the full eligibility verdict and the run guard.
   full (LFS-scanning) unsupported check, attribution, other-worktree classification,
   dependency drift, and the predicate run on start (must fail) and end (must pass).
   Anything missing is a reason; nothing missing is ever inferred as satisfied.
-- ``authorize_run`` / ``launch``: every commissioning launch goes through ``launch``, which
-  refuses unless the registration verifies and the episode is admitted, whatever the
-  output location.
+
+No launcher lives here: one that starts a commissioning run must first call
+``verify_registration`` and ``admit`` itself.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -167,28 +166,3 @@ def admit(stores: Stores, ep: str) -> dict[str, Any]:
             "causal_reasons": reasons, "check_results": rec.get("check_results"),
             "check_results_start": rec.get("check_results_start")}
 
-
-class RunRefused(RuntimeError):
-    """A commissioning launch was refused; nothing was started."""
-
-
-def authorize_run(stores: Stores, ep: str) -> dict[str, Any]:
-    """Raises ``RunRefused`` unless an immutable, verified predicate registration exists
-    and the episode is admitted."""
-    entry, probs = verify_registration(stores, ep)
-    if entry is None or probs is None:
-        raise RunRefused(f"{ep}: no verified predicate registration" + (f" ({', '.join(probs)})" if probs else ""))
-    if probs:
-        raise RunRefused(f"{ep}: registration does not verify ({', '.join(probs)})")
-    verdict = admit(stores, ep)
-    if not verdict["eligible"]:
-        raise RunRefused(f"{ep}: not admitted ({', '.join(verdict['admission_reasons'] + verdict['causal_reasons'])})")
-    return {"episode_id": ep, "registration_sha256": entry["sha256"]}
-
-
-def launch(stores: Stores, ep: str, run: Callable[[dict[str, Any]], Any]) -> Any:
-    """The only sanctioned entry to a commissioning run: ``run`` is called (with the
-    authorization) only after ``authorize_run`` succeeds."""
-    auth = authorize_run(stores, ep)
-    log_line(stores, f"causal launch {ep}: authorized {auth['registration_sha256']}")
-    return run(auth)

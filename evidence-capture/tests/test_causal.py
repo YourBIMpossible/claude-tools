@@ -740,6 +740,16 @@ def test_full_state_twin_stays_removed(tmp: Path) -> None:
     assert present == [], present
 
 
+def test_unwired_run_guard_stays_removed(tmp: Path) -> None:
+    """CT-SLOP1012-CAUSAL-DEAD-GATE: ``authorize_run`` / ``launch`` claimed to gate every
+    commissioning launch but nothing called them, so the gate they described did not exist.
+    A launcher must call ``verify_registration`` and ``admit``; the unwired guard stays out."""
+    import causal_admit
+
+    present = [name for name in ("authorize_run", "launch", "RunRefused") if hasattr(causal_admit, name)]
+    assert present == [], present
+
+
 # ------------------------------------------------------------------------ runner
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
