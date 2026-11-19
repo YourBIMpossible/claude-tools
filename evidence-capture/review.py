@@ -794,8 +794,12 @@ def review_episode(stores: Stores, m: dict[str, Any], inputs: ReviewInputs | Non
                 out["error"] = str(exc)
                 log_line(stores, f"review {ep}: snapshot deletion not verified: {exc}")
             touched.append(stores.meta / "DELETIONS.log")
-            retention.update(deleted_at=now, deleted_kind="snapshots",
-                             deletion_verified=bool(out["deletion"] and out["deletion"]["verified"]))
+            if out["deletion"] is None:
+                # not verified, so possibly still there: no ``deleted_at`` claims when it went
+                retention["deletion_verified"] = False
+            else:
+                retention.update(deleted_at=out["deletion"]["deleted_at"], deleted_kind="snapshots",
+                                 deletion_verified=bool(out["deletion"]["verified"]))
         if (stores.content / "causal" / ep).exists():  # causal states hold the same content
             try:
                 out["causal_deletion"] = verified_delete(stores, "causal", ep, f"excluded:{reason}")
@@ -861,17 +865,31 @@ def _adopt_payload(stores: Stores, ep: str, retention: dict[str, Any]) -> tuple[
 
 # ---------------------------------------------------------------------- seals and expiry
 
+SEAL_GIT_TIMEOUT_S = 30  # one seal probe; a git that hangs must not hang the expiry pass
+
+
 def _git_clean_tracked(path: Path) -> bool:
+    """``path`` is tracked and unmodified. A git that fails, times out or cannot start reads
+    as not clean, like any other git failure here: the seal is then not honoured."""
     cwd = str(path.parent)
-    tracked = subprocess.run(["git", "-C", cwd, "ls-files", "--error-unmatch", "--", path.name], capture_output=True)
-    if tracked.returncode != 0:
+    try:
+        tracked = subprocess.run(["git", "-C", cwd, "ls-files", "--error-unmatch", "--", path.name],
+                                 capture_output=True, timeout=SEAL_GIT_TIMEOUT_S)
+        if tracked.returncode != 0:
+            return False
+        same = subprocess.run(["git", "-C", cwd, "diff", "--quiet", "HEAD", "--", path.name],
+                              capture_output=True, timeout=SEAL_GIT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
         return False
-    same = subprocess.run(["git", "-C", cwd, "diff", "--quiet", "HEAD", "--", path.name], capture_output=True)
     return same.returncode == 0
 
 
 def _git_top(path: Path) -> Path | None:
-    proc = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], capture_output=True,
+                              text=True, timeout=SEAL_GIT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
     return Path(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip() else None
 
 

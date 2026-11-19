@@ -200,6 +200,52 @@ def test_sa11_both_deletion_errors_are_kept(root: Path) -> None:
     assert out["error"] == "snapshots not verified; causal not verified", out
 
 
+def test_cp21_unverified_deletion_is_not_stamped_deleted(root: Path) -> None:
+    """SA11-CP-21: a snapshot deletion that did not verify leaves no ``deleted_at`` on the
+    manifest; the content may still be there, so the manifest must not say when it went."""
+    st = tc.make_stores(root)
+    repo = tc.make_repo(root, "repo21")
+    m = tc.base_manifest("fix alpha")
+    ep = m["episode_id"]
+    store.write_manifest(st, m)
+    (st.snapshots / ep).mkdir(parents=True)
+
+    def refuse(stores: store.Stores, kind: str, e: str, why: str) -> dict[str, Any]:
+        raise store.StoreError(f"{kind} not verified")
+
+    inputs = review.ReviewInputs(repo, "fix alpha", "", {"cli_version": "9.9.9", "plugins": []})
+    with patched(review, "decide", lambda s, mm, i: ("excluded", "X1", None)),             patched(review, "verified_delete", refuse):
+        out = review.review_episode(st, m, inputs, commit=False)
+    assert out["error"] == "snapshots not verified", out
+    ret = json.loads(store.manifest_path(st, ep).read_text(encoding="utf-8"))["retention"]
+    assert ret.get("deleted_at") is None and ret.get("deleted_kind") is None, ret
+    assert ret["deletion_verified"] is False, ret
+    with patched(review, "decide", lambda s, mm, i: ("excluded", "X1", None)):
+        out = review.review_episode(st, m, inputs, commit=False)
+    ret = json.loads(store.manifest_path(st, ep).read_text(encoding="utf-8"))["retention"]
+    assert ret["deleted_at"] == out["deletion"]["deleted_at"] and ret["deleted_kind"] == "snapshots", ret
+    assert ret["deletion_verified"] is True, ret
+
+
+def test_cp22_seal_git_probes_are_bounded(root: Path) -> None:
+    """SA11-CP-22: the git probes behind a retention seal carry a timeout, and a probe that
+    times out or cannot start reads as "not clean" / "no repository", so the seal is not
+    honoured rather than the expiry pass hanging or dying."""
+    f = root / "seal.json"
+    f.write_text("{}", encoding="utf-8")
+    for exc in (subprocess.TimeoutExpired(["git"], 1), OSError("no git")):
+        seen: list[Any] = []
+
+        def run(argv: list[str], *a: Any, **k: Any) -> Any:
+            seen.append(k.get("timeout"))
+            raise exc
+
+        with patched(review.subprocess, "run", run):
+            assert review._git_clean_tracked(f) is False
+            assert review._git_top(root) is None
+        assert len(seen) == 2 and all(isinstance(t, (int, float)) and t > 0 for t in seen), seen
+
+
 def test_sa12_unreadable_git_config_raises(root: Path) -> None:
     """SA-12: a config git cannot parse is an error, not "no conversion settings"."""
     repo = tca.make_repo(root)
@@ -392,6 +438,7 @@ TESTS: list[Callable[[Path], None]] = [
     test_sa5_start_steps_share_one_budget, test_sa6_stuck_open_pointers_are_counted,
     test_sa7_unreadable_failure_records_cap_health, test_sa8_rescreen_child_failure_and_commit_failure_surface,
     test_sa10_expire_keeps_every_deletion, test_sa11_both_deletion_errors_are_kept,
+    test_cp21_unverified_deletion_is_not_stamped_deleted, test_cp22_seal_git_probes_are_bounded,
     test_sa12_unreadable_git_config_raises, test_sa13_unread_small_file_marks_lfs_scan_incomplete,
     test_sa14_failed_history_read_is_not_a_rewrite, test_sa15_x6_x7_are_unresolved_not_scope,
     test_sa26_8_lost_start_is_a_capture_failure, test_sa26_10_malformed_owner_review_is_ignored,
