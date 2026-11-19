@@ -29,7 +29,6 @@ FAILED: list[str] = []
 ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t",
        "GIT_CONFIG_NOSYSTEM": "1"}
-TOOLS = {"python": [sys.executable, "--version"]}
 
 
 def git(repo: Path, *args: str) -> str:
@@ -59,66 +58,60 @@ def raises(fn, text: str) -> None:
     raise AssertionError(f"expected CausalError({text})")
 
 
-# ------------------------------------------------------------------ states
+# ------------------------------------------------------------------ states (overlay path)
+
+NO_STATE = {"head": "0" * 40, "files": {}}  # an effective state with nothing moved, the shape ``attribute`` compares
 
 
-def test_state_roundtrip_raw_bytes_and_untracked(tmp: Path) -> None:
+def test_overlay_roundtrip_raw_bytes_untracked_not_ignored(tmp: Path) -> None:
     repo = make_repo(tmp)
     (repo / "new.bin").write_bytes(bytes(range(256)))
     (repo / ".gitignore").write_bytes(b"ignored.log\n")
     (repo / "ignored.log").write_bytes(b"secret")
-    rec = causal.capture_state(repo, tmp / "start", label="start")
-    assert "new.bin" in rec["files"] and "ignored.log" not in rec["files"]
+    rec = causal.capture_overlay(repo, tmp / "start", label="start")
+    assert "new.bin" in rec["files"] and "ignored.log" not in rec["files"], rec["files"]
+    assert "ignored.log" not in rec["bytes"], "an ignored file is not part of the worktree state"
     assert causal.verify_state(tmp / "start") == []
+    causal.freeze_history(repo, tmp / "h")
     out = tmp / "out"
-    causal.materialize(tmp / "start", out)
+    assert causal.materialize_overlay(tmp / "start", tmp / "h", out) == []
     assert (out / "a.txt").read_bytes() == b"one\r\ntwo\n"
     assert (out / "new.bin").read_bytes() == bytes(range(256))
+    assert not (out / "ignored.log").exists()
+    assert causal.verify_fidelity(tmp / "start", out) == []
 
 
-def test_state_immutable_and_never_overwritten(tmp: Path) -> None:
+def test_overlay_immutable_and_never_overwritten(tmp: Path) -> None:
     repo = make_repo(tmp)
-    causal.capture_state(repo, tmp / "s", label="start")
+    (repo / "a.txt").write_bytes(b"dirty\n")
+    causal.capture_overlay(repo, tmp / "s", label="start")
     obj = next((tmp / "s" / "objects").iterdir())
     assert not os.stat(obj).st_mode & stat.S_IWRITE
-    raises(lambda: causal.capture_state(repo, tmp / "s", label="start"), "never overwritten")
+    raises(lambda: causal.capture_overlay(repo, tmp / "s", label="start"), "never overwritten")
 
 
-def test_state_tamper_detected(tmp: Path) -> None:
+def test_overlay_tamper_detected(tmp: Path) -> None:
     repo = make_repo(tmp)
-    causal.capture_state(repo, tmp / "s", label="end")
-    obj = next((tmp / "s" / "objects").iterdir())
+    (repo / "a.txt").write_bytes(b"agent edit\n")
+    rec = causal.capture_overlay(repo, tmp / "s", label="end")
+    causal.freeze_history(repo, tmp / "h")
+    obj = tmp / "s" / "objects" / rec["files"]["a.txt"]["sha256"]
     os.chmod(obj, stat.S_IWRITE | stat.S_IREAD)
     obj.write_bytes(b"tampered")
     assert causal.verify_state(tmp / "s")
-    raises(lambda: causal.materialize(tmp / "s", tmp / "o"), "not intact")
+    problems = causal.materialize_overlay(tmp / "s", tmp / "h", tmp / "o")
+    assert any("a.txt" in p for p in problems), problems
+    assert not (tmp / "o").exists(), "a tampered state is never restored"
 
 
-def test_concurrent_change_fails_capture(tmp: Path) -> None:
-    repo = make_repo(tmp)
-    real = causal._scan
-    calls = {"n": 0}
-
-    def flaky(top: Path):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            (top / "a.txt").write_bytes(b"changed mid-capture")
-        return real(top)
-
-    causal._scan = flaky
-    try:
-        raises(lambda: causal.capture_state(repo, tmp / "s", label="end"), "concurrent_change")
-    finally:
-        causal._scan = real
-    assert not (tmp / "s").exists()
-
-
-def test_capture_leaves_source_untouched(tmp: Path) -> None:
+def test_overlay_capture_leaves_source_untouched(tmp: Path) -> None:
     repo = make_repo(tmp)
     (repo / "dirty.txt").write_bytes(b"d")
+    (repo / "a.txt").write_bytes(b"edited\n")
     index = (repo / ".git" / "index").read_bytes()
     status = git(repo, "status", "--porcelain")
-    causal.capture_state(repo, tmp / "s", label="start")
+    causal.capture_overlay(repo, tmp / "s", label="start")
+    causal.freeze_history(repo, tmp / "h")
     causal.unsupported_state(repo)
     assert (repo / ".git" / "index").read_bytes() == index
     assert git(repo, "status", "--porcelain") == status
@@ -141,26 +134,6 @@ def test_history_self_contained_without_source(tmp: Path) -> None:
     assert causal.restore_history(tmp / "h", bare) == head
     assert not (bare / "objects" / "info" / "alternates").exists()
     assert git(bare, "log", "--format=%s", "replay").split() == ["two", "init"]
-
-
-def test_raw_bytes_survive_hostile_attributes(tmp: Path) -> None:
-    repo = make_repo(tmp, {".gitattributes": b"*.txt text eol=crlf\n*.dat filter=up\n",
-                           "a.txt": b"lf\nonly\n", "b.dat": b"lower\n"})
-    git(repo, "config", "filter.up.smudge", "tr a-z A-Z")
-    git(repo, "config", "filter.up.clean", "cat")
-    causal.freeze_history(repo, tmp / "h")
-    bare = tmp / "r.git"
-    causal.restore_history(tmp / "h", bare)
-    wt = tmp / "wt"
-    subprocess.run(["git", "clone", "-q", "--no-local", "-b", "replay", str(bare), str(wt)], check=True, env=ENV,
-                   capture_output=True)
-    os.remove(wt / "a.txt")
-    os.remove(wt / "b.dat")
-    causal.neutralize_attributes(wt / ".git")
-    subprocess.run(["git", *causal.RAW_GIT_ARGS, "-c", "filter.up.smudge=tr a-z A-Z", "-C", str(wt),
-                    "checkout", "-q", "--", "."], check=True, env=ENV, capture_output=True)
-    assert (wt / "a.txt").read_bytes() == b"lf\nonly\n"
-    assert (wt / "b.dat").read_bytes() == b"lower\n"
 
 
 # ------------------------------------------------------------------ exclusions
@@ -192,14 +165,15 @@ def test_lfs_pointer_file_detected(tmp: Path) -> None:
 
 def test_attribution_isolated_and_concurrent_writer(tmp: Path) -> None:
     repo = make_repo(tmp)
-    start = causal.capture_state(repo, tmp / "s", label="start")
+    start = causal.capture_overlay(repo, tmp / "s", label="start")
     (repo / "a.txt").write_bytes(b"agent edit")
     (repo / "pkg" / "new.py").write_bytes(b"x = 1\n")
-    end = causal.capture_state(repo, tmp / "e", label="end")
+    end = causal.capture_overlay(repo, tmp / "e", label="end")
+    s_eff, e_eff = causal.effective_oids(repo, start, end)
     top = str(repo)
-    ok = causal.attribute(start, end, [f"{top}\\a.txt", "./pkg/new.py"], top=top)
-    assert ok["isolated"] and ok["changed"] == ["a.txt", "pkg/new.py"]
-    bad = causal.attribute(start, end, ["a.txt"], top=top)
+    ok = causal.attribute(s_eff, e_eff, [f"{top}\\a.txt", "./pkg/new.py"], top=top)
+    assert ok["isolated"] and ok["changed"] == ["a.txt", "pkg/new.py"], ok
+    bad = causal.attribute(s_eff, e_eff, ["a.txt"], top=top)
     assert bad["unattributed"] == ["pkg/new.py"] and not bad["isolated"]
 
 
@@ -216,63 +190,65 @@ def test_other_worktree_movement_detected(tmp: Path) -> None:
     assert list(before) and all(v != "missing" for v in before.values())
     (other / "a.txt").write_bytes(b"someone else")
     after = fingerprints(repo)
-    s = causal.capture_state(repo, tmp / "s", label="start")
-    res = causal.attribute(s, s, [], worktrees_start=before, worktrees_end=after)
+    res = causal.attribute(NO_STATE, NO_STATE, [], worktrees_start=before, worktrees_end=after)
     assert res["other_worktrees_moved"] and not res["isolated"]
-    assert causal.attribute(s, s, [], worktrees_start=before, worktrees_end=before)["isolated"]
+    assert causal.attribute(NO_STATE, NO_STATE, [], worktrees_start=before, worktrees_end=before)["isolated"]
 
 
 # ------------------------------------------------------------------ dependencies
 
 
-def test_dependency_fingerprint_and_drift(tmp: Path) -> None:
+def _deps(state: dict, tools: dict | None = None) -> dict:
+    """The ``dependency_drift`` input the end hook builds from an ``effective_oids`` state."""
+    return {"lockfiles": causal.lockfile_oids(state), "tools": tools or {}}
+
+
+def test_dependency_drift_from_effective_states(tmp: Path) -> None:
     repo = make_repo(tmp)
-    s = causal.capture_state(repo, tmp / "s", label="start")
-    fs = causal.dependency_fingerprint(s, TOOLS)
-    assert list(fs["lockfiles"]) == ["pkg/requirements.txt"] and fs["tools"]["python"].startswith("Python")
-    assert causal.dependency_fingerprint(s, {"nope": ["definitely-not-a-tool-xyz"]})["tools"]["nope"] == "absent"
+    start = causal.capture_overlay(repo, tmp / "s", label="start")
     (repo / "pkg" / "requirements.txt").write_bytes(b"x==2\n")
-    e = causal.capture_state(repo, tmp / "e", label="end")
-    fe = causal.dependency_fingerprint(e, TOOLS)
-    assert causal.dependency_drift(fs, fe, []) == ["lockfile:pkg/requirements.txt"]
-    assert causal.dependency_drift(fs, fe, ["pkg/requirements.txt"]) == []
-    fe["tools"]["python"] = "Python 0.0"
-    assert causal.dependency_drift(fs, fe, ["pkg/requirements.txt"]) == ["tool:python"]
+    (repo / "a.txt").write_bytes(b"not a lockfile\n")
+    end = causal.capture_overlay(repo, tmp / "e", label="end")
+    s_eff, e_eff = causal.effective_oids(repo, start, end)
+    assert list(causal.lockfile_oids(s_eff)) == ["pkg/requirements.txt"] == list(causal.lockfile_oids(e_eff))
+    assert causal.dependency_drift(_deps(s_eff), _deps(e_eff), []) == ["lockfile:pkg/requirements.txt"]
+    assert causal.dependency_drift(_deps(s_eff), _deps(e_eff), [str(repo / "pkg" / "requirements.txt")],
+                                   top=str(repo)) == []
+    drift = causal.dependency_drift(_deps(s_eff, {"python": "Python 3.0"}), _deps(e_eff, {"python": "Python 0.0"}),
+                                    ["pkg/requirements.txt"])
+    assert drift == ["tool:python"], drift
+    same_s, same_e = causal.effective_oids(repo, end, end)
+    assert causal.lockfile_oids(same_s) == causal.lockfile_oids(e_eff)
+    assert causal.dependency_drift(_deps(same_s), _deps(same_e), []) == [], "nothing moved, no drift"
 
 
 # ------------------------------------------------------------------ outcome checks
 
 
-def _registry(tmp: Path, body: object) -> Path:
-    p = tmp / "registry.json"
-    p.write_text(json.dumps(body))
-    return p
-
-
-def test_registry_validation(tmp: Path) -> None:
-    raises(lambda: causal.load_registry(_registry(tmp, {"x": 1})), "'tasks'")
-    raises(lambda: causal.load_registry(_registry(tmp, {"tasks": {"t": {"checks": []}}})), "no checks")
-    raises(lambda: causal.load_registry(_registry(tmp, {"tasks": {"t": {"checks": [{"kind": "llm"}]}}})),
-           "unknown check kind")
-    raises(lambda: causal.load_registry(_registry(tmp, {"tasks": {"t": {"checks": [{"kind": "command"}]}}})),
-           "argv")
+def test_predicate_validation(tmp: Path) -> None:
+    raises(lambda: causal.validate_predicate([]), "no checks")
+    raises(lambda: causal.validate_predicate([{"kind": "llm"}]), "unknown check kind")
+    raises(lambda: causal.validate_predicate([{"kind": "command"}]), "argv")
+    raises(lambda: causal.validate_predicate([{"kind": "file_absent"}]), "needs path")
+    causal.validate_predicate([{"kind": "file_contains", "path": "a.txt", "text": "x"}])
 
 
 def test_checks_run_on_materialized_end_state_only(tmp: Path) -> None:
     repo = make_repo(tmp)
     (repo / "a.txt").write_bytes(b"fixed: yes\n")
-    causal.capture_state(repo, tmp / "e", label="end")
+    causal.capture_overlay(repo, tmp / "e", label="end")
+    causal.freeze_history(repo, tmp / "h")
     (repo / "a.txt").write_bytes(b"live checkout changed later\n")
     out = tmp / "m"
-    causal.materialize(tmp / "e", out)
-    reg = causal.load_registry(_registry(tmp, {"tasks": {"t1": {"checks": [
+    assert causal.materialize_overlay(tmp / "e", tmp / "h", out) == []
+    checks = [
         {"kind": "file_contains", "path": "a.txt", "text": "fixed: yes"},
         {"kind": "file_sha256", "path": "a.txt", "sha256": causal.sha256_bytes(b"fixed: yes\n")},
         {"kind": "file_absent", "path": "gone.txt"},
         {"kind": "command", "argv": [sys.executable, "-c", "import sys; sys.exit(open('a.txt').read()!='fixed: yes\\n')"]},
         {"kind": "file_contains", "path": "../escape.txt", "text": "x"},
-    ]}}}))
-    res = causal.run_checks(reg["t1"], out)
+    ]
+    res = causal.run_checks(checks, out)
     assert [r["passed"] for r in res] == [True, True, True, True, None], res
     assert res[4]["error"] == "CausalError"
 
@@ -325,28 +301,33 @@ def test_end_to_end_synthetic_episode(tmp: Path) -> None:
     repo = make_repo(tmp)
     ep = tmp / "episode"
     wt0 = fingerprints(repo)
-    s = causal.capture_state(repo, ep / "start", label="start")
+    s = causal.capture_overlay(repo, ep / "start", label="start")
     causal.freeze_history(repo, ep / "history")
-    d0 = causal.dependency_fingerprint(s, TOOLS)
     (repo / "a.txt").write_bytes(b"done\n")
-    e = causal.capture_state(repo, ep / "end", label="end")
-    causal.materialize(ep / "end", tmp / "m")
+    e = causal.capture_overlay(repo, ep / "end", label="end")
+    s_eff, e_eff = causal.effective_oids(repo, s, e)
+    tools = {"python": sys.version.split()[0]}
+    assert causal.materialize_overlay(ep / "end", ep / "history", tmp / "m") == []
+    assert causal.materialize_overlay(ep / "start", ep / "history", tmp / "m0") == []
     checks = [{"kind": "file_contains", "path": "a.txt", "text": "done"}]
+    causal.validate_predicate(checks)
     record = {"identity_accepted": True,
               "start_problems": causal.verify_state(ep / "start"),
               "end_problems": causal.verify_state(ep / "end"),
               "history_problems": causal.verify_history(ep / "history"),
+              "start_fidelity": causal.verify_fidelity(ep / "start", tmp / "m0"),
+              "end_fidelity": causal.verify_fidelity(ep / "end", tmp / "m"),
               "unsupported": causal.unsupported_state(repo),
-              "attribution": causal.attribute(s, e, ["a.txt"], worktrees_start=wt0,
+              "attribution": causal.attribute(s_eff, e_eff, ["a.txt"], worktrees_start=wt0,
                                               worktrees_end=fingerprints(repo)),
-              "dependency_drift": causal.dependency_drift(d0, causal.dependency_fingerprint(e, TOOLS), ["a.txt"]),
-              "start_fidelity": [], "end_fidelity": [], "registration_problems": [],
+              "dependency_drift": causal.dependency_drift(_deps(s_eff), _deps(e_eff), ["a.txt"])
+              + causal.tool_drift(tools, tools),
+              "registration_problems": [],
               "worktrees": {"contaminating": [], "unknown": [], "shared_state_changed": False},
-              "checks": checks, "check_results": causal.run_checks(checks, tmp / "m")}
-    causal.materialize(ep / "start", tmp / "m0")
-    record["check_results_start"] = causal.run_checks(checks, tmp / "m0")
+              "checks": checks, "check_results": causal.run_checks(checks, tmp / "m"),
+              "check_results_start": causal.run_checks(checks, tmp / "m0")}
     assert causal.admit(record)["eligible"], causal.admit(record)
-    assert record["check_results"][0]["passed"] is True
+    assert record["check_results"][0]["passed"] is True and record["check_results_start"][0]["passed"] is False
 
 
 # ------------------------------------------------------------ worktree status failure
@@ -417,9 +398,8 @@ def test_worktree_status_failure_is_unknown_not_unmoved(tmp: Path) -> None:
         assert cls["unknown"] == [key] and not cls["unrelated"] and not cls["contaminating"], cls
         assert "other_worktree_unknown" in causal.admit({"worktrees": cls})["reasons"]
     # ``attribute`` never treats an unobserved fingerprint as unmoved.
-    s = causal.capture_state(repo, tmp / "s", label="start")
     fps = {k: v["fp"] for k, v in broken.items()}
-    att = causal.attribute(s, s, [], worktrees_start=fps, worktrees_end=fps)
+    att = causal.attribute(NO_STATE, NO_STATE, [], worktrees_start=fps, worktrees_end=fps)
     assert att["other_worktrees_moved"] == [key] and not att["isolated"]
 
 
@@ -503,9 +483,8 @@ def test_nested_worktree_without_marker_is_unknown(tmp: Path) -> None:
         cls = causal.classify_worktrees(s_, e_, shared_start="s", shared_end="s", calls=[], subagents_unresolved=0)
         assert cls["unknown"] == [key] and not cls["unrelated"], cls
         assert not causal.admit({"worktrees": cls})["eligible"]
-    st = causal.capture_state(repo, tmp / "s", label="start")
     fps = {k: v["fp"] for k, v in before.items()}
-    assert not causal.attribute(st, st, [], worktrees_start=fps, worktrees_end=fps)["isolated"]
+    assert not causal.attribute(NO_STATE, NO_STATE, [], worktrees_start=fps, worktrees_end=fps)["isolated"]
 
 
 def test_worktree_toplevel_probes_run_beside_the_statuses(tmp: Path) -> None:
@@ -708,23 +687,24 @@ def test_sibling_elsewhere_is_unrelated_and_the_predicate_decides(tmp: Path) -> 
     repo, side = _repo_with_sibling(tmp)
     ep = tmp / "episode"
     ws, ss = causal.worktree_records(repo), causal.shared_git_state(repo)
-    s = causal.capture_state(repo, ep / "start", label="start")
+    s = causal.capture_overlay(repo, ep / "start", label="start")
     causal.freeze_history(repo, ep / "history")
     (repo / "a.txt").write_bytes(b"done\n")  # the agent's write
     (side / "side.txt").write_bytes(b"other lane\n")  # the sibling, elsewhere
     git(side, "branch", "-u", "origin/main")
-    e = causal.capture_state(repo, ep / "end", label="end")
+    e = causal.capture_overlay(repo, ep / "end", label="end")
+    s_eff, e_eff = causal.effective_oids(repo, s, e)
     we, se = causal.worktree_records(repo), causal.shared_git_state(repo)
     calls = [{"input": {"file_path": str(repo / "a.txt"), "content": "done\n"}}]
     key = next(iter(we))
     cls = causal.classify_worktrees(ws, we, shared_start=ss, shared_end=se, calls=calls, subagents_unresolved=0,
                                     top=str(repo))
     assert cls == {"contaminating": [], "unrelated": [key], "unknown": [], "shared_state_changed": False}, cls
-    att = causal.attribute(s, e, ["a.txt"], top=str(repo), worktrees_start={k: v["fp"] for k, v in ws.items()},
+    att = causal.attribute(s_eff, e_eff, ["a.txt"], top=str(repo), worktrees_start={k: v["fp"] for k, v in ws.items()},
                            worktrees_end={k: v["fp"] for k, v in we.items()})
     assert att["unattributed"] == [] and att["other_worktrees_moved"] == [key] and not att["isolated"], att
-    causal.materialize(ep / "start", tmp / "m0")
-    causal.materialize(ep / "end", tmp / "m1")
+    assert causal.materialize_overlay(ep / "start", ep / "history", tmp / "m0") == []
+    assert causal.materialize_overlay(ep / "end", ep / "history", tmp / "m1") == []
     record = {"identity_accepted": True, "start_problems": causal.verify_state(ep / "start"),
               "end_problems": causal.verify_state(ep / "end"), "history_problems": causal.verify_history(ep / "history"),
               "unsupported": causal.unsupported_state(repo), "start_fidelity": [], "end_fidelity": [],
@@ -743,6 +723,21 @@ def test_sibling_elsewhere_is_unrelated_and_the_predicate_decides(tmp: Path) -> 
     assert cls2["contaminating"] == [key] and cls2["shared_state_changed"] is True, cls2
     assert causal.admit({**record, "worktrees": cls2})["reasons"][:2] == [
         "shared_git_state_changed", "other_worktree_contaminating"]
+
+
+# ------------------------------------------------------------------ dead-code guard
+
+
+DEAD_TWIN = ("capture_state", "materialize", "neutralize_attributes", "dependency_fingerprint", "load_registry",
+             "_scan", "DEFAULT_TOOLS", "STATE_VERSION", "NEUTRAL_ATTRIBUTES", "RAW_GIT_ARGS", "_tool_version")
+
+
+def test_full_state_twin_stays_removed(tmp: Path) -> None:
+    """SA-3 / SA11-CT-4 / SA16-CT-5: the full-state twin (capture, restore, fingerprint,
+    registry) had tests but no production caller, so its coverage was false. The hooks use
+    the overlay path only; the twin must not come back as an untested-in-production copy."""
+    present = [name for name in DEAD_TWIN if hasattr(causal, name)]
+    assert present == [], present
 
 
 # ------------------------------------------------------------------------ runner

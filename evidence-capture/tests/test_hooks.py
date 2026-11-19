@@ -212,10 +212,40 @@ def test_fail_open(root: Path) -> None:
     assert not list(fx.stores.manifests.glob("cap_*.json")), "no manifest on an unusable store"
     pend = (fx.tmp / pipeline.PENDING_NAME).read_text(encoding="utf-8").splitlines()
     assert len(pend) == 2 and all(PROMPT not in line for line in pend), pend
-    # a crash inside the pipeline is caught by the wrapper
+    # SA11-CT-57: rc 0 alone cannot tell "caught and logged" from "never ran"; every case
+    # below must also leave its line. The metadata store path is a file: not a crash, the
+    # pipeline refuses the store and says so (the temp-dir log, since capture.log is unreachable).
+    fail_log = fx.tmp / "ec-capture-failures.log"
+
+    def new_log_lines(before: list[str]) -> list[str]:
+        return (fail_log.read_text(encoding="utf-8").splitlines() if fail_log.is_file() else [])[len(before):]
+
+    before = new_log_lines([])
     broken = {**fx.env, "EC_CAPTURE_META": str(fx.repo / "README.md")}
     rc, out, _ = dryrun.run_hook("capture_start.py", {"session_id": sid, "prompt": PROMPT, "cwd": str(fx.repo)}, broken)
     assert rc == 0 and out == b""
+    lines = new_log_lines(before)
+    assert any("store_unusable" in line for line in lines), ("the unusable store was not logged", lines)
+    # a real crash inside the pipeline (injected through sitecustomize) is caught by the
+    # wrapper and logged with its type, never with prompt content
+    shim = root / "crash_shim"
+    shim.mkdir()
+    (shim / "sitecustomize.py").write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(PKG)!r})\n"
+        "import pipeline\n"
+        "def run_start(payload, env):\n"
+        "    raise RuntimeError('injected pipeline crash')\n"
+        "pipeline.run_start = run_start\n", encoding="utf-8")
+    crashing = {**broken, "PYTHONPATH": str(shim)}
+    before = new_log_lines([])
+    rc, out, _ = dryrun.run_hook("capture_start.py", {"session_id": sid, "prompt": PROMPT, "cwd": str(fx.repo)},
+                                 crashing)
+    assert rc == 0 and out == b"", (rc, out)
+    lines = new_log_lines(before)
+    assert any("start: RuntimeError: injected pipeline crash" in line for line in lines), \
+        ("the caught crash was not logged", lines)
+    assert not any(PROMPT in line for line in lines), "the crash line holds no prompt content"
 
 
 def test_unwritable_pending_is_lost_not_silent(root: Path) -> None:
@@ -875,6 +905,10 @@ TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 def main() -> int:
     require_yaml("test_hooks")
     only = sys.argv[1:]
+    unknown = sorted(set(only) - {fn.__name__ for fn in TESTS})
+    if unknown:  # SA11-CT-35: a filter that matches nothing is a usage error, not "0 passed"
+        print(f"unknown test name(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
     with tempfile.TemporaryDirectory(prefix="ec-hooks-test-") as tmp:
         for fn in TESTS:
             if only and fn.__name__ not in only:

@@ -56,7 +56,11 @@ def _attempt(kind: str, path: Path) -> str:
         elif kind == "resolve":
             os.stat(path)
             if path.is_dir():
-                os.listdir(path)
+                try:
+                    os.listdir(path)
+                except PermissionError:
+                    # still a denial, but the path's existence was resolved: record it
+                    return "denied:listdir (stat succeeded)"
         elif kind == "write":
             probe = path / f"isolation-probe-{os.getpid()}"
             with probe.open("xb") as fh:
@@ -79,19 +83,29 @@ def _attempt(kind: str, path: Path) -> str:
         return f"error:{type(exc).__name__}"
 
 
+def is_denied(outcome: str) -> bool:
+    """True for an access error: ``denied``, or ``denied:<detail>`` (a recorded partial denial)."""
+    return outcome == "denied" or outcome.startswith("denied:")
+
+
 def identity() -> dict[str, str | None]:
-    """The identity this process runs as: user name and, on Windows, the SID."""
+    """The identity this process runs as: user name and, on Windows, the SID.
+    ``sid_error`` says why the SID could not be read (None when it was, or off Windows)."""
     name = os.environ.get("USERNAME") or os.environ.get("USER")
     sid = None
+    sid_error = None
     if os.name == "nt":
         try:
-            out = subprocess.run(["whoami.exe", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True,
-                                 timeout=30).stdout
-            row = next(csv.reader(io.StringIO(out)))
-            name, sid = row[0], row[1]
-        except (OSError, StopIteration, IndexError, subprocess.SubprocessError):
-            pass
-    return {"name": name, "sid": sid}
+            proc = subprocess.run(["whoami.exe", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True,
+                                  timeout=30)
+            if proc.returncode != 0:
+                sid_error = f"whoami rc={proc.returncode}"
+            else:
+                row = next(csv.reader(io.StringIO(proc.stdout)))
+                name, sid = row[0], row[1]
+        except (OSError, StopIteration, IndexError, subprocess.SubprocessError) as exc:
+            sid_error = f"{type(exc).__name__}: {exc}"[:200]
+    return {"name": name, "sid": sid, "sid_error": sid_error}
 
 
 def probe_main(spec: str) -> int:
@@ -210,7 +224,7 @@ def check_isolation(targets: list[dict[str, str]], *, watch: list[Path], repos: 
         for name in [n for n in before[key] if n in after[key]]:  # an unread side is in state_unreadable
             if before[key][name] != after[key][name]:
                 record["state_changed"].append(f"{key}:{name}")
-    record["failures"] += [f"{a['name']}:{a['outcome']}" for a in record["attempts"] if a["outcome"] != "denied"]
+    record["failures"] += [f"{a['name']}:{a['outcome']}" for a in record["attempts"] if not is_denied(a["outcome"])]
     record["failures"] += record["state_changed"]
     record["failures"] += record["state_unreadable"]
     if proc.returncode != 0:

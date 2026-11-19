@@ -49,8 +49,11 @@ common=$(cd "$repo" && cd "$(git rev-parse --git-common-dir)" && pwd) || { echo 
 
 if [ -n "${BIMP_PREPUSH_BYPASS:-}" ]; then
     log="$common/prepush-bypass.log"
-    printf '%s pre-push bypass: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BIMP_PREPUSH_BYPASS" >> "$log"
-    echo "pre-push: gate BYPASSED ($BIMP_PREPUSH_BYPASS) - logged to $log" >&2
+    if printf '%s pre-push bypass: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BIMP_PREPUSH_BYPASS" >> "$log"; then
+        echo "pre-push: gate BYPASSED ($BIMP_PREPUSH_BYPASS) - logged to $log" >&2
+    else  # never claim an audit line that was not written
+        echo "pre-push: gate BYPASSED ($BIMP_PREPUSH_BYPASS) - WARNING: NOT logged, cannot append to $log" >&2
+    fi
     exit 0
 fi
 

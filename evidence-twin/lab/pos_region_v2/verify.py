@@ -1,7 +1,5 @@
 """Verify pos_region_v2: exit 0 when the task is done. Synthetic example — contains no private repository data or production findings."""
-import importlib
 import re
-import subprocess
 import sys
 from pathlib import Path
 

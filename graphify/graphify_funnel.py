@@ -36,9 +36,12 @@ Config (graphify.local.json beside this script, or --config), validated before a
 Relative config paths resolve against the config file's folder, as in GraphifyConfig.ps1.
 
 Input problems (missing/unreadable/corrupt query log, unreadable or undated transcripts,
-missing subagent metadata) are counted in the JSON "inputs" block and listed in the report;
+unreadable git repos) are counted in the JSON "inputs" block and listed in the report;
 they are never read as low volume, and while any is present no stage can PASS (a PASS is
-capped to INSUFFICIENT EVIDENCE; a FAIL stands).
+capped to INSUFFICIENT EVIDENCE; a FAIL stands). Agents of unknown type (missing subagent
+metadata, unreadable agent definitions, plugin agents) are judged shell-capable, the worst case
+for routing, so they are listed as notes ("inputs.notes") and cap no verdict; their bypasses are
+unproven, so routing FAILs only on a bypass by a unit known to have a shell.
 
 Run: python graphify_funnel.py [--days 7] [--out report.md] [--json summary.json]
 """
@@ -243,6 +246,9 @@ AGENT_TOOLS = {"Agent", "Task"}
 EXPLORE_AGENT_TYPES = {"Explore", "general-purpose", "Plan"}   # spawn statistics only
 # Built-in subagent types without a shell; custom ones are judged by their definition.
 NO_SHELL_AGENTS = {"claude-code-guide", "statusline-setup"}
+# Built-in subagent types that have a shell without any definition file (a fork inherits the
+# parent's tools). A project or user definition of the same name still takes precedence.
+SHELL_BUILTIN_AGENTS = {"general-purpose", "Explore", "Plan", "fork"}
 
 # Shell commands read from a Bash/PowerShell call, per command segment (lowercased).
 SHELL_CD_CMDS = {"cd", "pushd", "chdir", "set-location", "sl", "push-location"}
@@ -264,7 +270,6 @@ _PATHLIKE_RE = re.compile(r"^[\w.~\-\\/: ]+$")
 _GLOB_CHARS = "*?[{"
 
 # Routing heuristic thresholds (tool counts are a proxy for "cross-file exploration").
-SHELL_TOOLS = ("Bash", "PowerShell")
 AGENT_DEF_MAX_BYTES = 256 << 10
 _LIST_SPLIT_RE = re.compile(r",(?![^()]*\))")  # commas outside Bash(...) patterns
 SUBAGENT_MIN_LOOKUPS = 3      # searches + reads for a subagent of any type
@@ -1072,10 +1077,6 @@ def match_records(calls: list[Call], records: list[dict]) -> None:
             free.remove(cands[0])
 
 
-def coverage(session: Session) -> Callable[[str], bool]:
-    return coverage_for(session.resolved, session.repo)
-
-
 def coverage_for(resolved: dict | None, repo: str | None) -> Callable[[str], bool]:
     """Path predicate for the code a resolved graph covers.
 
@@ -1103,11 +1104,17 @@ def coverage_for(resolved: dict | None, repo: str | None) -> Callable[[str], boo
     return in_scope
 
 
-def repo_identity(path: str, resolver) -> str | None:
-    """Main-checkout root of the git repo holding `path` (a worktree maps to its main checkout)."""
+def repo_identity(path: str, resolver, problems: list[str] | None = None) -> str | None:
+    """Main-checkout root of the git repo holding `path` (a worktree maps to its main checkout).
+
+    None when `path` is in no repo. A path whose repo cannot be read also returns None and, when
+    `problems` is given, is recorded there as "<path>: <error>" so the miss is an input problem.
+    """
     try:
         top = resolver._git_toplevel(Path(path).resolve())
-    except OSError:
+    except OSError as exc:
+        if problems is not None:
+            problems.append(f"{path}: {type(exc).__name__}")
         return None
     if top is None:
         return None
@@ -1115,8 +1122,8 @@ def repo_identity(path: str, resolver) -> str | None:
     return str(main or top)
 
 
-def repo_of(session: Session, resolver) -> str | None:
-    return repo_identity(session.cwd, resolver) if session.cwd else None
+def repo_of(session: Session, resolver, problems: list[str] | None = None) -> str | None:
+    return repo_identity(session.cwd, resolver, problems) if session.cwd else None
 
 
 # --------------------------------------------------------------------------- agent definitions
@@ -1166,11 +1173,13 @@ def _tool_names(value: str | list[str] | None) -> list[str] | None:
     return [t.strip() for t in items if t.strip()]
 
 
-def find_agent_definition(agent_type: str, cwd: str | None,
-                          user_agents: Path | None) -> dict[str, str | list[str]] | None:
+def find_agent_definition(agent_type: str, cwd: str | None, user_agents: Path | None,
+                          problems: list[str] | None = None) -> dict[str, str | list[str]] | None:
     """Frontmatter of the agent file whose `name` (or file stem) is agent_type.
 
-    Searched in .claude/agents from cwd upward (nearest wins), then in user_agents.
+    Searched in .claude/agents from cwd upward (nearest wins), then in user_agents. A folder or
+    file that cannot be read is skipped and, when `problems` is given, recorded there as
+    "<path>: <error>" so the miss is an input problem, not a silent "no definition".
     """
     dirs: list[Path] = []
     if cwd:
@@ -1181,13 +1190,17 @@ def find_agent_definition(agent_type: str, cwd: str | None,
     for d in dirs:
         try:
             paths = sorted(d.glob("*.md")) if d.is_dir() else []
-        except OSError:
+        except OSError as exc:
+            if problems is not None:
+                problems.append(f"{d}: {type(exc).__name__}")
             continue
         for path in paths:
             try:
                 with open(path, "rb") as f:
                     text = f.read(AGENT_DEF_MAX_BYTES).decode("utf-8", errors="replace")
-            except OSError:
+            except OSError as exc:
+                if problems is not None:
+                    problems.append(f"{path}: {type(exc).__name__}")
                 continue
             fm = parse_frontmatter(text)
             if fm is None:
@@ -1198,9 +1211,9 @@ def find_agent_definition(agent_type: str, cwd: str | None,
     return None
 
 
-def agent_has_shell(agent_type: str | None, cwd: str | None,
-                    user_agents: Path | None) -> bool | None:
-    """False when the agent provably has no Bash/PowerShell; None when its definition is unknown.
+def agent_has_shell(agent_type: str | None, cwd: str | None, user_agents: Path | None,
+                    problems: list[str] | None = None) -> bool | None:
+    """True/False when the agent provably has / has no Bash/PowerShell; None when its tools are unknown.
 
     A `tools` field absent or `*` means every tool; a pattern grant such as Bash(git:*)
     counts as a shell; only a bare entry in disallowedTools removes one.
@@ -1211,9 +1224,9 @@ def agent_has_shell(agent_type: str | None, cwd: str | None,
         return False
     if ":" in agent_type:
         return None
-    fm = find_agent_definition(agent_type, cwd, user_agents)
+    fm = find_agent_definition(agent_type, cwd, user_agents, problems)
     if fm is None:
-        return None
+        return True if agent_type in SHELL_BUILTIN_AGENTS else None
     tools = _tool_names(fm.get("tools"))
     denied = set(_tool_names(fm.get("disallowedTools")) or [])
     if not tools or "*" in tools:
@@ -1242,14 +1255,30 @@ def input_problems(inputs: dict) -> list[str]:
     for key, text in (("transcripts_unstatable", "transcript(s) could not be stat'ed"),
                       ("transcripts_unreadable", "transcript file(s) could not be read"),
                       ("transcripts_undated", "transcript(s) had no timestamped record and were left out"),
-                      ("subagent_metadata_problems", "subagent(s) without readable metadata "
-                                                     "(type unknown, judged shell-capable)"),
+                      ("repo_identity_failures", "path(s) whose git repo could not be read "
+                                                 "(treated as outside any repo)"),
                       ("sessions_without_cwd", "session(s) without a cwd (repo and graph unknown)")):
         if inputs[key]:
             out.append(f"{len(inputs[key])} {text}")
     if inputs["transcript_corrupt_lines"]:
         out.append(f"{inputs['transcript_corrupt_lines']} corrupt transcript line(s), skipped")
     return out
+
+
+# An agent whose type or definition is unknown is judged shell-capable, so it stays a routing
+# exploration unit; its transcript is still read and no other stage looks at agent types. That
+# is the worst case for routing: a PASS reached this way holds for any true type (an agent that
+# called graphify had a shell), so these gaps are reported but cap no verdict. Its bypass is
+# unproven (it may have had no shell), so routing FAILs only on a bypass by a unit known to have one.
+TYPE_UNKNOWN_INPUTS = (
+    ("subagent_metadata_problems", "subagent(s) without readable metadata (type unknown, judged shell-capable)"),
+    ("agent_definitions_unreadable", "agent definition file(s) could not be read (agent judged shell-capable)"),
+)
+
+
+def input_notes(inputs: dict) -> list[str]:
+    """One line per kind of type-unknown agent; reported, never a cap on a verdict."""
+    return [f"{len(inputs[key])} {text}" for key, text in TYPE_UNKNOWN_INPUTS if inputs[key]]
 
 
 def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
@@ -1261,7 +1290,8 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     hint_live = cfg.hint_live_since
     # A target path (repo, else scan) may sit inside a repo or a worktree lane: compare it by
     # the same identity as a session's repo; a path outside any git repo is kept verbatim.
-    targets = {norm(repo_identity(t, resolver) or t) for t in cfg.targets}
+    repo_problems: list[str] = []
+    targets = {norm(repo_identity(t, resolver, repo_problems) or t) for t in cfg.targets}
     # Headless/throwaway runs start in the temp dir; on unless the config turns it off. Both sides
     # are real paths: Windows may spell the temp dir as an 8.3 short name and the session cwd long.
     tmp = norm(os.path.realpath(tempfile.gettempdir())) if cfg.exclude_temp_cwd else None
@@ -1274,7 +1304,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         if s.cwd:
             r = resolver.resolve(s.cwd)
             s.resolved = dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r
-        s.repo = repo_of(s, resolver)
+        s.repo = repo_of(s, resolver, repo_problems)
 
     organic = [s for s in sessions if not s.excluded]
     copied_calls = mark_copied_calls(sessions)
@@ -1349,16 +1379,20 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             if u.cwd not in graph_cache:
                 r = resolver.resolve(u.cwd)
                 graph_cache[u.cwd] = (dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r,
-                                      repo_identity(u.cwd, resolver))
+                                      repo_identity(u.cwd, resolver, repo_problems))
             u.resolved, u.repo = graph_cache[u.cwd]
-    routing_copies = mark_routing_copies([u for s in organic for u in s.units.values()])
     units = [u for s in organic for u in s.units.values() if u.resolved]
+    # Copies are settled among graph-backed holders only: a later holder with no graph must
+    # not take a lookup away from the unit that routing actually judges (SA02-9).
+    routing_copies = mark_routing_copies(units)
     scope_of = {id(u): coverage_for(u.resolved, u.repo) for u in units}
     eligible = [u for u in units if u.is_exploration(scope_of[id(u)])]
     # A subagent without a shell cannot run graphify: its lookups show the graph was
     # unusable to it, not that it was bypassed.
-    unusable = [u for u in eligible if u.unit_id != "main"
-                and agent_has_shell(u.agent_type, u.cwd, user_agents) is False]
+    agent_def_problems: list[str] = []
+    has_shell = {id(u): True if u.unit_id == "main"
+                 else agent_has_shell(u.agent_type, u.cwd, user_agents, agent_def_problems) for u in eligible}
+    unusable = [u for u in eligible if has_shell[id(u)] is False]
     exploration = [u for u in eligible if u not in unusable]
     no_path_evidence = [u for u in units if u.enough_lookups() and not (u.files | u.search_paths)]
     used = [u for u in exploration if u.routing_calls()]
@@ -1367,8 +1401,16 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     other_callers = [u for u in units if u.routing_calls() and u not in eligible]
     after_hint = [u for u in exploration if post_hint(u.session)]
     spawns = [sp for u in units for sp in u.spawned if sp["type"] in EXPLORE_AGENT_TYPES]
-    if bypassed:
+    # A bypass by a unit of unknown type may be a unit that had no shell: evidence, not a FAIL.
+    type_unknown_bypassed = [u for u in bypassed if has_shell[id(u)] is None]
+    bypassed_by_type: dict[str, int] = {}
+    for u in bypassed:
+        kind = "main" if u.unit_id == "main" else "unknown" if has_shell[id(u)] is None else u.agent_type
+        bypassed_by_type[kind] = bypassed_by_type.get(kind, 0) + 1
+    if len(bypassed) > len(type_unknown_bypassed):
         v2 = FAIL
+    elif bypassed:
+        v2 = INSUFFICIENT
     elif exploration:
         v2 = PASS
     else:
@@ -1447,9 +1489,12 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         "transcripts_undated": [str(s.path) for s in scan.undated],
         "transcript_corrupt_lines": sum(s.corrupt_lines for s in seen),
         "subagent_metadata_problems": meta,
+        "agent_definitions_unreadable": sorted(set(agent_def_problems)),
+        "repo_identity_failures": sorted(set(repo_problems)),
         "sessions_without_cwd": no_cwd,
     }
     inputs["problems"] = input_problems(inputs)
+    inputs["notes"] = input_notes(inputs)
     # A PASS is a claim about all the evidence; with inputs unread it is at most INSUFFICIENT.
     # A FAIL found in what was read stands.
     if inputs["problems"]:
@@ -1483,6 +1528,8 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
             "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} files={len(u.files)} "
                          f"in_graph={u.covered(scope_of[id(u)])} "
                          f"cwd={u.cwd}" for u in bypassed],
+            "bypassed_type_unknown": [u.label for u in type_unknown_bypassed],
+            "bypassed_by_type": bypassed_by_type,
             "copied_tool_uses_excluded": routing_copies,
             "graph_unusable_units": len(unusable),
             "graph_unusable": [f"{u.label} searches={u.searches} reads={u.reads} "
@@ -1534,6 +1581,9 @@ def render(summary: dict) -> str:
     if inp["problems"]:
         L += ["**Input problems (verdicts below are missing this evidence, so none can PASS; this is not low volume):**",
               *[f"- {x}" for x in inp["problems"]], ""]
+    if inp["notes"]:
+        L += ["**Agents of unknown type (judged shell-capable, so a PASS still holds; their bypasses alone "
+              "cannot FAIL routing):**", *[f"- {x}" for x in inp["notes"]], ""]
     L += ["| Stage | Verdict | Evidence |", "|---|---|---|",
          f"| 1a Graph resolution | {a['graph_resolution']} | {a['graph_backed']}/{s['organic']} organic sessions "
          f"resolved a graph; {len(a['expected_graph_missing'])} in graph-expected repos without one |",
@@ -1589,7 +1639,11 @@ def render(summary: dict) -> str:
     if r["bypassed"]:
         shown = r["bypassed"][:BYPASS_SHOWN]
         L += ["", f"**Bypassed (routing failures to investigate this week; largest {len(shown)} of "
-                  f"{len(r['bypassed'])}, full list in the JSON summary):**", *[f"- {x}" for x in shown]]
+                  f"{len(r['bypassed'])}, full list in the JSON summary):**", *[f"- {x}" for x in shown],
+              "", f"By agent type: {r['bypassed_by_type']}."]
+        if r["bypassed_type_unknown"]:
+            L += [f"{len(r['bypassed_type_unknown'])} of them by agents of unknown type (they may have had no "
+                  "shell, so they alone cannot FAIL routing): " + ", ".join(r["bypassed_type_unknown"][:BYPASS_SHOWN])]
     L += ["", "## 3 Execution", "",
           f"- Calls: {e['calls']} by status {e['by_status']}; logged: {e['logged']}; bare CLI (outside wrapper): {e['bare_cli_calls']}; "
           f"copies from continued/forked transcripts excluded: {e['copied_calls_excluded']}; "

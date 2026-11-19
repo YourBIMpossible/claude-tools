@@ -126,27 +126,43 @@ def git_ok(repo: Path) -> bool:
     return (repo / ".git").exists()
 
 
-def git_commit_exists(repo: Path, sha: str) -> bool:
+def git_commit_exists(repo: Path, sha: str) -> bool | None:
+    """True = commit exists, False = git ran and has no such commit,
+    None = git could not answer (not installed, timed out, broken repo)."""
     try:
         r = subprocess.run(
-            ["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+             f"{sha}^{{commit}}"],
             capture_output=True, timeout=15,
         )
-        return r.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode == 0:
+        return True
+    if r.returncode == 1:  # --verify --quiet: "no such object", nothing else
         return False
+    return None
 
 
-def git_last_commit_ts(repo: Path, path: Path) -> float | None:
+def git_last_commit_ts(repo: Path, path: Path) -> tuple[float | None, str | None]:
+    """(timestamp, None) from git history, or (None, reason) when git has no
+    date for the file: 'untracked' (git ran, no history) or 'git unavailable'."""
     try:
         r = subprocess.run(
             ["git", "-C", str(repo), "log", "-1", "--format=%ct", "--", str(path)],
             capture_output=True, text=True, timeout=15,
         )
-        s = r.stdout.strip()
-        return float(s) if r.returncode == 0 and s else None
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return None
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "git unavailable"
+    if r.returncode != 0:
+        return None, "git unavailable"
+    s = r.stdout.strip()
+    if not s:
+        return None, "untracked"
+    try:
+        return float(s), None
+    except ValueError:
+        return None, "git unavailable"
 
 
 def glob_repo(repo: Path, patterns: list[str]) -> list[Path]:
@@ -347,10 +363,18 @@ def check_links(cfg: dict, repo: Path, rep: Report) -> None:
             for sha in dict.fromkeys(_COMMIT_RE.findall(text)):
                 if any(c.isdigit() for c in sha) is False:
                     continue  # all-letter hex words ("deadbee") are usually prose
-                if not any(git_commit_exists(r, sha) for r in commit_repos):
+                answers = [git_commit_exists(r, sha) for r in commit_repos]
+                if any(a is True for a in answers):
+                    continue
+                if any(a is None for a in answers):
+                    rep.add(WARN, "links",
+                            f"{rel_doc}: commit `{sha}` could not verify - git failed "
+                            f"in {sum(a is None for a in answers)} of "
+                            f"{len(answers)} repo(s)")
+                else:
                     rep.add(WARN, "links",
                             f"{rel_doc}: commit `{sha}` not found in any known repo")
-                    issues += 1
+                issues += 1
         if adr_dir is not None:
             for m in _ADR_RE.finditer(text):
                 num = m.group(1) or m.group(2)
@@ -399,9 +423,11 @@ def check_staleness(cfg: dict, repo: Path, rep: Report) -> None:
     cutoff = time.time() - max_age_days * 86400
     use_git = git_ok(repo)
     fresh = 0
+    fallback: dict[str, int] = {}
     for f in glob_repo(repo, cfg.get("paths", [])):
-        ts = git_last_commit_ts(repo, f) if use_git else None
+        ts, why = git_last_commit_ts(repo, f) if use_git else (None, "not a git repo")
         if ts is None:
+            fallback[why or "unknown"] = fallback.get(why or "unknown", 0) + 1
             ts = f.stat().st_mtime
         if ts < cutoff:
             age = int((time.time() - ts) / 86400)
@@ -410,6 +436,11 @@ def check_staleness(cfg: dict, repo: Path, rep: Report) -> None:
                     f"(threshold {max_age_days}d) - review for staleness")
         else:
             fresh += 1
+    if fallback:
+        detail = ", ".join(f"{n} {why}" for why, n in sorted(fallback.items()))
+        rep.add(WARN, "staleness",
+                f"{sum(fallback.values())} file(s) dated by file mtime, not git history "
+                f"({detail}) - mtime is reset by a fresh clone, so their age is unreliable")
     rep.add(PASS, "staleness", f"{fresh} file(s) within {max_age_days}d threshold")
 
 

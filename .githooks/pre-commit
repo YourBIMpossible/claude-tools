@@ -21,8 +21,11 @@ repo=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-commit: not ins
 
 if [ -n "${BIMP_SECRETS_BYPASS:-}" ]; then
     log="$(git rev-parse --git-common-dir)/secrets-bypass.log"
-    printf '%s pre-commit bypass: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BIMP_SECRETS_BYPASS" >> "$log"
-    echo "pre-commit: secret scan BYPASSED ($BIMP_SECRETS_BYPASS) - logged to $log" >&2
+    if printf '%s pre-commit bypass: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BIMP_SECRETS_BYPASS" >> "$log"; then
+        echo "pre-commit: secret scan BYPASSED ($BIMP_SECRETS_BYPASS) - logged to $log" >&2
+    else  # never claim an audit line that was not written
+        echo "pre-commit: secret scan BYPASSED ($BIMP_SECRETS_BYPASS) - WARNING: NOT logged, cannot append to $log" >&2
+    fi
     exit 0
 fi
 

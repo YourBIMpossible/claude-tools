@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import copy
 import math
+import os
+import stat
+import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -174,30 +177,46 @@ def percentiles(values: list[int]) -> dict[str, int | None]:
     return {"p50": rank(0.50), "p95": rank(0.95), "max": v[-1]}
 
 
-def _dir_bytes(d: Path) -> int:
+def _dir_bytes(d: Path, unsized: list[str]) -> int:
+    """Bytes of the regular files under ``d``; every file or folder whose size could not be
+    read is appended to ``unsized`` (the caller names them), never dropped silently."""
     total = 0
-    for p in d.rglob("*"):
-        try:
-            if p.is_file():
-                total += p.stat().st_size
-        except OSError:
-            pass
+
+    def listing_failed(exc: OSError) -> None:
+        unsized.append(f"{exc.filename or d} ({type(exc).__name__})")
+    for top, _, files in os.walk(d, onerror=listing_failed):
+        for name in files:
+            path = os.path.join(top, name)
+            try:
+                st = os.lstat(path)
+            except OSError as exc:
+                unsized.append(f"{path} ({type(exc).__name__})")
+                continue
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
     return total
 
 
-def _latest_audit(stores: Stores) -> dict[str, Any] | None:
-    best = None
+def _latest_audit(stores: Stores) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """``(record, file name, unreadable)``: the newest readable FN audit and every audit
+    file that could not be read as an object (the caller names them; never skipped silently)."""
+    best: tuple[int, dict[str, Any], str] | None = None
+    unreadable: list[str] = []
     for p in sorted((stores.meta / "audits").glob("fn-audit-*.json")):
         stem = p.name[len("fn-audit-"):-len(".json")]
         if not stem.isdigit():
             continue
         try:
             rec = read_json(p)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            unreadable.append(f"{p.name} ({type(exc).__name__})")
+            continue
+        if not isinstance(rec, dict):
+            unreadable.append(f"{p.name} (not an object)")
             continue
         if best is None or int(stem) > best[0]:
-            best = (int(stem), rec)
-    return best[1] if best else None
+            best = (int(stem), rec, p.name)
+    return (best[1], best[2], unreadable) if best else (None, None, unreadable)
 
 
 def _isolation(stores: Stores) -> dict[str, Any]:
@@ -227,7 +246,8 @@ def _isolation(stores: Stores) -> dict[str, Any]:
 
 def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, now: str | None = None,
                      maintenance: dict[str, Any] | None = None,
-                     backstop: dict[str, Any] | None = None) -> dict[str, Any]:
+                     backstop: dict[str, Any] | None = None,
+                     maintenance_unreadable: str | None = None) -> dict[str, Any]:
     now = now or iso(now_utc())
     scan = scan_manifests(stores)
     # One classification for every count: each well-formed manifest is read refreshed (rules
@@ -246,6 +266,8 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
                  for m in views), key=lambda m: m["started_at"])
     maint = maintenance or {}
     notes: list[str] = []
+    if maintenance_unreadable is not None:
+        notes.append(f"maintenance.json unreadable ({maintenance_unreadable}): maintenance counts below read as 0")
     if backstop is not None and backstop.get("state") != "ok":
         notes.append(f"maintenance backstop {backstop.get('state')}: last success {backstop.get('last_ok')}, "
                      f"{backstop.get('consecutive_failures', 0)} consecutive failure(s)")
@@ -372,7 +394,11 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
                                             for m in suff for e in m["prior_context"].get("prior_context_evidence", [])))}
 
     # FN audit
-    audit = _latest_audit(stores)
+    audit, audit_name, audits_unreadable = _latest_audit(stores)
+    if audits_unreadable:
+        notes.append(f"{len(audits_unreadable)} FN audit file(s) unreadable and ignored: "
+                     + ", ".join(audits_unreadable[:20])
+                     + (f"; fn_audit is from {audit_name}" if audit_name else "; no readable FN audit"))
     reviews_needed = [m["episode_id"] for m in ms if mf.provisional_candidate(m["funnel"])]
     cbc = sum(1 for ep in reviews_needed if (owners.get(ep) or {}).get("case_by_case"))
     fn_audit: dict[str, Any] = {"n": 0, "audited_at": None, "sheet_sha256": None, "labels_sealed": False,
@@ -410,6 +436,7 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
     end_ms = [m["capture"]["end_ms"] for m in ms if isinstance(m["capture"].get("end_ms"), int)]
 
     # content store
+    unsized: list[str] = []
     snaps = [d for d in stores.snapshots.iterdir() if d.is_dir()] if stores.snapshots.is_dir() else []
     pays = [d for d in stores.payloads.iterdir() if d.is_dir()] if stores.payloads.is_dir() else []
     dels = read_deletions(stores)
@@ -417,11 +444,18 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
     store_problems = check_content_store(stores)
     sync = [p for p in store_problems if "sync" in p]
     content_store = {"snapshots_live": len(snaps), "payloads_live": len(pays),
-                     "bytes_total": sum(_dir_bytes(d) for d in snaps + pays),
+                     "bytes_total": sum(_dir_bytes(d, unsized) for d in snaps + pays),
                      "expired_deleted": len(expired), "deletions_verified": sum(1 for d in dels if d.get("verified")),
                      "extended_by_seal": sum(1 for m in ms if (m.get("retention") or {}).get("extended_until")),
                      "tmp_orphans_cleaned": int(maint.get("tmp_orphans_cleaned", 0)),
                      "sync_check": "ok" if not sync else "; ".join(sync)}
+
+    if unsized:
+        notes.append(f"{len(unsized)} content store entr{'y' if len(unsized) == 1 else 'ies'} unreadable and "
+                     f"outside bytes_total: {', '.join(unsized[:10])}")
+    meta_head, meta_head_problem = _meta_head(stores)
+    if meta_head_problem:
+        notes.append(meta_head_problem)
 
     # integrity
     bad = {d.name: verify_payload(stores, d.name) for d in pays}
@@ -430,7 +464,7 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
 
     return {
         "checkpoint": {"n": n, "episodes_target": EPISODES_TARGET, "produced_at": now, "tool_commit": tool_commit,
-                       "metadata_commit": _meta_head(stores), "content_store_markers_ok": not store_problems},
+                       "metadata_commit": meta_head, "content_store_markers_ok": not store_problems},
         "window": {"first_started_at": first, "last_ended_at": last,
                    "days": round((b - a).total_seconds() / 86400, 2) if a and b else None,
                    "repos": [{"main_root_sha256": k, "episodes": v} for k, v in sorted(repos.items())]},
@@ -461,12 +495,21 @@ def build_checkpoint(stores: Stores, n: int, *, tool_commit: str | None = None, 
     }
 
 
-def _meta_head(stores: Stores) -> str | None:
-    from common import git
+def _meta_head(stores: Stores) -> tuple[str | None, str | None]:
+    """``(commit, problem)``. An unborn HEAD (a metadata repository with no commit yet) is
+    ``(None, None)``; a HEAD git cannot read is ``(None, why)`` so the checkpoint says so."""
+    from common import git_env
     try:
-        return git(stores.meta, "rev-parse", "HEAD").strip() or None
-    except Exception:  # noqa: BLE001 — an empty metadata repository has no HEAD yet
-        return None
+        proc = subprocess.run(["git", "-C", str(stores.meta), "rev-parse", "--verify", "-q", "HEAD"],
+                              capture_output=True, env=git_env(), timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"metadata_commit unknown: git rev-parse could not run ({type(exc).__name__}: {exc})"
+    if proc.returncode == 0:
+        return proc.stdout.decode("utf-8", "replace").strip() or None, None
+    err = proc.stderr.decode("utf-8", "replace").strip()
+    if proc.returncode == 1 and not err:
+        return None, None
+    return None, f"metadata_commit unknown: git rev-parse exit {proc.returncode}: {err[:200]}"
 
 
 def _isolation_line(iso_: dict[str, Any]) -> str:
@@ -523,19 +566,27 @@ def write_checkpoint(stores: Stores, *, tool_commit: str | None = None, n: int |
                      backstop: dict[str, Any] | None = None) -> tuple[Path, dict[str, Any]]:
     n = n or next_checkpoint_n(stores)
     maint: dict[str, Any] = {}
+    maint_unreadable: str | None = None
     mp = stores.meta / "maintenance.json"
     if mp.is_file():
         try:
-            maint = read_json(mp)
-        except (OSError, ValueError):
-            maint = {}
-    ck = build_checkpoint(stores, n, tool_commit=tool_commit, now=now, maintenance=maint, backstop=backstop)
+            raw = read_json(mp)
+        except (OSError, ValueError) as exc:
+            maint_unreadable = type(exc).__name__
+        else:
+            if isinstance(raw, dict):
+                maint = raw
+            else:
+                maint_unreadable = "not an object"
+    ck = build_checkpoint(stores, n, tool_commit=tool_commit, now=now, maintenance=maint, backstop=backstop,
+                          maintenance_unreadable=maint_unreadable)
     out = stores.meta / "checkpoints" / f"ckpt-{n}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(out, ck)
     md = out.with_suffix(".md")
     md.write_text(render_markdown(ck), encoding="utf-8", newline="\n")
-    if commit:
-        commit_meta(stores, [out, md], f"capture checkpoint {n}")
+    # ``_committed`` (not part of the written record): the metadata commit's result, None
+    # when ``commit`` is false; the CLI exits non-zero on False
+    ck["_committed"] = commit_meta(stores, [out, md], f"capture checkpoint {n}") if commit else None
     ck["_sha256"] = sha256_file(out)
     return out, ck

@@ -190,7 +190,15 @@ try {
         }
     }
 } catch {
-    Add-Alert 'error' 'task-missing' "Scheduled task '$taskName' not found - weekly refresh is not registered." 'Re-register it with a hidden action, or a console window opens on every run: wscript.exe running run-hidden.js from the scheduling folder, then powershell.exe and Refresh-Graphs.ps1 (the exact arguments are in scheduling/README.md).' | Out-Null
+    # Only a not-found answer (ObjectNotFound / 0x80070002) means the task is unregistered. Anything else
+    # (access denied, Task Scheduler service down) leaves its state unknown and is reported as that, with
+    # the category and error id (never the raw message, which may carry a machine path).
+    $notFound = $_.CategoryInfo.Category -eq 'ObjectNotFound' -or "$($_.FullyQualifiedErrorId)" -match '0x80070002'
+    if ($notFound) {
+        Add-Alert 'error' 'task-missing' "Scheduled task '$taskName' not found - weekly refresh is not registered." 'Re-register it with a hidden action, or a console window opens on every run: wscript.exe running run-hidden.js from the scheduling folder, then powershell.exe and Refresh-Graphs.ps1 (the exact arguments are in scheduling/README.md).' | Out-Null
+    } else {
+        Add-Alert 'error' 'task-check-failed' "Could not read scheduled task '$taskName' ($($_.CategoryInfo.Category): $($_.FullyQualifiedErrorId)) - its last result is unknown." 'Run Get-ScheduledTaskInfo for that task in the account the check runs as, and fix the access or Task Scheduler error it reports.' | Out-Null
+    }
 }
 
 # -- 3. PyPI: is there a newer release? (notify only, never install) ---------

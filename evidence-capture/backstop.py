@@ -65,10 +65,12 @@ def _evaluate(stores: Stores, env: dict[str, str], now: str, lock_wait_s: float,
             break
         time.sleep(LOCK_POLL_S)
     if counts.get("action") == "skipped":
+        # the backstop waited for the lock, so any skip left is a failure of its own pass
         problems.append("maintenance_lock_held")
-    found, warned = pipeline.maintain_findings(counts)
-    problems.extend(found)
-    warnings.extend(warned)
+    else:
+        found, warned = pipeline.maintain_findings(counts)
+        problems.extend(found)
+        warnings.extend(warned)
     if stores.content.is_dir():
         left = overdue(stores, now=now)
         if left:
@@ -106,11 +108,24 @@ def run_backstop(env: dict[str, str], *, now: str | None = None, status: Path | 
 
 
 def _record(rec: dict[str, Any], status: Path, stores: Stores | None) -> None:
-    line = f"backstop {rec['status']}: " + ("; ".join(rec["problems"] + rec["warnings"]) or "ok")
     try:
         prev = read_json(status) if status.is_file() else {}
-    except (OSError, ValueError):
+        if not isinstance(prev, dict):
+            raise ValueError(f"not an object ({type(prev).__name__})")
+    except (OSError, ValueError) as exc:
+        # the history and failure streak are lost: say so, and keep the unreadable file
         prev = {}
+        kept = status.with_name(status.name + ".unreadable")
+        try:
+            status.replace(kept)
+            where = f"kept as {kept.name}"
+        except OSError as move_exc:
+            where = f"not kept: {type(move_exc).__name__}"
+        rec["warnings"].append(f"status_history_unreadable: {type(exc).__name__}; history and failure streak "
+                               f"restart ({where})")
+        if rec["status"] == "ok":
+            rec.update(status="warn", exit=EXIT_WARN)
+    line = f"backstop {rec['status']}: " + ("; ".join(rec["problems"] + rec["warnings"]) or "ok")
     history = ([{k: rec[k] for k in ("at", "status", "problems", "warnings")}] + list(prev.get("history") or []))
     doc = {"last_run": rec["at"], "last_status": rec["status"],
            "last_ok": rec["at"] if rec["status"] != "fail" else prev.get("last_ok"),

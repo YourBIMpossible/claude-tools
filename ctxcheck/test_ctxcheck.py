@@ -289,6 +289,28 @@ timeout = 2
         passes = [x["message"] for x in data["results"] if x["status"] == "PASS"]
         check(any("exit 5" in m for m in passes), "commands: expect_exit honored")
 
+        # --- git unavailable (SA11-CT-9, SA11-CT-41) ----------------------
+        # PATH holds only the interpreter's dir, so every git call raises
+        # OSError. A real commit must read "could not verify", never "not
+        # found", and the mtime fallback for staleness must be stated.
+        import os
+        nogit_env = {k: v for k, v in os.environ.items() if k.upper() != "PATH"}
+        nogit_env["PATH"] = str(Path(sys.executable).parent)
+        r = subprocess.run([sys.executable, CTXCHECK, "run", str(good), "--json"],
+                           capture_output=True, text=True, timeout=120, env=nogit_env)
+        ng = json.loads(r.stdout)
+        ng_msgs = [x["message"] for x in ng["results"]]
+        stale_ng = [x["message"] for x in ng["results"] if x["category"] == "staleness"]
+        stale_ok = [x["message"] for x in data["results"] if x["category"] == "staleness"]
+        check(not any(f"commit `{sha[:9]}` not found" in m for m in ng_msgs),
+              "links: git outage is not reported as commit not found")
+        check(any(sha[:9] in m and "could not verify" in m for m in ng_msgs),
+              "links: git outage reports could not verify")
+        check(any("mtime" in m and "git" in m for m in stale_ng),
+              "staleness: mtime fallback is stated when git is unavailable")
+        check(not any("mtime" in m for m in stale_ok),
+              "staleness: no mtime note when git history is available")
+
         # --- CLI / config plumbing ---------------------------------------
         r = run("run", str(tmp / "nope.toml"))
         check(r.returncode == 2, "missing config exits 2")
@@ -316,7 +338,7 @@ timeout = 2
 
 
 def test_ctxcheck_suite() -> None:
-    """pytest entry point - the same 48 checks as `python test_ctxcheck.py`."""
+    """pytest entry point - the same checks as `python test_ctxcheck.py`."""
     failures = run_checks()
     assert PASSED > 0, "suite ran zero checks"
     assert not failures, "failing checks:\n  " + "\n  ".join(failures)

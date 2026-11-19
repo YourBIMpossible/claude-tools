@@ -293,8 +293,22 @@ def _stats(values: list[int | None]) -> dict[str, Any]:
     return {"values": v, **({"min": min(v), "median": round(statistics.median(v)), "max": max(v)} if v else {})}
 
 
+HOOKS_NOT_ENDED = "hooks_not_ended"
+
+
+def _ordering(runs: list[bool], excluded: list[dict[str, Any]]) -> dict[str, Any]:
+    """An ordering property passes only on a non-empty, all-true run set with no turn whose hooks never ended."""
+    blocked = any(x["reason"] == HOOKS_NOT_ENDED for x in excluded)
+    return {"passed": bool(runs) and all(runs) and not blocked, "runs": runs, "excluded": excluded}
+
+
 def analyse_turns(turns: list[list[dict[str, Any]]]) -> dict[str, Any]:
-    per_turn, before_tool, before_output, timeout_turns = [], [], [], []
+    per_turn: list[dict[str, Any]] = []
+    before_tool: list[bool] = []
+    before_output: list[bool] = []
+    timeout_turns: list[dict[str, Any]] = []
+    tool_excl: list[dict[str, Any]] = []
+    output_excl: list[dict[str, Any]] = []
     for i, evs in enumerate(turns):
         starts = {n: _first(evs, n, "start") for n in UPS_NAMES}
         ends = {n: _first(evs, n, "end") for n in UPS_NAMES}
@@ -335,17 +349,25 @@ def analyse_turns(turns: list[list[dict[str, Any]]]) -> dict[str, Any]:
                                   "a_killed": ends["A"] is None, "first_activity_after_a_start_ms":
                                   _ms(a.get("t"), first_after), "turn_completed": stop is not None})
         else:
-            if all_ended and tool:
-                before_tool.append(last_end < tool["t"])
-            if all_ended and first_asst:
-                before_output.append(last_end < first_asst)
+            # A turn left out of a property's runs is named with its reason. One whose hooks never logged an
+            # end (killed or crashed) cannot be shown to finish first, so it fails the property (SA11-CT-2).
+            missing_end = sorted(n for n, e in ends.items() if e is None)
+            for runs, excl, mark, absent in ((before_tool, tool_excl, (tool or {}).get("t"), "no_tool"),
+                                             (before_output, output_excl, first_asst, "no_first_assistant")):
+                if not all_ended:
+                    excl.append({"turn": i + 1, "reason": HOOKS_NOT_ENDED, "missing_end": missing_end})
+                elif mark is None:
+                    excl.append({"turn": i + 1, "reason": absent})
+                else:
+                    runs.append(last_end < mark)
         per_turn.append(row)
     stop_rows = [r for r in per_turn if r["stop_seen"]]
+    stop_excl = [{"turn": r["turn"], "reason": "stop_not_seen"} for r in per_turn if not r["stop_seen"]]
     return {
         "turns": len(turns),
-        "a_hooks_finish_before_first_tool": {"passed": bool(before_tool) and all(before_tool), "runs": before_tool},
+        "a_hooks_finish_before_first_tool": _ordering(before_tool, tool_excl),
         "a_hooks_finish_before_first_output": {
-            "passed": bool(before_output) and all(before_output), "runs": before_output,
+            **_ordering(before_output, output_excl),
             "note": "first output = first assistant transcript entry of the turn (the desktop stream is not observable)"},
         "c_turn_waits_for_hook_within_timeout": {
             "passed": bool(timeout_turns) and all(t["passed"] for t in timeout_turns), "turns": timeout_turns,
@@ -354,8 +376,10 @@ def analyse_turns(turns: list[list[dict[str, Any]]]) -> dict[str, Any]:
                          for k in ("prompt_to_hook_start_ms", "ups_span_ms", "capstart_ms", "hook_end_to_first_tool_ms",
                                    "hook_end_to_first_assistant_ms", "capend_ms")},
         "e_stop_sees_final_message": {
-            "passed": bool(stop_rows) and all(r["stop_complete_at_stop"] for r in stop_rows),
-            "at_stop": [r["stop_complete_at_stop"] for r in stop_rows],
+            # A turn whose Stop was never seen is outside the denominator, so it is named and blocks a pass
+            # (SA11-CT-51).
+            "passed": bool(stop_rows) and not stop_excl and all(r["stop_complete_at_stop"] for r in stop_rows),
+            "at_stop": [r["stop_complete_at_stop"] for r in stop_rows], "excluded": stop_excl,
             "lag_ms": [r["stop_complete_lag_ms"] for r in stop_rows], "note": "recorded; capture reconciles below"},
         "per_turn": per_turn,
     }

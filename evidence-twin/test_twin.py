@@ -9,14 +9,18 @@ Synthetic example — contains no private repository data or production findings
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -30,7 +34,27 @@ EPISODE = "cap_0123456789abcdef"
 
 PASSED: list[str] = []
 FAILED: list[str] = []
-FAKE = str(HERE / "fake_claude.py")
+FAKE_RAW = str(HERE / "fake_claude.py")
+FAKE = FAKE_RAW  # replaced in main() by a wrapper that also runs the settings' replay hook, as the CLI does
+
+# The real CLI runs the UserPromptSubmit hooks named in --settings before the turn; fake_claude.py
+# does not. This wrapper runs them (argv split as the CLI would, no shell) and then fake_claude.py.
+HOOKED_FAKE_SRC = '''import json, runpy, shlex, subprocess, sys
+argv = sys.argv[1:]
+with open(argv[argv.index("--settings") + 1], encoding="utf-8") as fh:
+    settings = json.load(fh)
+for group in settings.get("hooks", {}).get("UserPromptSubmit", []):
+    for hook in group["hooks"]:
+        subprocess.run(shlex.split(hook["command"]), input=b"{}", capture_output=True)
+sys.argv = [%r] + argv
+runpy.run_path(%r, run_name="__main__")
+'''
+
+
+def make_hooked_fake(tmp: Path) -> str:
+    path = tmp / "fake_claude_hooked.py"
+    path.write_text(HOOKED_FAKE_SRC % (FAKE_RAW, FAKE_RAW), encoding="utf-8")
+    return str(path)
 GOLDEN = {
     "README.md": "# Golden fixture\n",
     "src/alpha.py": ('class AlphaService:\n    def __init__(self, factor: int = 2) -> None:\n'
@@ -140,6 +164,12 @@ def test_hook(tmp: Path) -> None:
     c = subprocess.run([sys.executable, hook, str(tmp / "missing.md")], input=b"{}", capture_output=True)
     check(b.stdout == b"" and b.returncode == 0, "arm B hook emits nothing")
     check(c.stdout == b"" and c.returncode == 0, "hook is fail-open on a missing brief")
+    marker = Path(str(brief) + twin.DELIVERED_SUFFIX)
+    check(marker.is_file() and marker.read_text(encoding="utf-8").strip()
+          == twin.sha256_bytes("<context_brief>é</context_brief>".encode("utf-8")),
+          "SA11-CT-40: the hook confirms emission with the brief's sha256 next to the brief")
+    check(not Path(str(tmp / "missing.md") + twin.DELIVERED_SUFFIX).exists(),
+          "SA11-CT-40: a brief the hook could not emit leaves no delivery marker")
     s = twin.settings_for("-", sys.executable)
     check("WebFetch" in s["permissions"]["deny"] and "Bash(git push:*)" in s["permissions"]["deny"],
           "settings deny network and push")
@@ -169,6 +199,8 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
     a = metas["A"]
     check(a["reached"] and a["tokens_to_target"] == 2260 and a["tokens_total"] == 3390, "fake run is scored")
     check(a["cli_version"] == "fake-0" and a["verified"] is False, "meta records CLI version and verify")
+    check(a.get("brief_delivered") is True and metas["B"].get("brief_delivered") is None,
+          "meta records that arm A's hook emitted the brief")
     check(all((archive / r["run_id"] / f).is_file() for r in plan["runs"]
               for f in ("stream.jsonl", "diff.patch", "stderr.txt", "meta.json")), "archive is complete")
     check("# fake edit" in (archive / plan["runs"][0]["run_id"] / "diff.patch").read_text(encoding="utf-8"),
@@ -210,6 +242,37 @@ def test_batch(tmp: Path, tasks: list[dict]) -> None:
           and any(k.endswith(".invalid-1") for k in book["runs"]), "the ledger rebuilds from every kept attempt")
     check(sorted(drift) == sorted(r["run_id"] for r in plan["runs"]) and "agents-md@builtin" in drift[plan["runs"][1]["run_id"]],
           "a batch that loaded different plugins is reported")
+
+
+def test_brief_delivery(tmp: Path, tasks: list[dict]) -> None:
+    """SA11-CT-40 / SA16-CT-15 / SA11-CT-64: arm A counts only when its hook confirmed the brief
+    was emitted, and a blank brief (arm A identical to arm B) is refused before any spend."""
+    base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+    plan = twin.plan([base], 1, 3)
+    by_arm = {r["arm"]: r for r in plan["runs"]}
+
+    def one(name: str, arm: str, claude: str, task: dict = base) -> tuple[dict, dict]:
+        p = dict(plan, runs=[by_arm[arm]])
+        kw = dict(archive=tmp / f"bd-{name}", scratch=tmp / f"bd-{name}-scratch", model="m",
+                  ledger=tmp / f"bd-{name}-ledger.json", cap=100_000, ceiling=1_000_000, wall=60,
+                  claude=claude, kind=None, limit=None, projects=tmp / f"bd-{name}-projects")
+        res = twin.run_batch([task], p, **kw)
+        metas = [twin.read_json(m) for m in kw["archive"].rglob("meta.json")] if kw["archive"].is_dir() else []
+        return res, (metas[0] if metas else {})
+
+    res, meta = one("silent", "A", FAKE_RAW)
+    check(meta.get("brief_delivered") is False and meta.get("invalid") == "brief_not_delivered"
+          and "invalid run" in (res.get("stopped") or ""),
+          "an arm A run whose hook never confirmed the brief is invalid and stops the batch")
+    res, meta = one("hooked", "A", FAKE)
+    check(meta.get("brief_delivered") is True and meta.get("invalid") is None and res["stopped"] is None,
+          "an arm A run whose hook confirmed the brief is valid")
+    res, meta = one("arm-b", "B", FAKE_RAW)
+    check(meta.get("brief_delivered") is None and meta.get("invalid") is None, "arm B carries no delivery check")
+    res, meta = one("blank", "A", FAKE, dict(base, brief="  \n"))
+    check(res["ran"] == 0 and "empty brief" in (res.get("stopped") or "") and not meta
+          and not (tmp / "bd-blank-ledger.json").exists(),
+          "a blank brief is refused before any run starts (arm A would equal arm B)")
 
 
 def test_real(tmp: Path) -> None:
@@ -312,6 +375,48 @@ def test_verify_guard(tmp: Path, tasks: list[dict]) -> None:
           "a timed-out verify is counted apart from a checked one (SA26-24)")
 
 
+def test_post_run_failure_books_spend(tmp: Path, tasks: list[dict]) -> None:
+    """SA26-26 / SA11-CT-36 / SA16-CT-3: a git or verify failure after the paid run never leaves
+    run_one before meta.json is written, so the spend always reaches the ledger."""
+    base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+    real_git, real_verify = twin.git, twin.run_verify
+
+    def git_add_fails(repo: Path, *args: str, check: bool = True) -> str:
+        if args[:2] == ("diff", "--cached"):
+            raise RuntimeError("git diff --cached failed: simulated")
+        return real_git(repo, *args, check=check)
+
+    def verify_cannot_start(*a: object, **k: object) -> tuple[bool, str | None]:
+        raise OSError("simulated: verify interpreter missing")
+
+    for name, patch in (("git", git_add_fails), ("run_verify", verify_cannot_start)):
+        plan = twin.plan([base], 1, 3)
+        plan["runs"] = plan["runs"][:1]
+        ledger = tmp / f"pr-{name}-ledger.json"
+        kw = dict(archive=tmp / f"pr-{name}-archive", scratch=tmp / f"pr-{name}-scratch", model="m", ledger=ledger,
+                  cap=100_000, ceiling=1_000_000, wall=60, claude=FAKE, kind=None, limit=None,
+                  projects=tmp / f"pr-{name}-projects")
+        setattr(twin, name, patch)
+        error: Exception | None = None
+        try:
+            res = twin.run_batch([base], plan, **kw)
+        except Exception as exc:  # noqa: BLE001 - the check is that nothing escapes
+            error, res = exc, {}
+        finally:
+            twin.git, twin.run_verify = real_git, real_verify
+        metas = [twin.read_json(m) for m in kw["archive"].rglob("meta.json")]
+        check(error is None and len(metas) == 1, f"a post-run {name} failure still writes meta ({error!r})")
+        check(ledger.is_file() and twin.read_json(ledger)["total"] == 3390 and res.get("ran") == 1,
+              f"a post-run {name} failure still books the spend")
+        m = metas[0] if metas else {}
+        if name == "git":
+            check((m.get("invalid") or "").startswith("post_run_error: diff") and "invalid run" in (res.get("stopped") or ""),
+                  "a run whose diff could not be taken is invalid and stops the batch")
+        else:
+            check(m.get("verified") is None and "verify could not run" in (m.get("verify_error") or "")
+                  and m.get("invalid") is None, "a verify that cannot start is unverified, not a lost run")
+
+
 def test_verify_kills_tree(tmp: Path) -> None:
     """SA26-26: a verify past its limit is killed with every process it started; a grandchild
     holding the output pipes neither outlives it nor holds the run past the limit."""
@@ -349,6 +454,168 @@ def _alive(pid: int) -> bool:
     return True
 
 
+LINGER_SRC = '''import os, runpy, sys, time
+sys.argv = [%r] + sys.argv[1:]
+try:
+    runpy.run_path(%r, run_name="__main__")
+except SystemExit:
+    pass
+sys.stdout.flush()
+os.close(1)  # output done, process keeps running: the harness must not wait on it unbounded
+time.sleep(%s)
+'''
+
+
+def test_kill_and_exit_bounds(tmp: Path, tasks: list[dict]) -> None:
+    """SA11-CT-63 / SA11-CT-64: a failed kill is reported, never silently trusted; the wait for a
+    run's process is bounded and its failure recorded; a wall timer that fires as the run ends
+    does not label a finished run as killed."""
+    base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+    plan = twin.plan([base], 1, 3)
+    plan = dict(plan, runs=[r for r in plan["runs"] if r["arm"] == "B"])
+
+    if os.name == "nt":
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        real_run = twin.subprocess.run
+        twin.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 1, b"", b"Access is denied.")
+        try:
+            why = twin.kill_tree(sleeper)
+        finally:
+            twin.subprocess.run = real_run
+        try:
+            sleeper.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            sleeper.kill()
+        check(why is not None and "taskkill rc 1" in why and sleeper.returncode is not None,
+              "a failed taskkill is reported and the process is still killed alone")
+    done = subprocess.Popen([sys.executable, "-c", "pass"])
+    done.wait()
+    check(twin.kill_tree(done) is None, "killing an exited process is not a failure")
+
+    def one(name: str, linger: float) -> tuple[dict, float]:
+        fake = tmp / f"linger-{name}.py"
+        fake.write_text(LINGER_SRC % (FAKE_RAW, FAKE_RAW, linger), encoding="utf-8")
+        kw = dict(archive=tmp / f"kb-{name}", scratch=tmp / f"kb-{name}-scratch", model="m",
+                  ledger=tmp / f"kb-{name}-ledger.json", cap=100_000, ceiling=1_000_000, wall=60,
+                  claude=str(fake), kind=None, limit=None, projects=tmp / f"kb-{name}-projects")
+        t = time.monotonic()
+        twin.run_batch([base], plan, **kw)
+        took = time.monotonic() - t
+        metas = [twin.read_json(m) for m in kw["archive"].rglob("meta.json")]
+        return (metas[0] if metas else {}), took
+
+    saved = twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree
+    twin.EXIT_GRACE, twin.KILL_GRACE = 1.0, 1.0
+    try:
+        meta, took = one("lingers", 60)
+        check(took < 20 and meta.get("invalid") is None and meta.get("exit_code") is not None
+              and any("did not exit" in e for e in meta.get("process_errors") or []),
+              f"a process that outlives its output is killed after a bounded wait and recorded ({took:.1f}s)")
+        twin.kill_tree = lambda proc: "simulated: kill refused"
+        meta, took = one("unkillable", 6)
+        check((meta.get("invalid") or "").startswith("process_not_killed") and meta.get("exit_code") is None
+              and any("simulated: kill refused" in e for e in meta.get("process_errors") or []),
+              f"a process that cannot be killed makes the run invalid instead of hanging it ({took:.1f}s)")
+    finally:
+        twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree = saved
+
+    class CancelFires:
+        """A timer that fires its callback in the instant before cancel() - the race window."""
+        def __init__(self, interval: float, fn: Any, args: tuple = ()) -> None:
+            self.fn, self.args = fn, args
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            self.fn(*self.args)
+
+    real_timer = twin.threading.Timer
+    twin.threading.Timer = CancelFires
+    try:
+        kw = dict(archive=tmp / "kb-race", scratch=tmp / "kb-race-scratch", model="m",
+                  ledger=tmp / "kb-race-ledger.json", cap=100_000, ceiling=1_000_000, wall=60,
+                  claude=FAKE, kind=None, limit=None, projects=tmp / "kb-race-projects")
+        twin.run_batch([base], plan, **kw)
+    finally:
+        twin.threading.Timer = real_timer
+    metas = [twin.read_json(m) for m in kw["archive"].rglob("meta.json")]
+    check(len(metas) == 1 and metas[0]["killed"] is None and metas[0]["invalid"] is None,
+          "a wall timer firing as the finished run is cancelled does not censor it")
+
+
+HOLDER_SRC = """import subprocess, sys, time
+import os
+pidfile = %r
+p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(%s)'], stdout=1, cwd=os.path.dirname(pidfile))
+open(pidfile, 'w').write(str(p.pid))
+sys.stdout.flush()
+if %r == 'hang':
+    time.sleep(60)
+"""
+
+
+def _reap(pidfile: Path) -> None:
+    """Kill a test's escaped grandchild so it never outlives the suite."""
+    try:
+        pid = int(pidfile.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def test_held_output_pipe(tmp: Path, tasks: list[dict]) -> None:
+    """SA26-26 residual: a process that escaped the tree kill and still holds the output pipe
+    neither holds the run past its bounds nor leaves a trusted result."""
+    hold = 30
+    # verify: the grandchild escapes the kill and keeps the verify's pipes open
+    pidfile = tmp / "verify-holder.pid"
+    script = tmp / "verify_holds.py"
+    script.write_text(HOLDER_SRC % (pidfile.as_posix(), hold, "hang"), encoding="utf-8")
+    saved = twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree
+
+    def kill_alone(proc: subprocess.Popen) -> None:  # a tree kill that misses the grandchild
+        proc.kill()
+
+    twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree = 1.0, 1.0, kill_alone
+    try:
+        t = time.monotonic()
+        verified, error = twin.run_verify([sys.executable, str(script)], cwd=tmp, env=dict(os.environ), timeout=1.0)
+        took = time.monotonic() - t
+        check(verified is False and (error or "").startswith("timeout") and took < 8,
+              f"a verify whose escaped grandchild holds its pipes still times out on time ({took:.1f}s)")
+        _reap(pidfile)
+
+        base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+        plan = twin.plan([base], 1, 3)
+        plan = dict(plan, runs=[r for r in plan["runs"] if r["arm"] == "B"])
+        for mode, label in (("exit", "a CLI that exits"), ("hang", "a CLI killed at the wall")):
+            pidfile = tmp / f"run-holder-{mode}.pid"
+            fake = tmp / f"holder-{mode}.py"
+            fake.write_text(HOLDER_SRC % (pidfile.as_posix(), hold, mode), encoding="utf-8")
+            kw = dict(archive=tmp / f"hp-{mode}", scratch=tmp / f"hp-{mode}-scratch", model="m",
+                      ledger=tmp / f"hp-{mode}-ledger.json", cap=100_000, ceiling=1_000_000, wall=2,
+                      claude=str(fake), kind=None, limit=None, projects=tmp / f"hp-{mode}-projects")
+            t = time.monotonic()
+            try:
+                twin.run_batch([base], plan, **kw)
+            finally:
+                took = time.monotonic() - t
+                _reap(pidfile)
+            # the held run directory may refuse its rename: its meta is then moved aside in place
+            metas = [twin.read_json(m) for m in kw["archive"].rglob("meta*.json")]
+            meta = metas[0] if metas else {}
+            check(not list(kw["archive"].glob("*/meta.json")), f"{label}: the held attempt is not left as a done run")
+            check(took < 15 and (meta.get("invalid") or "").startswith("output_held")
+                  and any("output pipe" in e for e in meta.get("process_errors") or []),
+                  f"{label} while a grandchild holds its output is bounded and not trusted ({took:.1f}s)")
+    finally:
+        twin.EXIT_GRACE, twin.KILL_GRACE, twin.kill_tree = saved
+
+
 def test_negative_censored() -> None:
     """A negative control with every run censored is inconclusive, not a pass."""
     def meta(reached: bool, killed: str | None = None) -> dict:
@@ -375,7 +642,7 @@ def test_bench_blind(tmp: Path) -> None:
     twin.write_json(tasks_f, tasks)
     twin.write_json(plan_f, plan)
 
-    def run_report(name: str, reached_a: bool, only: set[str] | None = None) -> dict:
+    def run_report(name: str, reached_a: bool, only: set[str] | None = None, want_rc: int = 0) -> dict:
         archive = tmp / f"bb-{name}"
         archive.mkdir()
         for r in plan["runs"]:
@@ -388,7 +655,7 @@ def test_bench_blind(tmp: Path) -> None:
         out = tmp / f"bb-{name}.json"
         rc = twin.main(["report", "--tasks", str(tasks_f), "--plan", str(plan_f), "--archive", str(archive),
                         "--cap", "100000", "--seed", "3", "--out", str(out)])
-        check(rc == 0, f"report CLI exits 0 ({name})")
+        check(rc == want_rc, f"SA11-CT-65: report CLI exits {want_rc} ({name}, got {rc})")
         return twin.read_json(out)
 
     empty = run_report("empty", True, only=set())
@@ -401,26 +668,56 @@ def test_bench_blind(tmp: Path) -> None:
     good = run_report("pass", True)
     check(good["bench_blind"] is False and good["positive_controls_incomplete"] == [],
           "a complete passing positive control gives bench_blind false")
-    bad = run_report("fail", False)
+    bad = run_report("fail", False, want_rc=1)
     check(bad["bench_blind"] is True, "a failing positive control gives bench_blind true")
     no_pos = [t for t in tasks if t["family"] != "positive"]
     check(twin.bench_blind(no_pos, twin.plan(no_pos, 1, 5), {}, [])[1] is None,
           "no planned positive control leaves bench_blind unknown")
 
 
+def test_run_cli_exit(tmp: Path, tasks: list[dict]) -> None:
+    """SA11-CT-65: the run CLI exits 0 only when the batch was not stopped."""
+    base = next(t for t in tasks if t["task_id"] == "neg_irrelevant")
+    tasks_f, plan_f = tmp / "rc-tasks.json", tmp / "rc-plan.json"
+    twin.write_json(tasks_f, [base])
+    twin.write_json(plan_f, twin.plan([base], 1, 3))
+
+    def run(name: str) -> int:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return twin.main(["run", "--tasks", str(tasks_f), "--plan", str(plan_f),
+                              "--archive", str(tmp / f"rc-{name}"), "--scratch", str(tmp / f"rc-{name}-scratch"),
+                              "--model", "m", "--ledger", str(tmp / f"rc-{name}-ledger.json"), "--cap", "100000",
+                              "--claude", FAKE, "--projects", str(tmp / f"rc-{name}-projects")])
+
+    check(run("ok") == 0, "a completed batch exits 0")
+    os.environ["FAKE_CLAUDE_ERROR"] = "1"
+    try:
+        rc = run("bad")
+    finally:
+        del os.environ["FAKE_CLAUDE_ERROR"]
+    check(rc == 1, f"a batch stopped by an invalid run exits 1 (got {rc})")
+
+
 def main() -> int:
+    global FAKE
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
+        FAKE = make_hooked_fake(tmp)
         tasks = test_lab(tmp)
         test_plan(tasks)
         test_stream()
         test_hook(tmp)
         test_batch(tmp, tasks)
+        test_brief_delivery(tmp, tasks)
         test_real(tmp)
         test_verify_guard(tmp, tasks)
+        test_post_run_failure_books_spend(tmp, tasks)
         test_verify_kills_tree(tmp)
+        test_kill_and_exit_bounds(tmp, tasks)
+        test_held_output_pipe(tmp, tasks)
         test_negative_censored()
         test_bench_blind(tmp)
+        test_run_cli_exit(tmp, tasks)
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")
     return 1 if FAILED else 0
 

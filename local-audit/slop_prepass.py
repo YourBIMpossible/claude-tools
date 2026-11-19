@@ -93,15 +93,23 @@ def is_testish(rel: str) -> bool:
     return any(t in low for t in ("test", "spec", "fixture", "mock"))
 
 
-def scan_file(repo: Path, path: Path, max_snippet: int) -> list[dict]:
+def scan_file(repo: Path, path: Path, max_snippet: int,
+              skipped: list[dict] | None = None) -> list[dict]:
+    """Scan one file. A file that cannot be scanned is appended to `skipped`
+    (file + reason) so the caller can report it; it is never dropped silently."""
+    rel = path.relative_to(repo).as_posix()
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            if skipped is not None:
+                skipped.append({"file": rel, "reason": f"size {size} bytes > limit {MAX_FILE_BYTES}"})
             return []
         text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except OSError as exc:
+        if skipped is not None:
+            skipped.append({"file": rel, "reason": f"unreadable: {type(exc).__name__}: {exc}"})
         return []
     lang = EXT_LANG[path.suffix.lower()]
-    rel = path.relative_to(repo).as_posix()
     hits: list[dict] = []
     lines = text.splitlines()
     for i, line in enumerate(lines, 1):
@@ -133,11 +141,20 @@ def scan_file(repo: Path, path: Path, max_snippet: int) -> list[dict]:
     return hits
 
 
-def render_markdown(repo: Path, since: str | None, hits: list[dict]) -> str:
+def render_markdown(repo: Path, since: str | None, hits: list[dict],
+                    scanned: int = 0, skipped: list[dict] | None = None) -> str:
+    skipped = skipped or []
     out = [f"# Slop pre-pass — {repo}", ""]
     out.append(f"Window: {'diff since ' + since if since else 'all tracked files'}. "
+               f"{scanned} files scanned, {len(skipped)} skipped. "
                f"{len(hits)} candidate sites. Candidates need CLASSIFICATION, they are not findings.")
     out.append("")
+    if skipped:
+        out.append(f"## Skipped files ({len(skipped)}) — NOT scanned, coverage is incomplete")
+        out.append("")
+        for s in skipped:
+            out.append(f"- {s['file']}: {s['reason']}")
+        out.append("")
     for check, title in (("swallow", "Swallowed-failure candidates"), ("counter", "Success-summary counters")):
         rows = [h for h in hits if h["check"] == check]
         out.append(f"## {title} ({len(rows)})")
@@ -177,7 +194,29 @@ def self_test() -> int:
     if not COUNTER.search(counter_yes) or COUNTER.search(counter_no):
         failed += 1
         print("FAIL counter heuristic")
-    print(f"self-test: {len(cases) + 1 - failed}/{len(cases) + 1} passed")
+    # a file the scan cannot read must be reported as skipped, never dropped silently
+    import tempfile
+    global MAX_FILE_BYTES
+    saved_max = MAX_FILE_BYTES
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        big = root / "big.py"
+        big.write_text("except:\n    pass\n", encoding="utf-8")
+        skipped: list[dict] = []
+        MAX_FILE_BYTES = 4
+        try:
+            got_hits = scan_file(root, big, 80, skipped)
+        finally:
+            MAX_FILE_BYTES = saved_max
+        if got_hits or [s["file"] for s in skipped] != ["big.py"] or "size" not in skipped[0]["reason"]:
+            failed += 1
+            print(f"FAIL skip accounting: hits={got_hits} skipped={skipped}")
+        md = render_markdown(root, None, [], scanned=0, skipped=skipped)
+        if "1 skipped" not in md or "big.py" not in md:
+            failed += 1
+            print("FAIL skip accounting: markdown omits the skipped file")
+    total = len(cases) + 3
+    print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 
 
@@ -202,14 +241,18 @@ def main() -> int:
         sys.exit(f"not a git repo root: {repo}")
 
     hits: list[dict] = []
-    for f in tracked_files(repo, args.since):
-        hits.extend(scan_file(repo, f, args.max_snippet))
+    skipped: list[dict] = []
+    files = tracked_files(repo, args.since)
+    for f in files:
+        hits.extend(scan_file(repo, f, args.max_snippet, skipped))
     hits.sort(key=lambda h: (h["file"], h["line"]))
+    scanned = len(files) - len(skipped)
 
     if args.json:
-        print(json.dumps({"repo": str(repo), "since": args.since, "candidates": hits}, indent=1))
+        print(json.dumps({"repo": str(repo), "since": args.since, "scanned": scanned,
+                          "skipped": skipped, "candidates": hits}, indent=1))
     else:
-        print(render_markdown(repo, args.since, hits))
+        print(render_markdown(repo, args.since, hits, scanned, skipped))
     return 0
 
 

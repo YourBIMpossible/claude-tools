@@ -9,7 +9,9 @@ Synthetic example — contains no private repository data or production findings
 """
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import os
 import subprocess
@@ -18,6 +20,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
+from typing import Any, Iterator
 
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
@@ -235,6 +238,9 @@ def test_snapshot_stability_and_index_untouched(root: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v2"], check=True, capture_output=True, env=env)
     control_changed = (index.read_bytes(), index.stat().st_mtime_ns) != after
     REPORT["index_refresh_without_optional_locks_off"] = control_changed
+    # SA11-CT-58: without the control the "index untouched" check above is vacuous: a stat cache
+    # git never refreshes proves nothing about GIT_OPTIONAL_LOCKS=0
+    assert control_changed, "control: plain git status did not refresh the stale index, so the fixture cannot detect a refresh"
 
 
 BRACKET_BUDGET_S = 60.0  # the bracket is under test, not the budget (timeout: test_snapshot_failed_is_final)
@@ -1094,20 +1100,17 @@ def test_short_name_path_normalizes_to_long_form(root: Path) -> None:
 
 def test_root_resolution_without_marker_and_gone(root: Path) -> None:
     """The captured root resolves by path hash even when the checkout no longer carries
-    the config marker; a removed worktree is reported as gone, not unresolved."""
+    the config marker; a removed worktree does not resolve as a live checkout."""
     live = root / "repo" / ".claude" / "worktrees" / "lane"
     (live / "sub").mkdir(parents=True)
     (live / ".git").write_text("gitdir: elsewhere", encoding="utf-8")
     m = {"repo": {"root_sha256": pipeline.root_sha256(live)}}
     assert pipeline.resolve_repo_root(m, [str(live / "sub")]) == live
-    assert not pipeline.captured_root_gone(m, [str(live / "sub")])
     gone = root / "repo" / ".claude" / "worktrees" / "removed"
     m = {"repo": {"root_sha256": pipeline.root_sha256(gone)}}
     assert pipeline.resolve_repo_root(m, [str(gone / "x")]) is None
-    assert pipeline.captured_root_gone(m, [str(gone / "x")])
     m = {"repo": {"root_sha256": "0" * 64}}
     assert pipeline.resolve_repo_root(m, [str(live)]) is None
-    assert not pipeline.captured_root_gone(m, [str(live)])
 
 
 def test_invalidate_replaces_prior_rescreen_cause(root: Path) -> None:
@@ -1312,11 +1315,127 @@ def test_shell_call_uses_its_own_recorded_cwd(root: Path) -> None:
     screen.screen(m, obs, repo, cwd=str(other))
     assert m["observation"]["shell_repo_mutations"] == [], m["observation"]
 
+@contextlib.contextmanager
+def patched(obj: Any, name: str, value: Any) -> Iterator[None]:
+    old = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, old)
+
+
+def run_cli(st: store.Stores, argv: list[str]) -> tuple[int, str]:
+    """``capture.main(argv)`` against ``st``; ``(exit code, standard error)``."""
+    import capture
+    err = io.StringIO()
+    with patched(capture, "_stores", lambda env: st), contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(err):
+        rc = capture.main(argv)
+    return rc, err.getvalue()
+
+
+def test_sa11_ct12_report_commit_failure_exits_nonzero(root: Path) -> None:
+    """SA11-CT-12 / SA16-CT-9: an uncommitted checkpoint says so and the CLI exits 2."""
+    import backstop
+    import capture
+    import report
+    st = make_stores(root)
+    lock = st.meta / ".git" / "index.lock"
+    lock.write_bytes(b"")
+    try:
+        path, ck = report.write_checkpoint(st, n=1, tool_commit="0" * 40, backstop={"state": "ok"})
+    finally:
+        lock.unlink()
+    assert path.is_file() and ck.get("_committed") is False, ck.get("_committed")
+    assert "_committed" not in json.loads(path.read_text(encoding="utf-8")), "the flag is not part of the record"
+    _, ck = report.write_checkpoint(st, n=2, tool_commit="0" * 40, backstop={"state": "ok"}, commit=False)
+    assert "_committed" in ck and ck["_committed"] is None, ck.get("_committed")
+
+    for committed, rc in ((False, 2), (True, 0), (None, 0)):
+        fake = {"denominator": {"episodes_total": 0}, "funnel": {"provisional_candidates": 0}, "_committed": committed}
+        with patched(capture, "write_checkpoint", lambda s, **kw: (path, fake)), \
+                patched(pipeline, "tool_identity", lambda: ("0" * 40, None)), \
+                patched(pipeline, "capture_failure_records", lambda s, e: ([], [])), \
+                patched(backstop, "health", lambda *a, **kw: {"state": "ok"}):
+            got, err = run_cli(st, ["report"])
+        assert got == rc, (committed, got)
+        assert ("metadata commit failed" in err) == (rc == 2), err
+
+
+def test_sa11_ct14_expire_cli_exit_follows_the_counts(root: Path) -> None:
+    """SA11-CT-14 / SA16-CT-8 / SA11-CT-19: expire exits non-zero on errors or a failed
+    commit, and warns on undated content and unreadable seals."""
+    import capture
+    st = make_stores(root)
+    clean = {"expired_deleted": 0, "deletions_verified": 0, "extended_by_seal": 0, "undated": 0,
+             "errors": 0, "seals_unreadable": 0, "committed": True}
+    cases = [({}, 0, ""), ({"errors": 1}, 4, "errors 1"), ({"committed": False}, 2, "metadata commit failed"),
+             ({"seals_unreadable": 2}, 3, "seals_unreadable 2"), ({"undated": 1}, 3, "undated 1"),
+             ({"committed": None}, 0, "")]
+    for over, rc, said in cases:
+        res = clean | over
+        with patched(capture, "expire", lambda s: res):
+            got, err = run_cli(st, ["expire"])
+        assert got == rc, (over, got, err)
+        assert (said in err) if said else not err, (over, err)
+
+
+def test_sa11_ct15_fn_audit_commit_failure_propagates(root: Path) -> None:
+    """SA11-CT-15: sheet, score and amendment report an uncommitted write, the CLI exits 2,
+    and admission never rests on an uncommitted audit result."""
+    import audit
+    st = make_stores(root)
+    m = base_manifest("audited")
+    store.write_manifest(st, m)
+    ep = m["episode_id"]
+
+    def no_commit(s: store.Stores, paths: list[Path], msg: str) -> bool:
+        return False
+
+    with patched(audit, "commit_meta", no_commit), patched(mf, "provisional_candidate", lambda f: True):
+        sheet = audit.build_sheet(st)
+    assert sheet.get("committed") is False, sheet
+    k = sheet["audit"]
+    labels = json.loads(audit.labels_path(st, k).read_text(encoding="utf-8"))
+    for e in labels["episodes"]:
+        e["labels"] = {c: {"label": "not_needed", "basis": "synthetic"} for c in audit.CATEGORIES}
+    labels["sealed"] = True
+    common.write_json_atomic(audit.labels_path(st, k), labels)
+    with patched(audit, "commit_meta", no_commit), patched(audit, "labels_sealed", lambda s, n: []):
+        res = audit.score(st, k)
+    assert res.get("committed") is False, res
+    on_disk = json.loads(audit.result_path(st, k).read_text(encoding="utf-8"))
+    assert "committed" not in on_disk, "the flag is not part of the record"
+
+    adm = audit.admission_check(st, ep)
+    assert any("audit result not committed" in r for r in adm["reasons"]), adm
+    with patched(audit, "commit_meta", no_commit):
+        amended = audit.record_amendment(st, k, "widened", "f" * 40)
+    assert amended.get("committed") is False, amended
+    assert store.commit_meta(st, [audit.result_path(st, k)], "result")
+    adm = audit.admission_check(st, ep)
+    assert not any("audit result not committed" in r for r in adm["reasons"]), adm
+    assert audit.record_amendment(st, k, "again", "e" * 40).get("committed") is True
+    dry = audit.record_amendment(st, k, "dry", "d" * 40, commit=False)
+    assert "committed" in dry and dry["committed"] is None, dry
+
+    for committed, rc in ((False, 2), (True, 0), (None, 0)):
+        with patched(audit, "build_sheet", lambda s: {"audit": 9, "committed": committed}):
+            got, err = run_cli(st, ["fn-audit", "sheet"])
+        assert got == rc, (committed, got)
+        assert ("metadata commit failed" in err) == (rc == 2), err
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
 def main() -> int:
     only = sys.argv[1:]
+    unknown = sorted(set(only) - {fn.__name__ for fn in TESTS})
+    if unknown:  # SA11-CT-35: a filter that matches nothing is a usage error, not "0 passed"
+        print(f"unknown test name(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
     with tempfile.TemporaryDirectory(prefix="ec-capture-test-") as tmp:
         for fn in TESTS:
             if only and fn.__name__ not in only:

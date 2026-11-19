@@ -145,10 +145,19 @@ def main() -> int:
     args.packet += [pid for pid in targets if pid not in args.packet]
 
     compiler, ranking, scoping, ripgrep, loaded = _import_compiler(args.src)
-    packets, _ = mr.load_packets()
-    pool = [p for p in packets if p.traffic == "candidate" and Path(p.repo_root).is_dir()
-            and (not args.packet or any(p.packet_id.startswith(x) for x in args.packet))]
-    turns, _ = mr.build_turns(pool)
+    packets, load_issues = mr.load_packets()
+    skipped: Counter = Counter()  # packets left out by design, by reason (not data loss)
+    pool = []
+    for p in packets:
+        if p.traffic != "candidate":
+            skipped["not_candidate"] += 1
+        elif not Path(p.repo_root).is_dir():
+            skipped["repo_root_missing"] += 1
+        elif args.packet and not any(p.packet_id.startswith(x) for x in args.packet):
+            skipped["not_selected"] += 1
+        else:
+            pool.append(p)
+    turns, turn_issues = mr.build_turns(pool)
 
     uncapped_cache: dict = {}
     rows, packet_rows = [], []
@@ -159,6 +168,7 @@ def main() -> int:
         named = next((v for k, v in targets.items() if p.packet_id.startswith(k)), set())
         opened = sorted(native | named)
         if not opened:
+            skipped["no_opened_files"] += 1
             continue
         raw = mr.load_packet_json(p.store_root, f"*{p.packet_id}.json")
         if raw is None:
@@ -166,6 +176,7 @@ def main() -> int:
             continue
         symbols = raw.get("task", {}).get("extracted_symbols") or []
         if not symbols:
+            skipped["no_symbols"] += 1
             continue
 
         runs = [_views(_compile(compiler, scoping, p.repo_root, symbols), ranking) for _ in range(args.repeats)]
@@ -212,8 +223,8 @@ def main() -> int:
         "packets_repeat_same_raw_path_set": sum(r["repeat_same_raw_path_set"] for r in packet_rows),
         "packets_repeat_same_brief": sum(r["repeat_same_brief"] for r in packet_rows),
         "files_brief_membership_unstable": sum(1 for r in rows if len(set(r["in_brief"])) > 1),
-        "issues": dict(issues),
-        "complete": not issues,
+        "skipped": dict(skipped),
+        **mr.replay_completeness(issues, load_issues, turn_issues),
     }
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / f"replay_relevance_{args.label}.json").write_text(

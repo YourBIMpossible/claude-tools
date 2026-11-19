@@ -963,13 +963,40 @@ def overdue(stores: Stores, *, now: str | None = None) -> list[dict[str, str]]:
             if expires is not None and seal is None]
 
 
-def expire(stores: Stores, *, now: str | None = None, commit: bool = True) -> dict[str, int]:
+def unreadable_seals(stores: Stores) -> list[Path]:
+    """Seal files ``valid_seal`` cannot read (not JSON, or not a JSON object). They extend
+    nothing, so expiry fails closed past them; this lists them so the pass can say so."""
+    bad: list[Path] = []
+    for d in stores.seal_dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.json")):
+            try:
+                rec = read_json(f)
+            except (OSError, ValueError):
+                bad.append(f)
+                continue
+            if not isinstance(rec, dict):
+                bad.append(f)
+    return bad
+
+
+def expire(stores: Stores, *, now: str | None = None, commit: bool = True) -> dict[str, Any]:
     """Delete every snapshot and payload past its expiry without a valid seal; verified,
-    logged in ``DELETIONS.log`` and committed with the updated manifests."""
+    logged in ``DELETIONS.log`` and committed with the updated manifests.
+
+    The counts also carry ``seals_unreadable`` (seal files that could not be read: ignored,
+    so the content they may have meant to keep expires; a warning, not an error, because
+    the pass fails closed) and ``committed`` (the metadata commit's result; ``None`` when
+    ``commit`` is false, ``True`` when nothing needed committing)."""
     now_s = now or iso(now_utc())
     now_dt = parse_iso(now_s)
     assert now_dt is not None
-    counts = {"expired_deleted": 0, "deletions_verified": 0, "extended_by_seal": 0, "undated": 0, "errors": 0}
+    counts: dict[str, Any] = {"expired_deleted": 0, "deletions_verified": 0, "extended_by_seal": 0, "undated": 0,
+                              "errors": 0, "seals_unreadable": 0}
+    for f in unreadable_seals(stores):
+        counts["seals_unreadable"] += 1
+        log_line(stores, f"expire: seal unreadable, ignored (content it names is not extended): {f.name}")
     touched: list[Path] = []
     for kind, ep, mp, m, expires, seal in _content_due(stores, now_dt):
         if expires is None:
@@ -1004,6 +1031,7 @@ def expire(stores: Stores, *, now: str | None = None, commit: bool = True) -> di
                        deletion_verified=all(d["verified"] for d in dels.values()))
             write_manifest(stores, m)
             touched.append(mp)
-    if touched and commit:
+    counts["committed"] = None if not commit else (
         commit_meta(stores, sorted(set(touched)), f"capture expire: {counts['expired_deleted']} deleted")
+        if touched else True)
     return counts

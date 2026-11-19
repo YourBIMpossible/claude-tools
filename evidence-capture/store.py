@@ -74,16 +74,38 @@ class Stores:
         return self.content / "tmp"
 
 
+def _read_config(config: Path) -> tuple[dict[str, Any], str | None]:
+    """``(settings, problem)``: the config object, or ``{}`` and why it could not be used."""
+    try:
+        cfg = read_json(config)
+    except (OSError, ValueError) as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+    if not isinstance(cfg, dict):
+        return {}, f"not an object ({type(cfg).__name__})"
+    return cfg, None
+
+
+def config_problem(config: Path = USER_CONFIG) -> str | None:
+    """Why an existing store config cannot be used, or None (absent or readable). For a
+    refusal to name a broken config rather than read as an unconfigured machine."""
+    if not config.is_file():
+        return None
+    _, problem = _read_config(config)
+    return None if problem is None else f"store config unreadable: {config}: {problem}"
+
+
 def resolve_stores(env: dict[str, str] | None = None, config: Path = USER_CONFIG) -> Stores | None:
-    """Store paths from the environment, else the user config; None when neither says."""
+    """Store paths from the environment, else the user config; None when neither says.
+    A config file that exists but cannot be read or is not a JSON object says nothing
+    either, but it is not an unconfigured machine: it leaves one line in the temp
+    fallback log (there is no store to log to) naming the file and why."""
     env = os.environ if env is None else env
     meta, content = env.get(ENV_META), env.get(ENV_CONTENT)
     packets, seals = env.get(ENV_PACKET_DIRS), env.get(ENV_SEALS)
     if not (meta and content) and config.is_file():
-        try:
-            cfg = read_json(config)
-        except (OSError, ValueError):
-            cfg = {}
+        cfg, problem = _read_config(config)
+        if problem:
+            log_line(None, f"store config unreadable: {config}: {problem}")
         meta = meta or cfg.get("meta")
         content = content or cfg.get("content")
         packets = packets or os.pathsep.join(cfg.get("packet_dirs") or [])
@@ -119,9 +141,25 @@ def init_stores(stores: Stores) -> None:
         sentinel.write_text("capture-content-sentinel " + os.urandom(8).hex() + "\n", encoding="utf-8")
 
 
-def _under_git(path: Path) -> bool:
-    proc = subprocess.run(["git", "-C", str(path), "rev-parse", "--git-dir"], capture_output=True)
-    return proc.returncode == 0
+# git's own messages in English, so "not a git repository" can be told from other failures
+_GIT_C_ENV = {"LC_ALL": "C", "LANGUAGE": "C"}
+
+
+def _git_dir_state(path: Path) -> tuple[bool | None, str | None]:
+    """(whether ``path`` is inside a git repository, why git could not say). Only git's own
+    "not a git repository" answer is False; a git that cannot start or refuses the
+    directory (dubious ownership, say) is (None, why)."""
+    try:
+        proc = subprocess.run(["git", "-C", str(path), "rev-parse", "--git-dir"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env={**os.environ, **_GIT_C_ENV}, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"git failed: {type(exc).__name__}: {exc}"
+    if proc.returncode == 0:
+        return True, None
+    err = (proc.stderr or "").strip()
+    if "not a git repository" in err.lower():
+        return False, None
+    return None, f"git rev-parse exit {proc.returncode}: {err[:200]}"
 
 
 def _under_sync_root(path: Path) -> str | None:
@@ -144,15 +182,29 @@ def parse_attrib_flags(line: str) -> str | None:
     return m.group("flags").replace(" ", "") if m else None
 
 
-def _windows_attrib_flags(path: Path) -> str | None:
+def _attrib_probe(path: Path) -> tuple[str | None, str | None]:
+    """(``attrib`` flag letters of ``path``, why they could not be read). Off Windows the
+    guard does not apply: (None, None)."""
     if os.name != "nt":
-        return None
+        return None, None
     try:
-        out = subprocess.run(["attrib", str(path)], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    line = out.strip().splitlines()[-1] if out.strip() else ""
-    return parse_attrib_flags(line)
+        proc = subprocess.run(["attrib", str(path)], capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return None, "attrib timed out"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"attrib failed: {type(exc).__name__}: {exc}"
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None, f"attrib printed nothing (exit {proc.returncode})"
+    line = out.splitlines()[-1]
+    flags = parse_attrib_flags(line)
+    if flags is None:
+        return None, f"attrib output not understood: {line[:120]}"
+    return flags, None
+
+
+def _windows_attrib_flags(path: Path) -> str | None:
+    return _attrib_probe(path)[0]
 
 
 def check_content_store(stores: Stores) -> list[str]:
@@ -164,13 +216,18 @@ def check_content_store(stores: Stores) -> list[str]:
     for name in CONTENT_MARKERS:
         if not (c / name).is_file():
             problems.append(f"marker missing: {name}")
-    if _under_git(c):
+    in_git, why = _git_dir_state(c)
+    if in_git is None:
+        problems.append(f"could not tell whether the content store is inside a git repository: {why}")
+    elif in_git:
         problems.append("content store is inside a git repository")
     sync = _under_sync_root(c)
     if sync:
         problems.append(f"content store under a sync root: {sync}")
-    flags = _windows_attrib_flags(c)
-    if flags and any(f in flags for f in ("P", "U", "O")):
+    flags, unknown = _attrib_probe(c)
+    if unknown:
+        problems.append(f"cloud-attribute guard could not be evaluated: {unknown}")
+    elif flags and any(f in flags for f in ("P", "U", "O")):
         problems.append(f"content store has cloud attributes: {flags}")
     for d in CONTENT_DIRS:
         if not (c / d).is_dir():
@@ -183,12 +240,23 @@ def check_meta_store(stores: Stores) -> list[str]:
     problems: list[str] = []
     if not m.is_dir():
         return ["metadata store missing"]
-    if not _under_git(m):
+    in_git, why = _git_dir_state(m)
+    if in_git is None:
+        problems.append(f"could not tell whether the metadata store is a git repository: {why}")
+    elif not in_git:
         problems.append("metadata store is not a git repository")
     else:
-        remotes = subprocess.run(["git", "-C", str(m), "remote"], capture_output=True, text=True).stdout
-        if remotes.strip():
-            problems.append("metadata store has a remote")
+        try:
+            proc = subprocess.run(["git", "-C", str(m), "remote"], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            problems.append(f"metadata store remotes could not be listed: {type(exc).__name__}: {exc}")
+        else:
+            if proc.returncode != 0:
+                problems.append(f"metadata store remotes could not be listed: git remote exit {proc.returncode}: "
+                                f"{(proc.stderr or '').strip()[:200]}")
+            elif (proc.stdout or "").strip():
+                problems.append("metadata store has a remote")
     gi = m / ".gitignore"
     if not gi.is_file() or "*.patch" not in gi.read_text(encoding="utf-8"):
         problems.append("metadata .gitignore lacks the content exclusions")
@@ -335,7 +403,8 @@ def new_tmp_dir(stores: Stores, episode: str) -> Path:
 
 
 def clean_tmp_orphans(stores: Stores, max_age_s: int = TMP_MAX_AGE_S) -> list[str]:
-    """Delete ``tmp/`` entries older than ``max_age_s``; return their names."""
+    """Delete ``tmp/`` entries older than ``max_age_s``; return their names. An entry whose
+    age cannot be read, or that could not be removed, is kept and logged."""
     gone: list[str] = []
     if not stores.tmp.is_dir():
         return gone
@@ -345,7 +414,8 @@ def clean_tmp_orphans(stores: Stores, max_age_s: int = TMP_MAX_AGE_S) -> list[st
         episode = entry.name.split(".", 1)[0]
         try:
             old = entry.stat().st_mtime < cutoff
-        except OSError:
+        except OSError as exc:
+            log_line(stores, f"tmp orphan age unreadable: {entry.name}: {type(exc).__name__}: {exc}")
             continue
         if old and staged.is_dir() and not (stores.snapshots / episode).exists() \
                 and not (stores.payloads / episode).exists():
@@ -359,8 +429,11 @@ def clean_tmp_orphans(stores: Stores, max_age_s: int = TMP_MAX_AGE_S) -> list[st
                 log_line(stores, f"staging interrupted; snapshot restore failed: {episode}: {exc}")
                 continue
         # ``old`` was taken before any restore (which touches the entry's mtime).
-        if old and rmtree(entry):
-            gone.append(entry.name)
+        if old:
+            if rmtree(entry):
+                gone.append(entry.name)
+            else:
+                log_line(stores, f"tmp orphan could not be removed: {entry.name}")
     if gone:
         log_line(stores, f"tmp orphans removed: {','.join(gone)}")
     return gone

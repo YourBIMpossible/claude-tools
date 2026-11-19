@@ -11,6 +11,28 @@ import os
 import sys
 
 
+def _log_import_failure(hook: str, exc: BaseException, env: dict[str, str]) -> None:
+    """The one line an import failure leaves: in the capture log through ``store`` when that
+    imports, else in the temp fallback log ``store.log_line`` falls back to. Never raises."""
+    message = f"{hook}: import failed: {type(exc).__name__}: {exc}"
+    try:
+        from store import log_line, resolve_stores
+
+        log_line(resolve_stores(env), message)
+        return
+    except Exception:  # noqa: BLE001 — store itself may be what failed to import
+        pass
+    try:
+        from datetime import datetime, timezone
+
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tmp = env.get("TEMP") or env.get("TMPDIR") or "."
+        with open(os.path.join(tmp, "ec-capture-failures.log"), "a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} {message}\n")
+    except Exception:  # noqa: BLE001 — fail-open (plan §9): no log is still exit 0
+        pass
+
+
 def main() -> int:
     env = dict(os.environ)
     try:
@@ -19,7 +41,8 @@ def main() -> int:
 
         import pipeline
         from store import log_line, resolve_stores
-    except Exception:  # noqa: BLE001 — an import failure must not reach the agent
+    except Exception as exc:  # noqa: BLE001 — an import failure must not reach the agent
+        _log_import_failure("start", exc, env)
         return 0
     try:
         if pipeline.disabled(env):

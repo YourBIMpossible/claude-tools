@@ -24,6 +24,9 @@ the same Footprint extractor as natural episodes.
     python twin.py report     --tasks tasks.json --plan plan.json --archive <dir> --cap 4000000
                               --seed <int> --out report.json
 
+Exit codes: 0 done; 1 when ``run`` stopped before the plan completed (an invalid run,
+the ceiling, a blank brief) or ``report`` found the bench blind (a failed positive control).
+
 Standard library, ``git`` and the ``claude`` CLI only.
 """
 from __future__ import annotations
@@ -34,6 +37,7 @@ import json
 import math
 import os
 import random
+import queue
 import re
 import shutil
 import signal
@@ -52,6 +56,8 @@ sys.path.insert(0, str(HERE.parent / "evidence-capture"))
 import clone_builder  # noqa: E402
 import store as capture_store  # noqa: E402
 import footprints as fpm  # noqa: E402
+sys.path.insert(0, str(HERE))
+from replay_hook import DELIVERED_SUFFIX  # noqa: E402
 
 ARMS = ("A", "B")
 DEFAULT_CAP = 4_000_000
@@ -292,49 +298,80 @@ def score_run(state: StreamState, repo: Path, task: dict) -> dict:
     }
 
 
-def kill_tree(proc: subprocess.Popen) -> None:
+def kill_tree(proc: subprocess.Popen) -> str | None:
     """Kill ``proc`` and, where it can be found, every process it started: ``taskkill /T`` on
     Windows; on POSIX the process group when ``proc`` leads its own (``start_new_session``),
-    else ``proc`` alone."""
+    else ``proc`` alone. ``None`` when the kill went through (or ``proc`` had already exited),
+    else why it did not (SA11-CT-63): a failed ``taskkill`` falls back to killing ``proc``
+    alone and is still reported, so no caller trusts a tree kill that never happened."""
     if proc.poll() is not None:
-        return
+        return None
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
-        return
+        try:
+            r = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+                               timeout=KILL_GRACE)
+        except (OSError, subprocess.SubprocessError) as exc:
+            why = f"taskkill could not run: {type(exc).__name__}: {exc}"
+        else:
+            if r.returncode == 0:
+                return None
+            why = f"taskkill rc {r.returncode}: {(r.stderr or b'').decode('utf-8', 'replace').strip()[:200]}"
+        if proc.poll() is not None:
+            return None  # it exited while taskkill ran: nothing left to kill
+        try:
+            proc.kill()
+        except OSError as exc:
+            return f"{why}; kill fallback failed: {type(exc).__name__}: {exc}"
+        return f"{why}; fell back to killing the process alone"
+    group_error = None
     try:
         if os.getpgid(proc.pid) == proc.pid:
             os.killpg(proc.pid, signal.SIGKILL)
-            return
+            return None
     except ProcessLookupError:
-        return
-    proc.kill()
+        return None
+    except OSError as exc:
+        group_error = f"killpg failed: {type(exc).__name__}: {exc}"
+    try:
+        proc.kill()
+    except OSError as exc:
+        return "; ".join(filter(None, (group_error, f"kill failed: {type(exc).__name__}: {exc}")))
+    return None if group_error is None else f"{group_error}; fell back to killing the process alone"
 
 
 # Seconds to drain a killed verify's pipes. A process that escaped the tree kill and still
 # holds them must not hold the run: past this the pipes are abandoned.
 KILL_GRACE = 5.0
 
+# Seconds a run's CLI may keep running after its output closed before it is killed: the wait
+# for its exit is bounded, never ``proc.wait()`` with no limit (SA11-CT-63).
+EXIT_GRACE = 30.0
+
 
 def run_verify(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float) -> tuple[bool, str | None]:
     """``(verified, verify_error)`` for one verify command. Past ``timeout`` the command is
     killed with every process it started and the result is ``(False, "timeout after …")``;
-    the whole call is bounded by ``timeout + KILL_GRACE``."""
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            start_new_session=os.name != "nt")
+    the whole call is bounded by ``timeout + 2 * KILL_GRACE``.
+
+    Its output is never read, so it goes to the null device: no pipe exists for a process
+    that escaped the tree kill to hold open. A held pipe used to stall the drain, and on
+    Windows closing it blocks while a reader thread is still inside ``read`` (SA26-26)."""
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=os.name != "nt")
     try:
-        proc.communicate(timeout=timeout)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        kill_tree(proc)
+        why = kill_tree(proc)
+        note = f"; kill: {why}" if why else ""
         try:
-            proc.communicate(timeout=KILL_GRACE)
-        except subprocess.TimeoutExpired:
-            for pipe in (proc.stdout, proc.stderr):
-                if pipe is not None:
-                    pipe.close()
-            proc.kill()
             proc.wait(timeout=KILL_GRACE)
-            return False, f"timeout after {timeout:g}s; output pipes still held after the kill"
-        return False, f"timeout after {timeout:g}s"
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=KILL_GRACE)
+            except subprocess.TimeoutExpired:
+                return False, f"timeout after {timeout:g}s{note}; the verify did not exit after the kill"
+        return False, f"timeout after {timeout:g}s{note}"
     return proc.returncode == 0, None
 
 
@@ -408,8 +445,15 @@ def clear_project_trace(projects: Path, repo: Path) -> list[str]:
     return left
 
 
+def blank_brief(task: dict) -> bool:
+    """A brief with nothing in it: arm A would inject nothing and equal arm B (SA11-CT-64)."""
+    return not (task.get("brief") or "").strip()
+
+
 def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, cap: int, wall: int,
             claude: str, projects: Path, cli_sha: str | None = None) -> dict:
+    if run["arm"] == "A" and blank_brief(task):
+        raise ValueError(f"{run['run_id']}: arm A with an empty brief would equal arm B")
     out = archive / run["run_id"]
     out.mkdir(parents=True, exist_ok=True)
     work = scratch / run["run_id"].replace(".", "_")
@@ -427,10 +471,13 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
             write_json(out / "clone_proofs.json", proofs)
 
     brief_arg = "-"
-    if run["arm"] == "A" and task["brief"]:
+    brief_sha = None
+    if run["arm"] == "A":
         brief_file = work / "brief.md"
-        brief_file.write_text(task["brief"].replace("{head}", head), encoding="utf-8")
+        brief_text = task["brief"].replace("{head}", head)
+        brief_file.write_text(brief_text, encoding="utf-8")
         brief_arg = brief_file.as_posix()
+        brief_sha = sha256_bytes(brief_text.encode("utf-8"))
     settings = work / "settings.json"
     write_json(settings, settings_for(brief_arg, sys.executable))
     env, dropped = child_env()
@@ -439,18 +486,69 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
 
     state = StreamState()
     killed: list[str] = []
+    process_errors: list[str] = []
+    output_held: str | None = None
     started = time.monotonic()
     target_seconds = None
     with (out / "stream.jsonl").open("w", encoding="utf-8", newline="\n") as stream, \
             (out / "stderr.txt").open("w", encoding="utf-8") as err:
         proc = subprocess.Popen(claude_cmd(claude, task["prompt"], model, settings), cwd=repo,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err, env=env,
-                                text=True, encoding="utf-8", errors="replace")
-        timer = threading.Timer(wall, lambda: (killed.append("wall"), kill_tree(proc)))
+                                text=True, encoding="utf-8", errors="replace",
+                                start_new_session=os.name != "nt")
+        # The wall timer and the cap check both kill through here, under one lock with the
+        # end-of-output flag: a timer that fires once the output is complete is a no-op, so a
+        # finished run is never labelled killed (SA11-CT-64). A failed kill is recorded, and a
+        # later trigger (the wall after a cap kill) tries again.
+        lock = threading.Lock()
+        output_done = threading.Event()
+
+        def kill(reason: str) -> None:
+            with lock:
+                if output_done.is_set() or proc.poll() is not None:
+                    return
+                if not killed:
+                    killed.append(reason)
+                why = kill_tree(proc)
+                if why:
+                    process_errors.append(f"{reason} kill: {why}")
+
+        # The output is read on its own thread, so the bounds hold even when the pipe never
+        # closes: a process the CLI started that escaped the kill keeps it open after the CLI
+        # is gone (SA26-26). Past the grace the read is abandoned, never waited out.
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def pump(src: Any) -> None:
+            try:
+                for item in src:
+                    lines.put(item)
+            except (OSError, ValueError) as exc:  # the pipe broke mid-read
+                process_errors.append(f"output read failed: {type(exc).__name__}: {exc}")
+            finally:
+                lines.put(None)
+
+        assert proc.stdout is not None
+        threading.Thread(target=pump, args=(proc.stdout,), daemon=True, name="twin-stdout").start()
+        timer = threading.Timer(wall, kill, args=("wall",))
         timer.start()
         try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
+            gone_at: float | None = None  # when the CLI was first seen exited or killed
+            while True:
+                try:
+                    line = lines.get(timeout=0.2)
+                except queue.Empty:
+                    if gone_at is None:
+                        if killed or proc.poll() is not None:
+                            gone_at = time.monotonic()
+                    elif time.monotonic() - gone_at > (KILL_GRACE if killed else EXIT_GRACE):
+                        output_held = (f"output pipe still open {KILL_GRACE if killed else EXIT_GRACE:g}s after "
+                                       f"the CLI {'was killed' if killed else 'exited'}: a process it started holds "
+                                       "it, reading abandoned")
+                        process_errors.append(output_held)
+                        break
+                    continue
+                if line is None:
+                    break
                 stream.write(line if line.endswith("\n") else line + "\n")
                 try:
                     event = json.loads(line)
@@ -462,39 +560,97 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
                     if target_seconds is None and len(state.calls) > before and score_run(state, repo, task)["reached"]:
                         target_seconds = round(time.monotonic() - started, 1)
                 if state.tokens() > cap and not killed:
-                    killed.append("cap")
-                    kill_tree(proc)
-            proc.wait()
+                    kill("cap")
+            with lock:
+                output_done.set()
+            # Bounded: a CLI that outlives its output, or survives a failed kill, never hangs
+            # the batch (SA11-CT-63). One still running after the kill is recorded below.
+            grace = KILL_GRACE if killed else EXIT_GRACE
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                process_errors.append(f"did not exit {grace:g}s after its output closed; killed")
+                why = kill_tree(proc)
+                if why:
+                    process_errors.append(f"exit kill: {why}")
+                try:
+                    proc.wait(timeout=KILL_GRACE)
+                except subprocess.TimeoutExpired:
+                    process_errors.append(f"still running {KILL_GRACE:g}s after the kill (pid {proc.pid})")
         finally:
             timer.cancel()
+    exit_code = proc.returncode  # None: the CLI was still running when the harness stopped waiting
     seconds = round(time.monotonic() - started, 1)
+    # Arm A counts only when its fail-open hook confirmed it emitted this exact brief (SA11-CT-40).
+    # "delivered" = emitted by the hook: the marker cannot show the model received the brief.
+    brief_delivered = None
+    if brief_sha is not None:
+        try:
+            marker = Path(brief_arg + DELIVERED_SUFFIX).read_text(encoding="utf-8").strip()
+        except OSError:
+            marker = None
+        brief_delivered = marker == brief_sha
 
-    git(repo, "add", "-A")
-    diff = git(repo, "diff", "--cached", "--binary", head)
-    (out / "diff.patch").write_text(diff, encoding="utf-8", newline="\n")
+    # The tokens are spent: from here on nothing may leave run_one before meta.json is written,
+    # or the spend never reaches the ledger (SA26-26). A step that fails is recorded instead.
+    post_errors: list[str] = []
+    diff = ""
+    try:
+        git(repo, "add", "-A")
+        diff = git(repo, "diff", "--cached", "--binary", head)
+        (out / "diff.patch").write_text(diff, encoding="utf-8", newline="\n")
+    except (RuntimeError, OSError) as exc:
+        post_errors.append(f"diff: {type(exc).__name__}: {exc}")
     verified = None
     verify_error = None
     if task.get("verify"):
         # verify.py imports the run's edited code: it gets the run's environment, not the harness's.
-        verified, verify_error = run_verify([sys.executable, task["verify"], str(repo)], cwd=repo, env=env,
-                                            timeout=VERIFY_TIMEOUT)
-    scored = score_run(state, repo, task)
+        try:
+            verified, verify_error = run_verify([sys.executable, task["verify"], str(repo)], cwd=repo, env=env,
+                                                timeout=VERIFY_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as exc:
+            verified, verify_error = None, f"verify could not run: {type(exc).__name__}: {exc}"
+    try:
+        scored = score_run(state, repo, task)
+    except (OSError, ValueError, KeyError) as exc:
+        post_errors.append(f"score: {type(exc).__name__}: {exc}")
+        scored = {"calls": len(state.calls), "reached": False, "calls_to_target": None, "tokens_to_target": None,
+                  "edited": [], "touched": [], "planted_touched": []}
     trace = [] if rmtree(work, tries=30) else [f"scratch not deleted: {work}"]
-    trace += clear_project_trace(projects, repo)
+    try:
+        trace += clear_project_trace(projects, repo)
+    except OSError as exc:
+        trace.append(f"projects trace not checked: {type(exc).__name__}: {exc}")
     if source_status is not None:
-        after = sha256_bytes(git(Path(task["prepare"]["source"]), "status", "--porcelain").encode())
-        if after != source_status:
-            trace.append("source checkout status changed")
+        try:
+            after = sha256_bytes(git(Path(task["prepare"]["source"]), "status", "--porcelain").encode())
+        except (RuntimeError, OSError) as exc:
+            trace.append(f"source checkout status unreadable: {type(exc).__name__}: {exc}")
+        else:
+            if after != source_status:
+                trace.append("source checkout status changed")
 
     init = state.init or {}
     invalid = None  # a run the CLI never really executed is not a data point; a killed run is censored, not invalid
-    if not killed:
+    if exit_code is None:
+        # the CLI outlived every kill: it may still be spending or editing, so nothing it left is trusted
+        invalid = "process_not_killed: " + (process_errors[-1] if process_errors else "no exit status")
+    elif output_held is not None:
+        # something the run started outlived it and may still be editing: nothing it left is trusted
+        invalid = "output_held: " + output_held
+    elif not killed:
         if state.result is None:
             invalid = "no_result"
         elif state.result.get("is_error"):
             r = state.result
             invalid = ("cli_error: " + (f"api {r['api_error_status']}" if r.get("api_error_status")
                                         else str(r.get("terminal_reason") or r.get("subtype"))))
+    if post_errors and invalid is None:
+        # no trustworthy diff or score: keep the attempt and its spend, but it is not a data point
+        invalid = "post_run_error: " + post_errors[0]
+    if brief_delivered is False and invalid is None:
+        # the hook fails open: without its confirmation arm A may have run as arm B
+        invalid = "brief_not_delivered"
     result_usage = (state.result or {}).get("usage") or {}
     meta = {
         **run, "family": task.get("family"), "model": model, "head": head,
@@ -504,12 +660,13 @@ def run_one(task: dict, run: dict, *, archive: Path, scratch: Path, model: str, 
         "init_plugins": sorted(str(p.get("source") or p.get("name")) if isinstance(p, dict) else str(p)
                                for p in init.get("plugins") or []),
         "cli_path_sha256": cli_sha, "env_dropped": dropped,
-        "exit_code": proc.returncode, "killed": killed[0] if killed else None, "invalid": invalid,
+        "exit_code": exit_code, "killed": killed[0] if killed else None, "invalid": invalid,
+        "process_errors": process_errors, "brief_delivered": brief_delivered,
         "is_error": (state.result or {}).get("is_error"), "result_subtype": (state.result or {}).get("subtype"),
         "tokens_total": state.tokens(),
         "tokens_result": sum(int(result_usage.get(f) or 0) for f in USAGE_FIELDS),
         "wall_seconds": seconds, "seconds_to_target": target_seconds, "verified": verified,
-        "verify_error": verify_error,
+        "verify_error": verify_error, "post_run_errors": post_errors,
         "trace_left": trace,
         "stream_sha256": sha256_bytes((out / "stream.jsonl").read_bytes()),
         "diff_sha256": sha256_bytes(diff.encode("utf-8")),
@@ -549,6 +706,13 @@ def run_batch(tasks: list[dict], plan_obj: dict, *, archive: Path, scratch: Path
     done = started = 0
     stopped = None
     claude, cli_sha = resolve_cli(claude)
+    blank = sorted({run["task_id"] for run in plan_obj["runs"] if run["arm"] == "A"
+                    and not (kind and run["kind"] != kind) and blank_brief(by_id[run["task_id"]])})
+    if blank:
+        # arm A would inject nothing and equal arm B: refuse the batch before anything is spent
+        stopped = "empty brief: " + ", ".join(blank)
+        print(stopped, flush=True)
+        return {"already_done": 0, "ran": 0, "ledger_total": book["total"], "stopped": stopped}
     for run in plan_obj["runs"]:
         if kind and run["kind"] != kind:
             continue
@@ -572,8 +736,16 @@ def run_batch(tasks: list[dict], plan_obj: dict, *, archive: Path, scratch: Path
             n = 1
             while (archive / f"{run['run_id']}.invalid-{n}").exists():
                 n += 1
-            (archive / run["run_id"]).rename(archive / f"{run['run_id']}.invalid-{n}")
             stopped = f"invalid run {run['run_id']}: {meta['invalid']}"
+            try:
+                (archive / run["run_id"]).rename(archive / f"{run['run_id']}.invalid-{n}")
+            except OSError as exc:
+                # Windows refuses to rename a directory a surviving process still holds a file in
+                # (output_held). Move the meta aside instead, so neither the report nor a rerun
+                # reads this attempt as a completed run.
+                meta_path = archive / run["run_id"] / "meta.json"
+                meta_path.rename(meta_path.with_name(f"meta.invalid-{n}.json"))
+                stopped += f" (run directory kept in place, rename failed: {type(exc).__name__}: {exc})"
             print(stopped, flush=True)
             break
         print(f"{run['run_id']}: reached={meta['reached']} tokens={spent} killed={meta['killed']} "
@@ -743,10 +915,13 @@ def main(argv: list[str] | None = None) -> int:
                         model=args.model, ledger=args.ledger, cap=args.cap, ceiling=args.ceiling, wall=args.wall,
                         claude=args.claude, kind=args.kind, limit=args.limit, projects=args.projects)
         print(json.dumps(res, indent=1))
+        return 1 if res["stopped"] else 0  # invalid run, ceiling or blank brief: the plan did not complete
     elif args.cmd == "ledger":
         write_json(args.out, ledger_from_archives(args.archive))
     elif args.cmd == "report":
-        write_json(args.out, report(read_json(args.tasks), read_json(args.plan), args.archive, args.cap, args.seed))
+        summary = report(read_json(args.tasks), read_json(args.plan), args.archive, args.cap, args.seed)
+        write_json(args.out, summary)
+        return 1 if summary["bench_blind"] is True else 0  # a failed positive control: no result is interpretable
     return 0
 
 

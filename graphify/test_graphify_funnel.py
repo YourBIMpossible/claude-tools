@@ -11,6 +11,7 @@ import math
 import os
 import tempfile
 import textwrap
+import types
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
@@ -220,11 +221,43 @@ class AnyAgentType(FunnelCase):
         self.assertIn("backend-endpoint-reviewer:c1", out["bypassed"][0])
 
     def test_unknown_type_is_judged_shell_capable(self):
+        """An agent of unknown type stays an exploration unit (the worst case for routing), but its
+        bypass is unproven: it may have had no shell. Alone it caps routing at INSUFFICIENT, never FAIL."""
         sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))
         Transcript(self.repo).subagent("u1", "", sub).write(self.projects, "p", "s-untyped")
         out = self.run_funnel()
-        self.assertEqual(out["routing"]["verdict"], gf.FAIL)
-        self.assertIn("judged shell-capable", " ".join(out["inputs"]["problems"]))
+        self.assertEqual(out["routing"]["verdict"], gf.INSUFFICIENT)
+        self.assertEqual(out["routing"]["exploration_units"], 1)
+        self.assertEqual(len(out["routing"]["bypassed_type_unknown"]), 1)
+        self.assertIn("subagent:u1", out["routing"]["bypassed_type_unknown"][0])
+        self.assertIn("judged shell-capable", " ".join(out["inputs"]["notes"]))
+        self.assertIn("1 of them by agents of unknown type", gf.render(out))
+
+    def test_a_proven_bypass_still_fails_beside_a_type_unknown_one(self):
+        t = Transcript(self.repo)
+        for agent, kind in (("u1", ""), ("g1", "general-purpose")):
+            t.subagent(agent, kind, Transcript(self.repo).greps(2).reads(self.backend_files(3)))
+        t.write(self.projects, "p", "s-mixed")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["verdict"], gf.FAIL)
+        self.assertEqual((len(out["bypassed"]), len(out["bypassed_type_unknown"])), (2, 1))
+        self.assertEqual(out["bypassed_by_type"], {"general-purpose": 1, "unknown": 1})
+
+    def test_builtin_shell_agents_are_proven_bypasses(self):
+        """general-purpose, Explore, Plan and fork have a shell without any definition file."""
+        t = Transcript(self.repo)
+        for i, kind in enumerate(("general-purpose", "Explore", "Plan", "fork")):
+            t.subagent(f"b{i}", kind, Transcript(self.repo).greps(2).reads(self.backend_files(3)))
+        t.write(self.projects, "p", "s-builtin")
+        out = self.run_funnel()["routing"]
+        self.assertEqual((out["verdict"], len(out["bypassed"]), out["bypassed_type_unknown"]), (gf.FAIL, 4, []))
+
+    def test_plugin_agent_bypass_is_type_unknown(self):
+        sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))
+        Transcript(self.repo).subagent("p1", "toolkit:reviewer", sub).write(self.projects, "p", "s-plugin")
+        out = self.run_funnel()["routing"]
+        self.assertEqual((out["verdict"], len(out["bypassed_type_unknown"])), (gf.INSUFFICIENT, 1))
+        self.assertEqual(out["bypassed_by_type"], {"unknown": 1})
 
 
 class ShellLookups(FunnelCase):
@@ -491,6 +524,39 @@ class GraphUnusable(FunnelCase):
         self.session_with("runner", "s-shell")
         out = self.run_funnel()["routing"]
         self.assertEqual((out["verdict"], out["graph_unusable_units"]), (gf.FAIL, 0))
+
+    def test_unreadable_agent_definition_is_recorded(self):
+        """SA16-CT-16: an agent file that cannot be read is recorded, never skipped as if absent.
+
+        The agent is then judged shell-capable (A18: a note, not a PASS cap), but a bypass by an agent
+        whose tools are unknown is unproven, so alone it is INSUFFICIENT, not FAIL."""
+        (self.repo / ".claude" / "agents" / "reviewer.md").mkdir(parents=True)   # open() on a dir: OSError
+        self.session_with("reviewer", "s-unreadable-def")
+        out = self.run_funnel()
+        bad = out["inputs"]["agent_definitions_unreadable"]
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("reviewer.md", bad[0])
+        self.assertTrue(any("1 agent definition file(s) could not be read" in n for n in out["inputs"]["notes"]))
+        self.assertIn("1 agent definition file(s) could not be read", gf.render(out))
+        self.assertEqual(out["routing"]["verdict"], gf.INSUFFICIENT)
+        self.assertEqual(len(out["routing"]["bypassed_type_unknown"]), 1)
+
+    def test_repo_identity_os_error_is_an_input_problem(self):
+        """SA16-CT-17: a cwd whose git repo cannot be read is recorded, never silently 'no repo'."""
+        real, other = self.resolver, self.other.resolve()
+
+        def toplevel(start):
+            if start == other or other in start.parents:
+                raise PermissionError(13, "Access is denied", str(start))
+            return real._git_toplevel(start)
+        self.resolver = types.SimpleNamespace(_git_toplevel=toplevel, _main_checkout=real._main_checkout,
+                                              resolve=real.resolve)
+        Transcript(self.other).greps(1).write(self.projects, "p", "s-identity")
+        out = self.run_funnel()
+        bad = out["inputs"]["repo_identity_failures"]
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("PermissionError", bad[0])
+        InputVisibility.assert_problem(self, out, "1 path(s) whose git repo could not be read")
 
     def test_builtin_no_shell_agent_is_unusable(self):
         self.session_with("claude-code-guide", "s-guide")
@@ -784,6 +850,21 @@ class OrganicSeparation(FunnelCase):
         t.write(self.projects, "p", "s-fork")
         r = self.run_funnel()["routing"]
         self.assertEqual((r["graph_backed_units"], r["exploration_units"], len(r["bypassed"])), (2, 1, 1))
+
+    def test_copy_held_by_a_graphless_unit_does_not_drop_the_graph_backed_one(self):
+        # SA02-9: the latest holder of a shared tool_use id resolves to no graph. Copies are
+        # settled among graph-backed holders only, so the graph-backed unit keeps its lookups.
+        t = Transcript(self.repo).greps(6).reads(self.backend_files(3))
+        for rec in t.lines:
+            rec["sessionId"] = "s-orig"
+        t.write(self.projects, "p", "s-orig")
+        t.t += timedelta(hours=1)
+        t.greps(1)
+        for rec in t.lines:
+            rec["cwd"] = str(self.other)
+        t.write(self.projects, "q", "s-elsewhere")
+        r = self.run_funnel()["routing"]
+        self.assertEqual((r["graph_backed_units"], r["exploration_units"], len(r["bypassed"])), (1, 1, 1))
 
     def test_continuation_call_covers_its_copied_exploration(self):
         # SA26-6: a continued transcript holds the earlier lookups and then queries graphify
@@ -1315,6 +1396,24 @@ class InputVisibility(FunnelCase):
         self.assertEqual(len(out["inputs"]["transcripts_unstatable"]), 1)
         self.assert_problem(out, "1 transcript(s) could not be stat'ed")
 
+    def test_type_unknown_subagent_is_a_note_not_a_pass_cap(self):
+        """A18: a subagent whose type is unknown is judged shell-capable, the worst case for routing,
+        and its transcript is still read. A PASS reached that way holds for any true type, so the
+        gap is reported as a note and caps no verdict; the subagent still counts as exploration."""
+        sub = Transcript(self.repo, T0 + timedelta(minutes=1)).query("who calls sync").greps(2)             .reads(self.backend_files(2))
+        Transcript(self.repo).hint().subagent("a2", "Explore", sub).write(self.projects, "p", "s-legacy")
+        (self.projects / "p" / "s-legacy" / "subagents" / "agent-a2.meta.json").unlink()
+        self.log_record("who calls sync", T0 + timedelta(minutes=1, seconds=2))
+        out = self.run_funnel()
+        self.assertEqual(out["inputs"]["problems"], [])
+        self.assertTrue(any("1 subagent(s) without readable metadata" in n for n in out["inputs"]["notes"]))
+        self.assertEqual((out["availability"]["graph_resolution"], out["routing"]["verdict"],
+                          out["execution"]["verdict"]), (gf.PASS, gf.PASS, gf.PASS))
+        self.assertEqual(out["routing"]["exploration_units"], 1)
+        report = gf.render(out)
+        self.assertNotIn("Input problems", report)
+        self.assertIn("1 subagent(s) without readable metadata", report)
+
     def test_subagent_metadata_problems(self):
         t = Transcript(self.repo)
         for agent in ("missing", "badjson", "notype", "fine"):
@@ -1331,7 +1430,8 @@ class InputVisibility(FunnelCase):
                        "agent-notype.jsonl: metadata has no agentType"):
             self.assertIn(needle, meta)
         self.assertEqual(len(out["inputs"]["subagent_metadata_problems"]), 3)
-        self.assert_problem(out, "3 subagent(s) without readable metadata")
+        self.assertIn("3 subagent(s) without readable metadata", " ".join(out["inputs"]["notes"]))
+        self.assertIn("3 subagent(s) without readable metadata", gf.render(out))
 
 
 if __name__ == "__main__":

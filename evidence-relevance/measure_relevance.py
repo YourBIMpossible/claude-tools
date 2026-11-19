@@ -98,8 +98,12 @@ def cited_files(packet: dict) -> set[str]:
     return out
 
 
-def traffic_classes(store_root: str) -> dict[str, tuple[str, str]]:
-    """prefix -> (traffic, rg) from `evidence review inventory --all` (ids are truncated there)."""
+def traffic_classes(store_root: str) -> dict[str, tuple[str, str]] | None:
+    """prefix -> (traffic, rg) from `evidence review inventory --all` (ids are truncated there).
+
+    None (with a WARN) when the inventory could not be read: the CLI failed to start, timed out, or
+    exited non-zero. An empty dict means the inventory ran and listed nothing.
+    """
     try:
         res = subprocess.run(
             ["evidence", "review", "--repo", store_root, "inventory", "--all"],
@@ -107,13 +111,31 @@ def traffic_classes(store_root: str) -> dict[str, tuple[str, str]]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"WARN inventory failed for {store_root}: {exc}", file=sys.stderr)
-        return {}
+        return None
+    if res.returncode != 0:
+        detail = (res.stderr or "").strip().splitlines()[-1:] or ["no stderr"]
+        print(f"WARN inventory exited {res.returncode} for {store_root}: {detail[0]}", file=sys.stderr)
+        return None
     out: dict[str, tuple[str, str]] = {}
     for line in res.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 5 and parts[0].startswith("ep_"):
             out[parts[0]] = (parts[2], parts[4])
     return out
+
+
+# Join issues that mean input was lost (a file could not be read), as opposed to coverage facts such as
+# a packet with no session or no traffic class. Any of these makes a replay's output incomplete.
+DATA_LOSS_ISSUES = ("unreadable_packet", "unreadable_transcript_line", "unreadable_subagent", "inventory_failed")
+
+
+def replay_completeness(local: Counter, *joins: Counter) -> dict:
+    """Summary fields for a replay: its own issues, every join issue, and whether nothing was lost."""
+    join: Counter = Counter()
+    for c in joins:
+        join.update(c)
+    return {"issues": dict(local), "join_issues": dict(join),
+            "complete": not local and not any(join[k] for k in DATA_LOSS_ISSUES)}
 
 
 def load_packet_json(store_root: str, glob_pattern: str) -> dict | None:
@@ -130,6 +152,9 @@ def load_packets() -> tuple[list[Packet], Counter]:
     for store in sorted({p for g in STORE_GLOBS for p in glob.glob(g)}):
         store_root = str(Path(store).parent).replace("\\", "/")
         classes = traffic_classes(store_root)
+        if classes is None:
+            issues["inventory_failed"] += 1
+            classes = {}
         for f in sorted(Path(store, "packets").glob("*.json")):
             try:
                 d = json.loads(f.read_text(encoding="utf-8"))
@@ -238,9 +263,11 @@ def build_turns(packets: list[Packet]) -> tuple[dict[str, Turn], Counter]:
                 continue
             first = next((t for t in map(_ts, entries) if t), None)
             if first is None:
+                issues["subagent_without_timestamp"] += 1
                 continue
             owner = next((p for p, s, e in windows if s and s <= first and (e is None or first < e)), None)
             if owner is None:
+                issues["subagent_outside_packet_window"] += 1
                 continue
             for entry in entries:
                 for name, inp in _tool_uses(entry):

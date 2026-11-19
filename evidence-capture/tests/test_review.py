@@ -313,7 +313,8 @@ def test_privacy_scope_rejects(root: Path) -> None:
         assert got["retention"]["deletion_verified"] is True and not got["funnel"]["privacy_cleared"]
         assert outside not in json.dumps(got), "findings carry hashes, never the path"
         by_check = got["review"]["privacy"]["by_check"]
-        assert [k for k, v in by_check.items() if v] == [expect] if expect else True, (name, by_check)
+        # SA11-CT-59: exactly the expected check fired; no conditional, so an empty expect fails
+        assert expect and [k for k, v in by_check.items() if v] == [expect], (name, expect, by_check)
         return by_check
 
     assert run("prompt-path", "path_outside_repo", prompt=f"compare with {outside}")["path_outside_repo"] >= 1
@@ -954,11 +955,37 @@ def test_seal_extends(root: Path) -> None:
     assert res["expired_deleted"] == 1 and not (st.payloads / ep).exists(), "an uncommitted seal edit voids it"
 
 
+def test_sa11_ct19_unreadable_seal_is_counted(root: Path) -> None:
+    """SA11-CT-19: an unreadable seal still fails closed (the payload expires) but the
+    expiry result counts it and the capture log names it; the commit result is returned."""
+    base = make_stores(root)
+    repo = tc.make_repo(root)
+    m, i = episode(base, repo)
+    review.review_episode(base, m, i)
+    ep = m["episode_id"]
+    sums = common.sha256_file(base.payloads / ep / "SHA256SUMS")
+    seals = _seal_repo(root, [{"episode_id": "cap_other", "sums_sha256": sums, "until": "2027-12-31T00:00:00Z"}])
+    (seals / "seals" / "broken.json").write_text("{not json", encoding="utf-8")
+    st = dataclasses.replace(base, seal_dirs=(seals / "seals",))
+    res = review.expire(st, now=common.plus_days(ENDED, 91))
+    assert res["expired_deleted"] == 1 and not (st.payloads / ep).exists(), "fails closed"
+    assert res.get("seals_unreadable") == 1, res
+    assert res.get("committed") is True, res
+    log = (st.meta / "capture.log").read_text(encoding="utf-8")
+    assert "seal unreadable" in log and "broken.json" in log, log[-400:]
+    res = review.expire(st, now=common.plus_days(ENDED, 92), commit=False)
+    assert res["seals_unreadable"] == 1 and res["committed"] is None, res
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
 def main() -> int:
     only = sys.argv[1:]
+    unknown = sorted(set(only) - {fn.__name__ for fn in TESTS})
+    if unknown:  # SA11-CT-35: a filter that matches nothing is a usage error, not "0 passed"
+        print(f"unknown test name(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
     os.environ.update({k: v for k, v in tc.GIT_ENV.items() if k.startswith("GIT_")})
     with tempfile.TemporaryDirectory(prefix="ec-review-test-") as tmp:
         for fn in TESTS:

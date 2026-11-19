@@ -153,7 +153,8 @@ def test_analyse_turns(case: Path) -> None:
     evs = _turn(100.0) + _turn(200.0, tool_at=None) + _turn(300.0, a_sleep=6, a_end=False, tool_at=3.2, asst_at=3.1)
     r = hp.analyse_turns(hp.split_turns(sorted(evs, key=lambda e: e["t"])))
     assert r["turns"] == 3
-    assert r["a_hooks_finish_before_first_tool"] == {"passed": True, "runs": [True]}, r
+    assert r["a_hooks_finish_before_first_tool"] == {"passed": True, "runs": [True],
+                                                     "excluded": [{"turn": 2, "reason": "no_tool"}]}, r
     assert r["a_hooks_finish_before_first_output"]["runs"] == [True, True], r
     assert r["c_turn_waits_for_hook_within_timeout"]["passed"], r["c_turn_waits_for_hook_within_timeout"]
     assert r["e_stop_sees_final_message"]["passed"]
@@ -161,7 +162,7 @@ def test_analyse_turns(case: Path) -> None:
 
     early = _turn(100.0, tool_at=0.35)  # a tool call while the capture start hook (ends at +0.4) is running
     r = hp.analyse_turns(hp.split_turns(sorted(early, key=lambda e: e["t"])))
-    assert r["a_hooks_finish_before_first_tool"] == {"passed": False, "runs": [False]}, r
+    assert r["a_hooks_finish_before_first_tool"] == {"passed": False, "runs": [False], "excluded": []}, r
 
     short = _turn(300.0, a_sleep=6, a_end=False, tool_at=1.0, asst_at=0.9)  # the turn did not wait
     r = hp.analyse_turns(hp.split_turns(sorted(short, key=lambda e: e["t"])))
@@ -172,7 +173,27 @@ def test_analyse_turns(case: Path) -> None:
     assert not r["e_stop_sees_final_message"]["passed"] and r["e_stop_sees_final_message"]["at_stop"] == [False]
 
 
-TESTS = [test_setup_layout, test_arm_disarm, test_one_shot_arm_claimed_by_one_turn, test_probe_hooks_end_to_end, test_analyse_turns]
+def test_analyse_turns_surfaces_excluded_turns(case: Path) -> None:
+    """SA11-CT-2 / SA11-CT-51: a turn left out of a property's denominator is named, never silently dropped."""
+    del case
+    unfinished = [e for e in _turn(200.0) if not (e["hook"] == "capstart" and e["ev"] == "end")]
+    evs = _turn(100.0) + unfinished
+    r = hp.analyse_turns(hp.split_turns(sorted(evs, key=lambda e: e["t"])))
+    for key in ("a_hooks_finish_before_first_tool", "a_hooks_finish_before_first_output"):
+        prop = r[key]
+        assert prop["runs"] == [True], (key, prop)
+        assert prop["excluded"] == [{"turn": 2, "reason": "hooks_not_ended", "missing_end": ["capstart"]}], prop
+        assert prop["passed"] is False, (key, prop)
+
+    no_stop = _turn(100.0) + [e for e in _turn(200.0) if e["hook"] != "stop"]
+    r = hp.analyse_turns(hp.split_turns(sorted(no_stop, key=lambda e: e["t"])))
+    e = r["e_stop_sees_final_message"]
+    assert e["at_stop"] == [True] and e["excluded"] == [{"turn": 2, "reason": "stop_not_seen"}], e
+    assert e["passed"] is False, e
+
+
+TESTS = [test_setup_layout, test_arm_disarm, test_one_shot_arm_claimed_by_one_turn, test_probe_hooks_end_to_end, test_analyse_turns,
+         test_analyse_turns_surfaces_excluded_turns]
 
 
 def main() -> int:

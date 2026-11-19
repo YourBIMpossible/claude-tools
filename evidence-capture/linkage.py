@@ -66,26 +66,51 @@ def load_packet(path: Path) -> dict[str, Any] | None:
     }
 
 
-def load_packets(dirs: list[Path]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
+class Packets(list):  # type: ignore[type-arg]  # list[dict[str, Any]] plus what could not be read
+    """The packets ``load_packets`` could read, and ``unreadable``: the paths of every file
+    under the packet glob that was unreadable, half-written or not a packet. A link made
+    without them may be wrong, so ``resolve_link`` and ``reconcile`` report the count."""
+
+    def __init__(self, items: Any = (), unreadable: Any = ()) -> None:
+        super().__init__(items)
+        self.unreadable: list[str] = list(unreadable)
+
+
+def load_packets(dirs: list[Path]) -> Packets:
+    out = Packets()
     seen: set[str] = set()
     for d in dirs:
         if not d.is_dir():
             continue
         for p in sorted(d.glob(PACKET_GLOB)):
             pk = load_packet(p)
-            if pk and pk["packet_id"] not in seen:
+            if pk is None:
+                out.unreadable.append(str(p))
+            elif pk["packet_id"] not in seen:
                 seen.add(pk["packet_id"])
                 out.append(pk)
     return out
 
 
 def resolve_link(m: dict[str, Any], packets: list[dict[str, Any]], now: str | None = None) -> dict[str, Any]:
-    """The link block for manifest ``m`` given the packets visible now. Pure."""
-    now = now or iso(now_utc())
+    """The link block for manifest ``m`` given the packets visible now. Pure.
+
+    ``packets_unreadable`` counts the packet files ``load_packets`` could not read (0 for a
+    plain list); when the link is not ``linked`` its reason names that count, since a
+    missing or half-written packet may be the one that would have matched."""
     prev = m["link"]
     if prev.get("state") in FINAL_LINK_STATES:
         return dict(prev)  # final states are never recomputed
+    link = _resolve(m, packets, now or iso(now_utc()))
+    bad = len(getattr(packets, "unreadable", ()))
+    link["packets_unreadable"] = bad
+    if bad and link["state"] != "linked":
+        link["reason"] = f"{link['reason']}; {bad} packet file(s) unreadable"
+    return link
+
+
+def _resolve(m: dict[str, Any], packets: list[dict[str, Any]], now: str) -> dict[str, Any]:
+    prev = m["link"]
     start = parse_iso(m["started_at"])
     if start is not None:
         start -= timedelta(seconds=HOOK_START_SKEW_S)
@@ -128,8 +153,10 @@ def reconcile(stores: Stores, manifests: list[dict[str, Any]], repo_root_by_epis
     state or its packet). A changed manifest has its exclusions and funnel recomputed first,
     with the owner's rules from ``rules_for(episode_id)`` when given. Maintenance calls this
     for each terminal episode, so this is the one place a link is re-resolved."""
-    counts = {"checked": 0, "linked": 0, "ambiguous": 0, "mismatch": 0, "none": 0, "final_skipped": 0, "changed": 0}
-    cache: dict[str, list[dict[str, Any]]] = {}
+    counts = {"checked": 0, "linked": 0, "ambiguous": 0, "mismatch": 0, "none": 0, "final_skipped": 0, "changed": 0,
+              "packets_unreadable": 0}
+    cache: dict[str, Packets] = {}
+    unreadable: set[str] = set()
     for m in manifests:
         if m["link"].get("state") in FINAL_LINK_STATES:
             counts["final_skipped"] += 1
@@ -138,7 +165,12 @@ def reconcile(stores: Stores, manifests: list[dict[str, Any]], repo_root_by_epis
         root = (repo_root_by_episode or {}).get(m["episode_id"])
         key = str(root) if root else ""
         if key not in cache:
-            cache[key] = load_packets(packet_dirs(root, stores, session_roots)) + list(extra_packets or [])
+            loaded = load_packets(packet_dirs(root, stores, session_roots))
+            for path in loaded.unreadable:
+                if path not in unreadable:
+                    unreadable.add(path)
+                    log_line(stores, f"link: packet unreadable: {Path(path).name}")
+            cache[key] = Packets([*loaded, *(extra_packets or [])], loaded.unreadable)
         new = resolve_link(m, cache[key], now)
         counts[new["state"]] += 1
         if new["state"] != m["link"].get("state") or new.get("packet_id") != m["link"].get("packet_id"):
@@ -147,4 +179,5 @@ def reconcile(stores: Stores, manifests: list[dict[str, Any]], repo_root_by_epis
             write_manifest(stores, m)
             counts["changed"] += 1
             log_line(stores, f"link {m['episode_id']} -> {new['state']} {new.get('packet_id') or ''}")
+    counts["packets_unreadable"] = len(unreadable)
     return counts

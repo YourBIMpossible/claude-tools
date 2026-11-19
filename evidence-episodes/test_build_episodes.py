@@ -45,6 +45,15 @@ SESSION_C = "00000000-0000-4000-8000-00000000000c"
 SESSION_GONE = "00000000-0000-4000-8000-0000000000ff"
 
 
+def all_keys(value: Any) -> set[str]:
+    """Every dict key at any depth of a JSON-shaped value."""
+    if isinstance(value, dict):
+        return set(value).union(*(all_keys(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(all_keys(v) for v in value))
+    return set()
+
+
 def packet(pid: str, session: str, prompt: str, created: str, *, selected: bool = True,
            source_kind: str = "human") -> dict[str, Any]:
     evidence = [{
@@ -151,6 +160,10 @@ def fixture(tmp: Path) -> tuple[list, list, list]:
         tool_result("2026-09-21T00:00:03.000Z", "tu_1", False),
         tool_result("2026-09-21T00:00:03.100Z", "tu_2", True),
         "{not json",
+        # SA11-CT-66: skipped entries, each counted by reason
+        {**assistant("2026-09-21T00:00:04.000Z", "msg_side", [("tu_s", "Read")]), "isSidechain": True},
+        user("2026-09-21T00:00:04.100Z", "summary of earlier work", isCompactSummary=True),
+        {"type": "system", "timestamp": "2026-09-21T00:00:04.200Z", "content": "x"},
         user("2026-09-21T00:01:00.000Z", slash),
         brief("2026-09-21T00:01:01.500Z", SESSION_A, brief_text(p2)),
         assistant("2026-09-21T00:01:02.000Z", "msg_2", []),
@@ -247,6 +260,10 @@ def test_build(tmp: Path) -> None:
     check(r["cohort"] == "c" and r["cohort_status"] == "member" and r["compiler_commit"] == "abc1234",
           "cohort membership and commit from manifest")
     check(r["transcript"]["parse_errors"] == 1, "malformed transcript line counted, not fatal")
+    check(r["transcript"].get("skipped_entries") == {"compact_summary": 1, "no_message:system": 1, "sidechain": 1},
+          f"skipped transcript entries counted by reason: {r['transcript'].get('skipped_entries')}")
+    check(s["transcripts"].get("skipped_entries") == {"compact_summary": 1, "no_message:system": 1, "sidechain": 1},
+          f"summary totals skipped entries: {s['transcripts']}")
     check(r["observed"]["ended_by"] == "prompt", "turn ends at the next prompt")
 
     r = rows["ep_00000000000000a2"]
@@ -288,9 +305,10 @@ def test_build(tmp: Path) -> None:
     check(s["sha_conflicts"] == ["ep_00000000000000f1"], "summary lists conflicts")
     check("ep_00000000000000a3" in s["prompts"]["hash_mismatch"], "summary lists prompt hash mismatches")
     footprint_keys = {"hit", "coverage", "waste", "rediscovery", "gap", "head_start"}
-    check(not any(footprint_keys & set(json.dumps(r)) for r in rows.values())
-          and not any(k in r for r in rows.values() for k in footprint_keys),
-          "rows hold no Footprints fields")
+    check(footprint_keys & all_keys({"observed": [{"x": {"waste": 1}}]}) == {"waste"},
+          "Footprints-field probe finds a key nested in a list (positive control)")
+    found = set().union(*(footprint_keys & all_keys(r) for r in rows.values()))
+    check(not found, f"rows hold no Footprints fields at any depth (found {sorted(found)})")
 
     be.build(sources, troots, cohorts, tmp / "out2")
     for name in ("episodes.jsonl", "build.json"):

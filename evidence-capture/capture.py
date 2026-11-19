@@ -4,7 +4,8 @@
   init                 create the stores named by the environment or the user config
   maintain [--quiet]   run maintenance now (the start hook launches it detached);
                        exit 0 ok, 3 warn, 4 fail, judged as the backstop judges it
-  report               write the next §12 checkpoint (JSON and markdown) and commit it
+  report               write the next §12 checkpoint (JSON and markdown) and commit it;
+                       exit 0 committed, 2 written but the metadata commit failed
   rescreen             re-join and re-screen every joined episode; commit a corrections record;
                        exit 0 complete, 1 skipped, 2 commit failed, 3 incomplete (an episode
                        unread, malformed, failed or deferred; the gaps go to standard error)
@@ -12,8 +13,11 @@
   fn-audit score K     score sealed sheet K
   fn-audit amended K --note TEXT --tool-commit SHA
                        record that the screen was amended after audit K
+                       (fn-audit: exit 0 committed, 2 refused or the metadata commit failed)
   admit EPISODE        first-batch admission check for one episode
-  expire               delete expired snapshots and payloads now
+  expire               delete expired snapshots and payloads now; exit 0 ok, 2 the metadata
+                       commit failed, 3 warn (undated content or an unreadable seal, which
+                       fails closed), 4 deletion errors; the reasons go to standard error
   backstop [--health | --task-xml PATH]
                        scheduled maintenance and expiry backstop (exit 0 ok, 3 warn, 4 fail);
                        --task-xml writes a Task Scheduler definition for review only
@@ -38,13 +42,15 @@ import audit  # noqa: E402
 import pipeline  # noqa: E402
 from report import write_checkpoint  # noqa: E402
 from review import expire  # noqa: E402
-from store import Stores, init_meta_repo, init_stores, resolve_stores  # noqa: E402
+from store import USER_CONFIG, Stores, config_problem, init_meta_repo, init_stores, resolve_stores  # noqa: E402
 
 
-def _stores(env: dict[str, str]) -> Stores:
-    st = resolve_stores(env)
+def _stores(env: dict[str, str], config: Path = USER_CONFIG) -> Stores:
+    st = resolve_stores(env, config)
     if st is None:
-        raise SystemExit("capture stores are not configured (EC_CAPTURE_META / EC_CAPTURE_CONTENT or user config)")
+        problem = config_problem(config)
+        raise SystemExit("capture stores are not configured (EC_CAPTURE_META / EC_CAPTURE_CONTENT or user config)"
+                         + (f": {problem}" if problem else ""))
     return st
 
 
@@ -135,7 +141,11 @@ def main(argv: list[str] | None = None) -> int:
         path, ck = write_checkpoint(st, tool_commit=commit, backstop=backstop.health(
             backstop.status_path(env), failure_times=times, failure_problems=unread))
         _print({"checkpoint": str(path), "episodes": ck["denominator"]["episodes_total"],
-                "provisional_candidates": ck["funnel"]["provisional_candidates"]})
+                "provisional_candidates": ck["funnel"]["provisional_candidates"],
+                "committed": ck.get("_committed")})
+        if ck.get("_committed") is False:
+            print("report: checkpoint written but the metadata commit failed", file=sys.stderr)
+            return 2
         return 0
     if args.cmd == "rescreen":
         import rescreen
@@ -169,6 +179,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"refused: {exc}", file=sys.stderr)
             return 2
         _print(res)
+        if res.get("committed") is False:
+            print(f"fn-audit {args.action}: written but the metadata commit failed", file=sys.stderr)
+            return 2
         return 0
     if args.cmd == "admit":
         res = audit.admission_check(st, args.episode)
@@ -193,8 +206,19 @@ def main(argv: list[str] | None = None) -> int:
         _print(res)
         return 0 if args.action != "admit" or res["eligible"] else 1
     if args.cmd == "expire":
-        _print(expire(st))
-        return 0
+        import backstop
+        res = expire(st)
+        _print(res)
+        if res.get("committed") is False:
+            print("expire: deletions done but the metadata commit failed", file=sys.stderr)
+            return 2
+        if res.get("errors"):
+            print(f"expire: errors {res['errors']}", file=sys.stderr)
+            return backstop.EXIT_FAIL
+        warned = [k for k in ("undated", "seals_unreadable") if res.get(k)]
+        for k in warned:
+            print(f"expire: {k} {res[k]}", file=sys.stderr)
+        return backstop.EXIT_WARN if warned else backstop.EXIT_OK
     return 2
 
 

@@ -41,7 +41,13 @@ STUB_TOP = {"checked_at", "status", "alerts", "targets"}
 
 HARNESS = r"""
 function global:Get-ScheduledTaskInfo { [CmdletBinding()] param($TaskName)
-    if ($env:STUB_TASK_RESULT -eq 'missing') { throw 'no such task' }
+    # Error shapes match a real Get-ScheduledTaskInfo on Windows: not-found is ObjectNotFound / 0x80070002.
+    if ($env:STUB_TASK_RESULT -eq 'missing') { $PSCmdlet.ThrowTerminatingError([System.Management.Automation.ErrorRecord]::new(
+        [System.IO.FileNotFoundException]::new('The system cannot find the file specified.'),
+        'HRESULT 0x80070002,Get-ScheduledTaskInfo', 'ObjectNotFound', $TaskName)) }
+    if ($env:STUB_TASK_RESULT -eq 'denied') { $PSCmdlet.ThrowTerminatingError([System.Management.Automation.ErrorRecord]::new(
+        [System.UnauthorizedAccessException]::new('Access is denied.'),
+        'HRESULT 0x80070005,Get-ScheduledTaskInfo', 'PermissionDenied', $TaskName)) }
     [pscustomobject]@{ LastTaskResult = [int]$env:STUB_TASK_RESULT; NextRunTime = $null } }
 function global:Invoke-RestMethod { [CmdletBinding()] param($Uri, $TimeoutSec, [switch]$UseBasicParsing)
     [pscustomobject]@{ info = [pscustomobject]@{ version = $env:STUB_PYPI_VERSION } } }
@@ -492,6 +498,25 @@ def main():
         pub = next((a for a in (doc or {}).get("alerts", []) if a["code"] == "task-missing"), None)
         check("task-missing: the published alert carries the same hidden-launcher action",
               bool(pub) and "run-hidden.js" in pub["action"], f"{pub}")
+    finally:
+        e.close()
+
+    # -- a task that exists but cannot be read (SA16-CT-18): not labelled task-missing, and the cause is kept
+    e = Env("task-check-failed")
+    try:
+        e.write_config(valid_config())
+        e.write_health({"installed_version": FAKE_VERSION, "last_success_at": RECENT,
+                        "last_run": {"exit_code": 0, "ended_at": RECENT, "targets": []}})
+        e.run(task_result="denied")
+        codes = [a["code"] for a in e.alerts()["alerts"]]
+        check("task-check-failed: an access-denied read is not labelled task-missing", "task-missing" not in codes, f"{codes}")
+        alert = next((a for a in e.alerts()["alerts"] if a["code"] == "task-check-failed"), None)
+        check("task-check-failed: an error alert is raised", bool(alert) and alert["severity"] == "error", f"{alert}")
+        check("task-check-failed: the message carries the error category and id",
+              bool(alert) and "PermissionDenied" in alert["message"] and "0x80070005" in alert["message"], f"{alert}")
+        text, doc = e.public()
+        check("task-check-failed: the alert reaches the public file",
+              any(a["code"] == "task-check-failed" for a in (doc or {}).get("alerts", [])), text[:300])
     finally:
         e.close()
 
