@@ -60,8 +60,7 @@ Every suite is listed in `TEST_SUITES` in [tools/gate.py](tools/gate.py), and th
 runs them all (`tools/test_gate.py` fails if a tracked `test_*.py` is missing from the
 list). A suite is a plain script that exits non-zero on a failure; run one alone with
 `python <suite>`. The graphify suites need pwsh (PowerShell 7); the scheduling suite
-runs only on Windows; the evidence-episodes suite needs evidence-compiler installed at
-the commit `tools/gate.py` pins. The gate prints a line for each suite it cannot run
+runs only on Windows. The gate prints a line for each suite it cannot run
 here. CI's `ci.yml` runs the same gate on manual dispatch only
 (`gh workflow run ci.yml --ref <branch>`). The automatic PR check, `secret-scan.yml`
 (when a PR opens or leaves draft, never on later pushes), runs the boundary check and
