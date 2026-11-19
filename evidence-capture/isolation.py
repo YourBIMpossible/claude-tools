@@ -12,7 +12,8 @@ replay agent will run as, attempts each forbidden access:
              was created, and the success still fails the check
 
 Every attempt must end in an access error. A success, a missing target (nothing was
-proven) or any other error fails the check. Around the probe the parent records, per
+proven), a ``resolve`` whose stat succeeded while only the listing was refused (the path's
+existence was disclosed) or any other error fails the check. Around the probe the parent records, per
 watched store, a stat walk (paths, sizes, mtimes) and ``git status`` of every watched
 repository; any change fails the check. At least one watched store and one watched
 repository are required, and a store or repository that cannot be read (missing path,
@@ -59,8 +60,9 @@ def _attempt(kind: str, path: Path) -> str:
                 try:
                     os.listdir(path)
                 except PermissionError:
-                    # still a denial, but the path's existence was resolved: record it
-                    return "denied:listdir (stat succeeded)"
+                    # the listing was refused but the path's existence was resolved: not a
+                    # denial, so the check fails closed (SA11-CT-48)
+                    return "unreadable:listdir denied (stat succeeded)"
         elif kind == "write":
             probe = path / f"isolation-probe-{os.getpid()}"
             with probe.open("xb") as fh:
@@ -84,7 +86,8 @@ def _attempt(kind: str, path: Path) -> str:
 
 
 def is_denied(outcome: str) -> bool:
-    """True for an access error: ``denied``, or ``denied:<detail>`` (a recorded partial denial)."""
+    """True for an access error: ``denied``, or ``denied:<detail>``. A stat-visible path whose
+    listing was refused is ``unreadable:<detail>``, which is not a denial."""
     return outcome == "denied" or outcome.startswith("denied:")
 
 

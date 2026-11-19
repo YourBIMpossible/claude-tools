@@ -416,8 +416,16 @@ def test_fs_isolation_deterministic(root: Path) -> None:
     ghost = [dict(targets[0], path=str(src / "nope.py"))]
     assert isolation.check_isolation(ghost, watch=watch, repos=repos)["failures"] == ["source_file:missing"]
 
-    # deny the identity on the protected roots: every attempt is an access error, state unchanged
+    # a deny on the sibling itself leaves it stat-visible through its listable parent: the listing
+    # is refused but the path's existence is disclosed, so the check fails closed (SA11-CT-48)
     roots = [src, root / "repos" / "sibling", st.meta, st.content]
+    seen = isolation.check_isolation(targets, watch=watch, repos=repos, acl_window=_deny(roots, sid))
+    assert seen["passed"] is False
+    assert seen["failures"] == ["sibling_worktree:unreadable:listdir denied (stat succeeded)"], seen["failures"]
+
+    # deny the identity on the protected roots, the worktrees through their parent so that neither
+    # can be resolved: every attempt is an access error, state unchanged
+    roots = [root / "repos", st.meta, st.content]
     rec = isolation.check_isolation(targets, watch=watch, repos=repos, acl_window=_deny(roots, sid))
     REPORT["fs_isolation"] = {"identity_sid_matches": rec["identity"]["sid"] == sid,
                               "attempts": {a["name"]: a["outcome"] for a in rec["attempts"]},

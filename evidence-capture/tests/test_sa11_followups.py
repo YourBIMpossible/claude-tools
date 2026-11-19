@@ -219,8 +219,9 @@ def test_git_version_failure_is_not_cached(root: Path) -> None:
 
 def test_isolation_records_partial_resolve_and_sid_failure(root: Path) -> None:
     """SA11-CT-48: a resolve whose stat succeeded but whose listing was denied is recorded
-    as such (still a denial for the verdict), and a failed SID lookup is recorded instead
-    of leaving the SID silently empty."""
+    as such and is not a denial for the verdict (the path's existence was disclosed, so the
+    check fails closed), and a failed SID lookup is recorded instead of leaving the SID
+    silently empty."""
     target = root / "sibling"
     target.mkdir()
 
@@ -229,8 +230,8 @@ def test_isolation_records_partial_resolve_and_sid_failure(root: Path) -> None:
 
     with patched(os, "listdir", deny):
         outcome = isolation._attempt("resolve", target)
-    assert outcome == "denied:listdir (stat succeeded)", outcome
-    assert isolation.is_denied(outcome) and isolation.is_denied("denied")
+    assert outcome == "unreadable:listdir denied (stat succeeded)", outcome
+    assert not isolation.is_denied(outcome) and isolation.is_denied("denied")
     assert not isolation.is_denied("succeeded") and not isolation.is_denied("missing")
 
     def stat_deny(p: Any, *a: Any, **k: Any) -> Any:
