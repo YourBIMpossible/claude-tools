@@ -273,6 +273,7 @@ _GLOB_CHARS = "*?[{"
 AGENT_DEF_MAX_BYTES = 256 << 10
 _LIST_SPLIT_RE = re.compile(r",(?![^()]*\))")  # commas outside Bash(...) patterns
 SUBAGENT_MIN_LOOKUPS = 3      # searches + reads for a subagent of any type
+SUBAGENT_MIN_FILES = 2        # distinct in-graph files or search paths those lookups touch
 MAIN_MIN_SEARCHES = 6         # searches for a main thread
 MAIN_MIN_FILES = 3            # distinct files read by that main thread
 MATCH_SLACK = timedelta(seconds=5)
@@ -377,7 +378,7 @@ class Unit:
 
     def is_exploration(self, in_scope: Callable[[str], bool]) -> bool:
         """Heuristic eligibility: enough lookups, and they land in code the graph covers."""
-        need = MAIN_MIN_FILES if self.unit_id == "main" else 1
+        need = MAIN_MIN_FILES if self.unit_id == "main" else SUBAGENT_MIN_FILES
         return self.enough_lookups() and self.covered(in_scope) >= need
 
 
@@ -1612,7 +1613,8 @@ def render(summary: dict) -> str:
         if items:
             L += ["", f"**{title}:**", *[f"- {x}" for x in items]]
     L += ["", "## 2 Routing", "",
-          f"Eligibility is a heuristic (a subagent of any type with >= {SUBAGENT_MIN_LOOKUPS} lookups, or a main "
+          f"Eligibility is a heuristic (a subagent of any type with >= {SUBAGENT_MIN_LOOKUPS} lookups touching "
+          f">= {SUBAGENT_MIN_FILES} in-graph files, or a main "
           f"thread with >= {MAIN_MIN_SEARCHES} searches over >= {MAIN_MIN_FILES} files; shell searches and reads "
           "count with the paths they name). Each unit is judged against the graph of its own cwd, and "
           "only lookups inside that graph's coverage count. "

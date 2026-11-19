@@ -482,6 +482,25 @@ class ShellLookups(FunnelCase):
         self.assertEqual(out["lookup_units_without_path_evidence"], 0)
 
 
+class SubagentInGraphFiles(FunnelCase):
+    def test_a_subagent_touching_one_in_graph_file_is_not_a_bypass(self):
+        # A13: enough lookups, but all of them on a single in-graph file: a narrow, known-file
+        # job, not cross-file exploration, so doing it without graphify is legitimate.
+        one = self.backend_files(1)
+        sub = Transcript(self.repo).reads(one + one + one)
+        Transcript(self.repo).hint().subagent("n1", "Explore", sub).write(self.projects, "p", "s-one")
+        out = self.run_funnel()["routing"]
+        self.assertEqual((out["exploration_units"], out["bypassed"]), (0, []))
+
+    def test_a_subagent_touching_two_in_graph_files_is_a_bypass(self):
+        two = self.backend_files(2)
+        sub = Transcript(self.repo).reads(two + two[:1])
+        Transcript(self.repo).hint().subagent("n2", "Explore", sub).write(self.projects, "p", "s-two")
+        out = self.run_funnel()["routing"]
+        self.assertEqual(out["exploration_units"], 1)
+        self.assertIn("in_graph=2", out["bypassed"][0])
+
+
 class PerUnitCwd(FunnelCase):
     def test_subagent_outside_graph_in_graph_backed_session_is_not_a_unit(self):
         sub = Transcript(self.other).greps(3, self.repo / "backend").reads(self.backend_files(3))
