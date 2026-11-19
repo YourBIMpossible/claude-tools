@@ -100,7 +100,9 @@ def _stores(root: Path):
 
 def test_unreadable_packet_is_counted_by_load_and_link(root: Path) -> None:
     """SA11-CT-18: load_packets keeps the two good packets and names the unreadable one;
-    resolve_link records the count, and a link it could not make says why it may be wrong."""
+    resolve_link records the count, and a link it could not make says why it may be wrong.
+    A single match beside an unreadable packet is not ``linked``: the unreadable file may be
+    a second match, so the link stays ``none`` (retried), and it links once every packet reads."""
     import linkage
 
     repo, bad = _packet_dir_with_one_unreadable(root)
@@ -109,27 +111,36 @@ def test_unreadable_packet_is_counted_by_load_and_link(root: Path) -> None:
     assert sorted(p["packet_id"] for p in pk) == ["ep_0001", "ep_0002"], pk
     assert list(pk.unreadable) == [str(bad)], pk.unreadable
     link = linkage.resolve_link(_manifest("p"), pk)
-    assert (link["state"], link["packet_id"]) == ("linked", "ep_0001"), link
+    assert (link["state"], link["packet_id"]) == ("none", None), link
     assert link["packets_unreadable"] == 1, link
+    assert link["reason"] == ("insufficient: one packet matches (ep_0001) but 1 packet file(s) unreadable; "
+                              "a second match cannot be ruled out"), link["reason"]
+    assert link["state"] not in linkage.FINAL_LINK_STATES
     none = linkage.resolve_link(_manifest("no such prompt"), pk)
     assert none["state"] == "none" and none["packets_unreadable"] == 1, none
     assert "1 packet file(s) unreadable" in none["reason"], none["reason"]
     clean = linkage.resolve_link(_manifest("p"), [p for p in pk])
-    assert clean["packets_unreadable"] == 0, clean
+    assert (clean["state"], clean["packet_id"], clean["packets_unreadable"]) == ("linked", "ep_0001", 0), clean
 
 
 def test_reconcile_counts_and_logs_unreadable_packets(root: Path) -> None:
-    """SA11-CT-18: reconcile counts the unreadable packet files it saw and logs each one."""
+    """SA11-CT-18: reconcile counts the unreadable packet files it saw and logs each one; the
+    match beside the unreadable file is not linked until that file reads."""
     import linkage
 
     repo, bad = _packet_dir_with_one_unreadable(root)
     st = _stores(root)
     m = _manifest("p")
     counts = linkage.reconcile(st, [m], {m["episode_id"]: repo})
-    assert counts["linked"] == 1, counts
+    assert (counts["linked"], counts["none"]) == (0, 1), counts
     assert counts["packets_unreadable"] == 1, counts
+    assert m["link"]["state"] == "none", m["link"]
     log = (st.meta / "capture.log").read_text(encoding="utf-8")
     assert f"packet unreadable: {bad.name}" in log, log
+    bad.unlink()
+    counts = linkage.reconcile(st, [m], {m["episode_id"]: repo})
+    assert (counts["linked"], counts["packets_unreadable"]) == (1, 0), counts
+    assert (m["link"]["state"], m["link"]["packet_id"]) == ("linked", "ep_0001"), m["link"]
 
 
 class _StubbornProc:

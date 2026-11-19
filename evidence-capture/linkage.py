@@ -4,7 +4,8 @@
 Identity: ``session_id`` equal, ``prompt_sha256`` equal to the packet's prompt hash,
 packet ``created_at`` inside the episode bounds and ``repo.head`` equal. All four must
 select exactly one packet. Anything else is ``none`` (retried at every capture start and
-in the daily backstop), ``ambiguous`` (final) or ``mismatch`` (final). Capture never reads
+in the daily backstop), ``ambiguous`` (final) or ``mismatch`` (final). One match beside a
+packet file that cannot be read is also ``none``, until that file reads. Capture never reads
 a packet at start time; packets are read here, afterwards, from the repository's own
 ``.evidence-compiler/packets/`` and any extra directories the store configuration names.
 
@@ -97,14 +98,20 @@ def resolve_link(m: dict[str, Any], packets: list[dict[str, Any]], now: str | No
 
     ``packets_unreadable`` counts the packet files ``load_packets`` could not read (0 for a
     plain list); when the link is not ``linked`` its reason names that count, since a
-    missing or half-written packet may be the one that would have matched."""
+    missing or half-written packet may be the one that would have matched. A single match
+    beside an unreadable packet is insufficient for a final ``linked``: the unreadable file
+    may be a second match, so the link stays ``none`` and is retried (SA11-CT-18)."""
     prev = m["link"]
     if prev.get("state") in FINAL_LINK_STATES:
         return dict(prev)  # final states are never recomputed
     link = _resolve(m, packets, now or iso(now_utc()))
     bad = len(getattr(packets, "unreadable", ()))
     link["packets_unreadable"] = bad
-    if bad and link["state"] != "linked":
+    if bad and link["state"] == "linked":
+        link.update(state="none", packet_id=None, matched_on=[],
+                    reason=f"insufficient: one packet matches ({link['packet_id']}) but {bad} packet file(s) "
+                           "unreadable; a second match cannot be ruled out")
+    elif bad:
         link["reason"] = f"{link['reason']}; {bad} packet file(s) unreadable"
     return link
 
