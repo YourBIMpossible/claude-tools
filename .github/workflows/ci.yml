@@ -13,8 +13,7 @@ name: CI
 #
 # Both jobs run the one gate, tools/gate.py: the public-boundary check, the
 # machine-paths guard, the slop_prepass self-test, every test suite in its
-# TEST_SUITES (with the one package a suite needs, evidence-compiler, installed
-# at the commit gate.py pins) and the gitleaks secret scan. The pre-push hook (.githooks/pre-push)
+# TEST_SUITES and the gitleaks secret scan. The pre-push hook (.githooks/pre-push)
 # runs the same gate on the pushing machine, so a push that would fail here is
 # blocked before it leaves. A new check goes into tools/gate.py, not into a step
 # here. Linux leaves out the Windows-only suite; Windows runs the PowerShell
