@@ -1053,6 +1053,79 @@ class CallWindow(FunnelCase):
                          (0, 0, 0))
 
 
+class SubagentWindow(FunnelCase):
+    """A subagent is placed by its own records, not its parent session's (OD-354 item 3, fix 2).
+    Seen on White: session 1b1e2cde ran 11-05 to 11-20 and its subagents of 11-19 were listed
+    in the 11-09, 11-11 and 11-16 windows (GRAPHIFY-B-EXCERPTS)."""
+
+    def setUp(self):
+        super().setUp()
+        self.keep: list[Transcript] = []   # tool ids derive from id(Transcript): keep fixtures alive
+
+    def t(self, start: datetime) -> Transcript:
+        self.keep.append(Transcript(self.repo, start))
+        return self.keep[-1]
+
+    def explorer(self, start: datetime) -> Transcript:
+        return self.t(start).greps(2).reads(self.backend_files(2))
+
+    def test_subagent_starting_after_the_window_is_not_judged(self):
+        parent = self.t(T0).hint().tool("Agent", {"subagent_type": "Explore", "prompt": "find X"})
+        parent.t = UNTIL + timedelta(days=3)            # the parent session runs on past the window end
+        parent.greps(1)
+        parent.subagent("a-late", "Explore", self.explorer(UNTIL + timedelta(days=3))) \
+            .write(self.projects, "p", "s-1b1e2cde")
+        out = self.run_funnel()
+        self.assertEqual(out["sessions"]["total"], 1, "the parent still overlaps the window")
+        r = out["routing"]
+        self.assertEqual(r["bypassed"], [], "a post-window subagent was judged in this window")
+        self.assertEqual(r["exploration_units"], 0)
+        self.assertEqual(r["verdict"], gf.INSUFFICIENT)
+        self.assertEqual(out["inputs"]["subagents_outside_window"], ["s-1b1e2c/Explore:a-late"])
+        self.assertIn("ran outside the window (in sessions overlapping it) left out: 1", gf.render(out))
+
+    def test_subagent_ending_before_the_window_is_not_judged(self):
+        parent = self.t(SINCE - timedelta(days=2)).tool("Agent", {"subagent_type": "Explore", "prompt": "x"})
+        parent.t = SINCE + timedelta(hours=1)
+        parent.greps(1)
+        parent.subagent("a-early", "Explore", self.explorer(SINCE - timedelta(days=2))) \
+            .write(self.projects, "p", "s-early")
+        r = self.run_funnel()["routing"]
+        self.assertEqual(r["bypassed"], [])
+
+    def test_subagent_inside_the_window_is_still_judged(self):
+        parent = self.t(T0).tool("Agent", {"subagent_type": "Explore", "prompt": "find X"})
+        parent.t = UNTIL + timedelta(days=3)
+        parent.greps(1)
+        parent.subagent("a-in", "Explore", self.explorer(T0 + timedelta(minutes=1))) \
+            .subagent("a-late", "Explore", self.explorer(UNTIL + timedelta(days=3))) \
+            .write(self.projects, "p", "s-mixed")
+        out = self.run_funnel()
+        r = out["routing"]
+        self.assertEqual([x.split()[0] for x in r["bypassed"]], ["s-mixed/Explore:a-in"])
+        self.assertEqual(r["verdict"], gf.FAIL)
+        self.assertEqual(out["inputs"]["subagents_outside_window"], ["s-mixed/Explore:a-late"])
+
+    def test_subagent_spanning_the_window_end_is_judged(self):
+        sub = self.explorer(UNTIL - timedelta(minutes=5))
+        sub.t = UNTIL + timedelta(hours=2)
+        sub.greps(1)
+        self.t(T0).tool("Agent", {"subagent_type": "Explore", "prompt": "x"}) \
+            .subagent("a-span", "Explore", sub).write(self.projects, "p", "s-span")
+        r = self.run_funnel()["routing"]
+        self.assertEqual([x.split()[0] for x in r["bypassed"]], ["s-span/Explore:a-span"])
+
+    def test_post_window_subagent_hint_is_not_counted(self):
+        parent = self.t(T0).hint().tool("Agent", {"subagent_type": "Explore", "prompt": "x"})
+        late = self.t(UNTIL + timedelta(days=1))
+        late._rec(type="attachment", attachment={
+            "type": "hook_additional_context", "hookEvent": "SubagentStart",
+            "content": ["<graphify-graph>\nsynthetic\n</graphify-graph>"]})
+        late.greps(2).reads(self.backend_files(2))
+        parent.subagent("a-late", "Explore", late).write(self.projects, "p", "s-hint")
+        self.assertEqual(self.run_funnel()["availability"]["subagent_hints"], 0)
+
+
 class Availability(FunnelCase):
     def test_missing_hint_after_go_live_fails(self):
         self.cfg["funnel"]["hint_live_since"] = iso(T0 - timedelta(days=1))

@@ -339,6 +339,9 @@ class Unit:
     resolved: dict | None = None        # the graph for that cwd (set by analyse)
     repo: str | None = None
     routing_copies: set[str] = field(default_factory=set)   # tool_use ids routing counts elsewhere
+    first_ts: datetime | None = None    # this unit's own records (a subagent is windowed by these)
+    last_ts: datetime | None = None
+    hints: int = 0                      # <graphify-graph> hints injected into this subagent
 
     def _kept(self) -> list[Lookup]:
         return [lk for lk in self.lookups if lk.tool_use_id not in self.routing_copies]
@@ -414,6 +417,7 @@ class SessionScan:
     projects_missing: bool = False
     unstatable: list[str] = field(default_factory=list)     # "<file>: <error>"
     undated: list[Session] = field(default_factory=list)    # no timestamp at all (incl. unreadable)
+    outside_window: list[str] = field(default_factory=list)  # subagents of in-window sessions, left out
 
 
 @dataclass
@@ -666,6 +670,9 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
             target = session.unit("sidechain", "subagent")
         if target.cwd is None and cwd:
             target.cwd = cwd
+        if ts:
+            target.first_ts = min(filter(None, [target.first_ts, ts]))
+            target.last_ts = max(filter(None, [target.last_ts, ts]))
 
         att = rec.get("attachment")
         if isinstance(att, dict) and att.get("type") == "hook_additional_context":
@@ -674,6 +681,7 @@ def _ingest_records(session: Session, unit: Unit, records: Iterable[dict],
                     session.hint_seen = True
                 else:
                     session.subagent_hints += 1
+                    target.hints += 1
 
         msg = rec.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
@@ -971,8 +979,28 @@ def discover_sessions(projects: Path, since: datetime, until: datetime) -> Sessi
         if not (s.first_ts and s.last_ts):
             scan.undated.append(s)      # unreadable, or no timestamped record: not placeable
         elif s.last_ts >= since and s.first_ts <= until:
+            scan.outside_window += drop_subagents_outside(s, since, until)
             scan.sessions.append(s)
     return scan
+
+
+def drop_subagents_outside(session: Session, since: datetime, until: datetime) -> list[str]:
+    """Remove the subagents whose own records all lie outside [since, until]; return their labels.
+
+    A session is placed in the window by its whole span, so a long session that overlaps a past
+    window also carries subagents that ran after it (or before it). Each subagent is placed by
+    its own timestamps instead. The main thread stays with its session, and a subagent with no
+    timestamped record stays (it cannot be placed, so it is not dropped silently).
+    """
+    out = []
+    for uid, u in list(session.units.items()):
+        if uid == "main" or not (u.first_ts and u.last_ts):
+            continue
+        if u.last_ts < since or u.first_ts > until:
+            out.append(u.label)
+            session.subagent_hints -= u.hints
+            del session.units[uid]
+    return out
 
 
 # --------------------------------------------------------------------------- analysis
@@ -1518,6 +1546,7 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         "agent_definitions_unreadable": sorted(set(agent_def_problems)),
         "repo_identity_failures": sorted(set(repo_problems)),
         "sessions_without_cwd": no_cwd,
+        "subagents_outside_window": scan.outside_window,
     }
     inputs["problems"] = input_problems(inputs)
     inputs["notes"] = input_notes(inputs)
@@ -1649,6 +1678,8 @@ def render(summary: dict) -> str:
           f"lookups/calls repeated by continued/forked transcripts, counted once: "
           f"{r['copied_tool_uses_excluded']}",
           f"- Subagents without a shell (graph unusable, not bypasses): {r['graph_unusable_units']}",
+          f"- Subagents that ran outside the window (in sessions overlapping it) left out: "
+          f"{len(inp['subagents_outside_window'])}",
           f"- Units with enough lookups but no file/path evidence (eligibility unknown): "
           f"{r['lookup_units_without_path_evidence']}",
           f"- Queried graphify: {len(r['used_graphify'])} {r['used_graphify'] or ''}",
