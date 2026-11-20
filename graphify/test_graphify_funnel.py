@@ -211,6 +211,67 @@ class Routing(FunnelCase):
         self.assertEqual(self.run_funnel()["routing"]["exploration_units"], 1)
 
 
+class DelegatedQuery(FunnelCase):
+    """A main thread whose own subagent queried graphify delegated the graph query: it is
+    not a bypass (OD-354 item 3, GRAPHIFY-ROUTING-CLASSES row 1; seen as 1b6948a7/main and
+    fddd3bb6/main, whose Explore subagents are in "Queried graphify")."""
+
+    def setUp(self):
+        super().setUp()
+        # Transcript tool ids derive from id(Transcript). Keep every fixture alive so two
+        # sessions never reuse an id and read as forked copies of each other.
+        self.keep: list[Transcript] = []
+
+    def t(self, start: datetime = T0) -> Transcript:
+        self.keep.append(Transcript(self.repo, start))
+        return self.keep[-1]
+
+    def exploring_main(self, start: datetime = T0) -> Transcript:
+        return self.t(start).greps(6).reads(self.backend_files(3)) \
+            .tool("Agent", {"subagent_type": "Explore", "prompt": "find X"})
+
+    def querying_explore(self, question: str, start: datetime) -> Transcript:
+        return self.t(start).query(question).greps(2).reads(self.backend_files(2))
+
+    def test_main_whose_subagent_queried_is_not_a_bypass(self):
+        for sid, agent in (("s-1b6948a7", "adc400507daf3fc11"), ("s-fddd3bb6", "a12e38cfde90f08fd")):
+            self.exploring_main() \
+                .subagent(agent, "Explore", self.querying_explore(f"who calls {sid}", T0 + timedelta(minutes=1))) \
+                .write(self.projects, "p", sid)
+        r = self.run_funnel()["routing"]
+        self.assertEqual(r["bypassed"], [], "a delegating main thread was listed as a bypass")
+        self.assertEqual(r["verdict"], gf.PASS)
+        self.assertEqual(r["exploration_units"], 4)
+        delegated = sorted(x for x in r["used_graphify"] if "/main" in x)
+        self.assertEqual(delegated, ["s-1b6948/main (delegated to Explore:adc400507daf3fc11)",
+                                     "s-fddd3b/main (delegated to Explore:a12e38cfde90f08fd)"])
+
+    def test_main_whose_subagent_did_not_query_is_still_a_bypass(self):
+        sub = self.t(T0 + timedelta(minutes=1)).greps(2).reads(self.backend_files(2))
+        self.exploring_main().subagent("a-quiet", "Explore", sub).write(self.projects, "p", "s-quiet")
+        r = self.run_funnel()["routing"]
+        self.assertEqual(r["verdict"], gf.FAIL)
+        self.assertEqual(sorted(x.split()[0] for x in r["bypassed"]),
+                         ["s-quiet/Explore:a-quiet", "s-quiet/main"])
+
+    def test_a_sibling_subagent_query_does_not_cover_another_subagent(self):
+        quiet = self.t(T0 + timedelta(minutes=2)).greps(2).reads(self.backend_files(2))
+        self.exploring_main() \
+            .subagent("a-asks", "Explore", self.querying_explore("who calls sync", T0 + timedelta(minutes=1))) \
+            .subagent("a-quiet", "Explore", quiet).write(self.projects, "p", "s-mixed")
+        r = self.run_funnel()["routing"]
+        self.assertEqual(r["verdict"], gf.FAIL)
+        self.assertEqual([x.split()[0] for x in r["bypassed"]], ["s-mixed/Explore:a-quiet"])
+
+    def test_a_query_in_another_session_does_not_cover_this_main(self):
+        self.exploring_main().write(self.projects, "p", "s-alone")
+        self.t(T0 + timedelta(hours=1)).hint() \
+            .subagent("a-other", "Explore", self.querying_explore("who calls x", T0 + timedelta(hours=1))) \
+            .write(self.projects, "p", "s-other")
+        r = self.run_funnel()["routing"]
+        self.assertEqual([x.split()[0] for x in r["bypassed"]], ["s-alone/main"])
+
+
 class AnyAgentType(FunnelCase):
     def test_custom_agent_type_counts_as_exploration(self):
         sub = Transcript(self.repo).greps(2).reads(self.backend_files(3))

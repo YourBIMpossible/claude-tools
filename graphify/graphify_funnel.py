@@ -11,7 +11,8 @@ Stages
                    worktree -> main checkout) and, once the hint hook is live, whether the
                    <graphify-graph> hint was actually injected.
   2. Routing       graph-backed exploration units (main threads and subagents) and whether
-                   each made a graphify call. Eligibility is a HEURISTIC over tool counts and
+                   each made a graphify call (a main thread whose own subagent made one
+                   delegated it and is credited). Eligibility is a HEURISTIC over tool counts and
                    is labelled as such; a graph-backed exploration unit with no graphify call
                    is a routing FAIL to investigate, never a reason to wait for volume.
   3. Execution     graphify calls found in transcripts vs completed calls vs matched
@@ -1034,6 +1035,30 @@ def mark_copied_calls(sessions: list[Session]) -> int:
     return marked
 
 
+def delegate_of(u: Unit) -> Unit | None:
+    """The subagent that ran the graph query for a main thread, if the main ran none itself.
+
+    Every subagent of a session was started from that session's main thread (directly or
+    through another subagent), so a routing-credited graphify call by any of them means the
+    main delegated the query rather than bypassed the graph. Only the main gets this credit:
+    the transcripts do not record which subagent started which, so a subagent is never
+    credited with a sibling's call.
+    """
+    if u.unit_id != "main" or u.routing_calls():
+        return None
+    return next((o for o in u.session.units.values() if o is not u and o.routing_calls()), None)
+
+
+def credited(u: Unit) -> bool:
+    """Routing counts the unit as having used graphify: its own call, or (main) a delegated one."""
+    return bool(u.routing_calls()) or delegate_of(u) is not None
+
+
+def used_label(u: Unit) -> str:
+    d = delegate_of(u)
+    return u.label if d is None else f"{u.label} (delegated to {d.label.split('/', 1)[1]})"
+
+
 def mark_routing_copies(units: list[Unit]) -> int:
     """Count each lookup and call once in routing; return how many copies were set aside.
 
@@ -1396,8 +1421,8 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
     unusable = [u for u in eligible if has_shell[id(u)] is False]
     exploration = [u for u in eligible if u not in unusable]
     no_path_evidence = [u for u in units if u.enough_lookups() and not (u.files | u.search_paths)]
-    used = [u for u in exploration if u.routing_calls()]
-    bypassed = sorted((u for u in exploration if not u.routing_calls()),
+    used = [u for u in exploration if credited(u)]
+    bypassed = sorted((u for u in exploration if not credited(u)),
                       key=lambda u: -(u.searches + u.reads))
     other_callers = [u for u in units if u.routing_calls() and u not in eligible]
     after_hint = [u for u in exploration if post_hint(u.session)]
@@ -1520,12 +1545,12 @@ def analyse(scan: SessionScan, log: QueryLog, resolver, cfg: FunnelConfig,
         "routing": {
             "verdict": v2, "eligibility": "heuristic",
             "graph_backed_units": len(units), "exploration_units": len(exploration),
-            "used_graphify": [u.label for u in used],
+            "used_graphify": [used_label(u) for u in used],
             "after_hint_live": {"exploration_units": len(after_hint),
-                                "used_graphify": sum(1 for u in after_hint if u.routing_calls()),
+                                "used_graphify": sum(1 for u in after_hint if credited(u)),
                                 "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} "
                                              f"transcript={u.session.path}"
-                                             for u in after_hint if not u.routing_calls()]},
+                                             for u in after_hint if not credited(u)]},
             "bypassed": [f"{u.label} searches={u.searches} reads={u.reads} files={len(u.files)} "
                          f"in_graph={u.covered(scope_of[id(u)])} "
                          f"cwd={u.cwd}" for u in bypassed],
