@@ -273,6 +273,11 @@ def _repo_cases() -> list[tuple[str, bool]]:
             except ConfigError:
                 return 2
 
+    def staged(root: Path) -> bool:
+        # A failed `git add` leaves the scan looking at a stale index, so every later case
+        # would be judged against the wrong tree; it must fail the self-test, not pass silently.
+        return subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True).returncode == 0
+
     cases = []
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -281,7 +286,8 @@ def _repo_cases() -> list[tuple[str, bool]]:
         (root / "clean.md").write_text("Reports go to {reports}/x.md and ~/notes.\n", encoding="utf-8")
         (root / "fixture.py").write_text(_expand('P = "<D>/fixture/x"\n'), encoding="utf-8")
         (root / "blob.bin").write_bytes(b"\0" + _expand("<D>/x").encode())
-        subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True)
+        if not staged(root):
+            return [("git add (initial files)", False)]
         cases.append(("finding fails the run", run(root) == 1))
         allow = [{"path": "*.py", "match": "fixture", "reason": "synthetic fixture"}]
         (root / ALLOW_FILE).write_text(json.dumps(allow), encoding="utf-8")
@@ -292,10 +298,12 @@ def _repo_cases() -> list[tuple[str, bool]]:
         with contextlib.redirect_stdout(io.StringIO()):
             cases.append(("--ignore-stale passes a stale entry", check(root, root / ALLOW_FILE, True) == 0))
             (root / "other.md").write_text(_expand("See <D>/other/x\n"), encoding="utf-8")
-            subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True)
+            if not staged(root):
+                return cases + [("git add (other.md added)", False)]
             cases.append(("--ignore-stale still fails a finding", check(root, root / ALLOW_FILE, True) == 1))
             (root / "other.md").unlink()
-            subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True)
+            if not staged(root):
+                return cases + [("git add (other.md removed)", False)]
         (root / ALLOW_FILE).write_text(json.dumps([{"path": "*.py"}]), encoding="utf-8")
         cases.append(("entry without reason is a config error", run(root) == 2))
     return cases

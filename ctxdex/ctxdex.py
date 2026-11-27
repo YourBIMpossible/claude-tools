@@ -281,6 +281,10 @@ def _fts_query_escape(query: str) -> str:
 
 
 def cmd_search(args) -> int:
+    """Search both indexes. Returns 0 on success or a clean miss, 1 when any index
+    query failed: with no candidates it prints "search failed"; with partial results
+    it prints them first, then a "search incomplete" notice, and still returns 1 so a
+    degraded index is never reported as a healthy search."""
     conn = connect(args.project)
     q = _fts_query_escape(args.query)
 
@@ -355,6 +359,11 @@ def cmd_search(args) -> int:
         print()
 
     conn.close()
+    if errors:
+        # Partial results are shown, but a fault in either index is never exit 0.
+        print(f"search incomplete: {len(errors)} index query error(s) - results above may be partial",
+              file=sys.stderr)
+        return 1
     return 0
 
 

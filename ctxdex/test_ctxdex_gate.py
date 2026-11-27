@@ -184,6 +184,20 @@ def main():
         check("8 true miss: 'no results'", "no results" in p.stdout, p.stdout)
         reset()
 
+        # 9) a partial fault (trigram broken, porter healthy) still prints the porter results
+        #    but exits non-zero (SA23-CT-1): degraded search is never reported as success
+        p = run(["index", str(d2), "--source", "t"])
+        conn = sqlite3.connect(DB)
+        conn.executescript("DROP TABLE docs_trigram; CREATE TABLE docs_trigram(content);")
+        conn.close()
+        p = run(["search", "alpha content"])
+        check("9 partial fault: non-zero exit", p.returncode != 0, f"rc={p.returncode}")
+        check("9 partial fault: porter results still printed", "alpha content" in p.stdout, p.stdout)
+        check("9 partial fault: incomplete notice on stderr", "search incomplete" in p.stderr, p.stderr)
+        DB.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm"):
+            Path(str(DB) + suffix).unlink(missing_ok=True)
+
     finally:
         reset()
         shutil.rmtree(tmp, ignore_errors=True)
